@@ -1,0 +1,201 @@
+play_id,game_id,player_committing,player_disadvantaged,call_type,review_decision,label,video_path
+0022600190_2115_00,0022600190,Julius Randle,Nickeil Alexander-Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2115_00.mp4
+0022600190_2116_01,0022600190,Nickeil Alexander-Walker,Day'Ron Sharpe,Shooting Foul,INC,1,data/raw/foul/0022600190_2116_01.mp4
+0022600190_2117_02,0022600190,Mikel Brown Jr.,Nickeil Alexander-Walker,Shooting Foul,CC,1,data/raw/foul/0022600190_2117_02.mp4
+0022600190_2120_05,0022600190,Jalen Johnson,Michael Porter Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2120_05.mp4
+0022600190_2122_07,0022600190,Kingston Flemings,Mikel Brown Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2122_07.mp4
+0022600190_2125_10,0022600190,Julius Randle,Jalen Johnson,Personal Foul,CNC,0,data/raw/no_foul/0022600190_2125_10.mp4
+0022600190_2126_11,0022600190,Danny Wolf,Jalen Johnson,Shooting Foul,CC,1,data/raw/foul/0022600190_2126_11.mp4
+0022600190_2130_15,0022600190,Onyeka Okongwu,Michael Porter Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2130_15.mp4
+0022600190_2131_16,0022600190,Danny Wolf,Jalen Johnson,Personal Foul,CC,1,data/raw/foul/0022600190_2131_16.mp4
+0022600190_2132_17,0022600190,Jalen Johnson,Julius Randle,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2132_17.mp4
+0022600190_2133_18,0022600190,Michael Porter Jr.,Dyson Daniels,Personal Foul,CC,1,data/raw/foul/0022600190_2133_18.mp4
+0022600190_2135_20,0022600190,Luguentz Dort,Danny Wolf,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2135_20.mp4
+0022600190_2137_22,0022600190,Mikel Brown Jr.,Aaron Wiggins,Personal Foul,CC,1,data/raw/foul/0022600190_2137_22.mp4
+0022600190_2138_23,0022600190,Jalen Johnson,Michael Porter Jr.,Shooting Foul,CC,1,data/raw/foul/0022600190_2138_23.mp4
+0022600190_2140_25,0022600190,Luguentz Dort,Danny Wolf,Shooting Foul,CNC,0,data/raw/no_foul/0022600190_2140_25.mp4
+0022600190_2142_27,0022600190,Day'Ron Sharpe,Onyeka Okongwu,Personal Foul,CC,1,data/raw/foul/0022600190_2142_27.mp4
+0022600193_2134_02,0022600193,Anthony Black,Stephen Curry,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2134_02.mp4
+0022600193_2135_03,0022600193,Yaxel Lendeborg,Tristan da Silva,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2135_03.mp4
+0022600193_2137_05,0022600193,Yaxel Lendeborg,Tristan da Silva,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2137_05.mp4
+0022600193_2139_07,0022600193,Wendell Carter Jr.,Stephen Curry,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2139_07.mp4
+0022600193_2140_08,0022600193,Wendell Carter Jr.,Stephen Curry,Shooting Foul,CC,1,data/raw/foul/0022600193_2140_08.mp4
+0022600193_2141_09,0022600193,Gary Payton II,Anthony Black,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2141_09.mp4
+0022600193_2142_10,0022600193,Gary Payton II,Franz Wagner,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2142_10.mp4
+0022600193_2143_11,0022600193,Jamal Cain,Stephen Curry,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2143_11.mp4
+0022600193_2144_12,0022600193,Brandin Podziemski,Franz Wagner,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2144_12.mp4
+0022600193_2145_13,0022600193,Yaxel Lendeborg,Wendell Carter Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2145_13.mp4
+0022600193_2146_14,0022600193,Charles Bassey,Wendell Carter Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2146_14.mp4
+0022600193_2147_15,0022600193,Stephen Curry,Tristan da Silva,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2147_15.mp4
+0022600193_2149_17,0022600193,Wendell Carter Jr.,Stephen Curry,Shooting Foul,CC,1,data/raw/foul/0022600193_2149_17.mp4
+0022600193_2150_18,0022600193,Draymond Green,Wendell Carter Jr.,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2150_18.mp4
+0022600193_2151_19,0022600193,Yaxel Lendeborg,Wendell Carter Jr.,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2151_19.mp4
+0022600193_2153_20,0022600193,Yaxel Lendeborg,Wendell Carter Jr.,Personal Foul,CC,1,data/raw/foul/0022600193_2153_20.mp4
+0022600193_2154_22,0022600193,Wendell Carter Jr.,Georges Niang,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2154_22.mp4
+0022600193_2155_23,0022600193,Franz Wagner,Stephen Curry,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2155_23.mp4
+0022600193_2156_24,0022600193,Georges Niang,Tristan da Silva,Personal Foul,CNC,0,data/raw/no_foul/0022600193_2156_24.mp4
+0022600193_2158_26,0022600193,Yaxel Lendeborg,Franz Wagner,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2158_26.mp4
+0022600193_2159_27,0022600193,Draymond Green,Tristan da Silva,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2159_27.mp4
+0022600193_2161_29,0022600193,Georges Niang,Wendell Carter Jr.,Shooting Foul,CC,1,data/raw/foul/0022600193_2161_29.mp4
+0022600193_2162_30,0022600193,Wendell Carter Jr.,Yaxel Lendeborg,Personal Foul,CC,1,data/raw/foul/0022600193_2162_30.mp4
+0022600193_2163_31,0022600193,Draymond Green,Tristan da Silva,Shooting Foul,CNC,0,data/raw/no_foul/0022600193_2163_31.mp4
+0022600194_2157_02,0022600194,Kevin Durant,Devin Booker,Personal Foul,CNC,0,data/raw/no_foul/0022600194_2157_02.mp4
+0022600194_2158_03,0022600194,Amen Thompson,Dillon Brooks,Personal Foul,CNC,0,data/raw/no_foul/0022600194_2158_03.mp4
+0022600194_2159_05,0022600194,Jabari Smith Jr.,Miles Bridges,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2159_05.mp4
+0022600194_2160_06,0022600194,Miles Bridges,Alperen Sengun,Personal Foul,CNC,0,data/raw/no_foul/0022600194_2160_06.mp4
+0022600194_2163_09,0022600194,Alperen Sengun,Devin Booker,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2163_09.mp4
+0022600194_2165_13,0022600194,Jabari Smith Jr.,Devin Booker,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2165_13.mp4
+0022600194_2167_15,0022600194,Dillon Brooks,Alperen Sengun,Personal Foul,CC,1,data/raw/foul/0022600194_2167_15.mp4
+0022600194_2168_16,0022600194,Oso Ighodaro,Fred VanVleet,Shooting Foul,INC,1,data/raw/foul/0022600194_2168_16.mp4
+0022600194_2170_18,0022600194,Dillon Brooks,Kevin Durant,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2170_18.mp4
+0022600194_2171_19,0022600194,Fred VanVleet,Jalen Green,Personal Foul,CNC,0,data/raw/no_foul/0022600194_2171_19.mp4
+0022600194_2173_21,0022600194,Fred VanVleet,Devin Booker,Personal Foul,CNC,0,data/raw/no_foul/0022600194_2173_21.mp4
+0022600194_2175_23,0022600194,Amen Thompson,Devin Booker,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2175_23.mp4
+0022600194_2176_24,0022600194,Dillon Brooks,Kevin Durant,Shooting Foul,CNC,0,data/raw/no_foul/0022600194_2176_24.mp4
+0022600025_2190_01,0022600025,Kyshawn George,CJ McCollum,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2190_01.mp4
+0022600025_2192_03,0022600025,Tre Johnson,Luguentz Dort,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2192_03.mp4
+0022600025_2195_06,0022600025,Luguentz Dort,Kyshawn George,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2195_06.mp4
+0022600025_2196_07,0022600025,Luguentz Dort,Kyshawn George,Personal Foul,CC,1,data/raw/foul/0022600025_2196_07.mp4
+0022600025_2197_08,0022600025,AJ Dybantsa,CJ McCollum,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2197_08.mp4
+0022600025_2199_10,0022600025,Trae Young,Nickeil Alexander-Walker,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2199_10.mp4
+0022600025_2200_11,0022600025,AJ Dybantsa,CJ McCollum,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2200_11.mp4
+0022600025_2201_12,0022600025,Onyeka Okongwu,Trae Young,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2201_12.mp4
+0022600025_2203_14,0022600025,Kyshawn George,Nickeil Alexander-Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2203_14.mp4
+0022600025_2204_15,0022600025,Kyshawn George,Nickeil Alexander-Walker,Shooting Foul,CC,1,data/raw/foul/0022600025_2204_15.mp4
+0022600025_2205_16,0022600025,CJ McCollum,Trae Young,Personal Foul,CC,1,data/raw/foul/0022600025_2205_16.mp4
+0022600025_2206_17,0022600025,Kyshawn George,Nickeil Alexander-Walker,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2206_17.mp4
+0022600025_2210_21,0022600025,Tre Johnson,Luguentz Dort,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2210_21.mp4
+0022600025_2211_22,0022600025,Dyson Daniels,AJ Dybantsa,Personal Foul,CNC,0,data/raw/no_foul/0022600025_2211_22.mp4
+0022600025_2212_23,0022600025,Dyson Daniels,AJ Dybantsa,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2212_23.mp4
+0022600025_2213_24,0022600025,Tre Johnson,Nickeil Alexander-Walker,Personal Foul,CC,1,data/raw/foul/0022600025_2213_24.mp4
+0022600025_2214_25,0022600025,Dyson Daniels,Kyshawn George,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2214_25.mp4
+0022600025_2215_26,0022600025,Alex Sarr,Nickeil Alexander-Walker,Personal Foul,CC,1,data/raw/foul/0022600025_2215_26.mp4
+0022600025_2216_27,0022600025,Dyson Daniels,Trae Young,Shooting Foul,CNC,0,data/raw/no_foul/0022600025_2216_27.mp4
+0022600025_2217_28,0022600025,Alex Sarr,Onyeka Okongwu,Personal Foul,CC,1,data/raw/foul/0022600025_2217_28.mp4
+0022600178_2119_01,0022600178,Cameron Boozer,Pascal Siakam,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2119_01.mp4
+0022600178_2121_03,0022600178,Pascal Siakam,Cameron Boozer,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2121_03.mp4
+0022600178_2123_05,0022600178,Aaron Nesmith,Ty Jerome,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2123_05.mp4
+0022600178_2124_06,0022600178,Larry Nance Jr.,Cedric Coward,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2124_06.mp4
+0022600178_2125_07,0022600178,Pascal Siakam,Zach Edey,Shooting Foul,CC,1,data/raw/foul/0022600178_2125_07.mp4
+0022600178_2127_09,0022600178,Ty Jerome,Pascal Siakam,Personal Foul,CNC,0,data/raw/no_foul/0022600178_2127_09.mp4
+0022600178_2129_11,0022600178,Ty Jerome,Pascal Siakam,Personal Foul,CNC,0,data/raw/no_foul/0022600178_2129_11.mp4
+0022600178_2131_13,0022600178,Ty Jerome,Pascal Siakam,Shooting Foul,CC,1,data/raw/foul/0022600178_2131_13.mp4
+0022600178_2133_15,0022600178,Pascal Siakam,Cameron Boozer,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2133_15.mp4
+0022600178_2135_17,0022600178,Larry Nance Jr.,Ty Jerome,Personal Foul,CNC,0,data/raw/no_foul/0022600178_2135_17.mp4
+0022600178_2136_18,0022600178,Aaron Nesmith,Ty Jerome,Personal Foul,CNC,0,data/raw/no_foul/0022600178_2136_18.mp4
+0022600178_2139_21,0022600178,Cam Spencer,Aaron Nesmith,Shooting Foul,CC,1,data/raw/foul/0022600178_2139_21.mp4
+0022600178_2140_22,0022600178,Jarace Walker,Cedric Coward,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2140_22.mp4
+0022600178_2141_23,0022600178,Jarace Walker,Cedric Coward,Shooting Foul,CNC,0,data/raw/no_foul/0022600178_2141_23.mp4
+0022600179_2186_00,0022600179,Lauri Markkanen,Derik Queen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2186_00.mp4
+0022600179_2189_03,0022600179,Darryn Peterson,Jeremiah Fears,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2189_03.mp4
+0022600179_2191_05,0022600179,Lauri Markkanen,Derik Queen,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2191_05.mp4
+0022600179_2192_06,0022600179,Ace Bailey,Derik Queen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2192_06.mp4
+0022600179_2193_07,0022600179,Lauri Markkanen,Derik Queen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2193_07.mp4
+0022600179_2195_09,0022600179,Dejounte Murray,Lauri Markkanen,Shooting Foul,CC,1,data/raw/foul/0022600179_2195_09.mp4
+0022600179_2196_10,0022600179,Lauri Markkanen,Derik Queen,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2196_10.mp4
+0022600179_2200_14,0022600179,Herbert Jones,Lauri Markkanen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2200_14.mp4
+0022600179_2201_15,0022600179,Ace Bailey,Dejounte Murray,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2201_15.mp4
+0022600179_2202_16,0022600179,Ace Bailey,Zion Williamson,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2202_16.mp4
+0022600179_2203_17,0022600179,Zion Williamson,Lauri Markkanen,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2203_17.mp4
+0022600179_2204_18,0022600179,Zion Williamson,Keyonte George,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2204_18.mp4
+0022600179_2205_19,0022600179,Josh Okogie,Dejounte Murray,Shooting Foul,CC,1,data/raw/foul/0022600179_2205_19.mp4
+0022600179_2207_21,0022600179,Zion Williamson,Keyonte George,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2207_21.mp4
+0022600179_2209_23,0022600179,Josh Okogie,Herbert Jones,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2209_23.mp4
+0022600179_2210_24,0022600179,Ace Bailey,Saddiq Bey,Shooting Foul,CC,1,data/raw/foul/0022600179_2210_24.mp4
+0022600179_2211_25,0022600179,Saddiq Bey,Lauri Markkanen,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2211_25.mp4
+0022600179_2212_26,0022600179,Herbert Jones,Lauri Markkanen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2212_26.mp4
+0022600179_2214_28,0022600179,Josh Green,Saddiq Bey,Shooting Foul,CC,1,data/raw/foul/0022600179_2214_28.mp4
+0022600179_2215_29,0022600179,Zion Williamson,Keyonte George,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2215_29.mp4
+0022600179_2216_30,0022600179,Zion Williamson,Keyonte George,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2216_30.mp4
+0022600179_2217_31,0022600179,Herbert Jones,Keyonte George,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2217_31.mp4
+0022600179_2219_33,0022600179,Ace Bailey,Saddiq Bey,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2219_33.mp4
+0022600179_2220_34,0022600179,Ace Bailey,Saddiq Bey,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2220_34.mp4
+0022600179_2221_35,0022600179,Trendon Watford,Ace Bailey,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2221_35.mp4
+0022600179_2223_37,0022600179,Josh Green,Saddiq Bey,Personal Foul,CNC,0,data/raw/no_foul/0022600179_2223_37.mp4
+0022600179_2224_38,0022600179,Ace Bailey,Zion Williamson,Personal Foul,CC,1,data/raw/foul/0022600179_2224_38.mp4
+0022600179_2225_39,0022600179,Herbert Jones,Lauri Markkanen,Shooting Foul,CNC,0,data/raw/no_foul/0022600179_2225_39.mp4
+0022600179_2226_40,0022600179,Ace Bailey,Dejounte Murray,Personal Foul,CC,1,data/raw/foul/0022600179_2226_40.mp4
+0022600184_2183_00,0022600184,Victor Wembanyama,Kyrie Irving,Shooting Foul,CNC,0,data/raw/no_foul/0022600184_2183_00.mp4
+0022600184_2184_01,0022600184,Walter Clayton Jr.,Dylan Harper,Personal Foul,CNC,0,data/raw/no_foul/0022600184_2184_01.mp4
+0022600184_2185_02,0022600184,P.J. Washington,Dylan Harper,Shooting Foul,CNC,0,data/raw/no_foul/0022600184_2185_02.mp4
+0022600184_2187_04,0022600184,Naji Marshall,Victor Wembanyama,Personal Foul,CNC,0,data/raw/no_foul/0022600184_2187_04.mp4
+0022600184_2188_05,0022600184,Naji Marshall,De'Aaron Fox,Shooting Foul,CNC,0,data/raw/no_foul/0022600184_2188_05.mp4
+0022600184_2189_06,0022600184,P.J. Washington,Victor Wembanyama,Shooting Foul,CNC,0,data/raw/no_foul/0022600184_2189_06.mp4
+0022600184_2191_08,0022600184,P.J. Washington,Victor Wembanyama,Shooting Foul,CC,1,data/raw/foul/0022600184_2191_08.mp4
+0022600184_2192_10,0022600184,Victor Wembanyama,P.J. Washington,Personal Foul,CNC,0,data/raw/no_foul/0022600184_2192_10.mp4
+0022600184_2193_11,0022600184,De'Aaron Fox,Kyrie Irving,Shooting Foul,CNC,0,data/raw/no_foul/0022600184_2193_11.mp4
+0022600186_2081_00,0022600186,Rui Hachimura,Bam Adebayo,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2081_00.mp4
+0022600186_2083_02,0022600186,Giannis Antetokounmpo,Darius Garland,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2083_02.mp4
+0022600186_2085_04,0022600186,Giannis Antetokounmpo,Darius Garland,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2085_04.mp4
+0022600186_2086_05,0022600186,Darius Garland,Davion Mitchell,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2086_05.mp4
+0022600186_2088_07,0022600186,Kris Dunn,Pelle Larsson,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2088_07.mp4
+0022600186_2090_09,0022600186,Giannis Antetokounmpo,Rui Hachimura,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2090_09.mp4
+0022600186_2092_11,0022600186,Brook Lopez,Bam Adebayo,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2092_11.mp4
+0022600186_2095_14,0022600186,Giannis Antetokounmpo,Darius Garland,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2095_14.mp4
+0022600186_2096_15,0022600186,Darius Garland,Davion Mitchell,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2096_15.mp4
+0022600186_2097_16,0022600186,Derrick Jones Jr.,Giannis Antetokounmpo,Shooting Foul,CC,1,data/raw/foul/0022600186_2097_16.mp4
+0022600186_2098_17,0022600186,Bam Adebayo,Rui Hachimura,Shooting Foul,CC,1,data/raw/foul/0022600186_2098_17.mp4
+0022600186_2099_18,0022600186,Brook Lopez,Bam Adebayo,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2099_18.mp4
+0022600186_2100_19,0022600186,Pelle Larsson,Darius Garland,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2100_19.mp4
+0022600186_2103_22,0022600186,Giannis Antetokounmpo,Darius Garland,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2103_22.mp4
+0022600186_2104_23,0022600186,Giannis Antetokounmpo,Rui Hachimura,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2104_23.mp4
+0022600186_2105_24,0022600186,Giannis Antetokounmpo,Max Strus,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2105_24.mp4
+0022600186_2108_27,0022600186,Brook Lopez,Bam Adebayo,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2108_27.mp4
+0022600186_2109_28,0022600186,Klay Thompson,Darius Garland,Personal Foul,CNC,0,data/raw/no_foul/0022600186_2109_28.mp4
+0022600186_2112_31,0022600186,Klay Thompson,Max Strus,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2112_31.mp4
+0022600186_2114_33,0022600186,Max Strus,Davion Mitchell,Shooting Foul,CNC,0,data/raw/no_foul/0022600186_2114_33.mp4
+0022600186_2115_34,0022600186,Bam Adebayo,Max Strus,Shooting Foul,INC,1,data/raw/foul/0022600186_2115_34.mp4
+0022600186_2116_35,0022600186,Max Strus,Giannis Antetokounmpo,Personal Foul,CC,1,data/raw/foul/0022600186_2116_35.mp4
+0022600158_2174_01,0022600158,Sam Merrill,Shai Gilgeous-Alexander,Personal Foul,CNC,0,data/raw/no_foul/0022600158_2174_01.mp4
+0022600158_2175_02,0022600158,Evan Mobley,Isaiah Hartenstein,Personal Foul,CNC,0,data/raw/no_foul/0022600158_2175_02.mp4
+0022600158_2176_03,0022600158,Sam Merrill,Shai Gilgeous-Alexander,Personal Foul,CNC,0,data/raw/no_foul/0022600158_2176_03.mp4
+0022600158_2179_07,0022600158,Sam Merrill,Shai Gilgeous-Alexander,Personal Foul,CNC,0,data/raw/no_foul/0022600158_2179_07.mp4
+0022600158_2181_09,0022600158,Donovan Mitchell,Ajay Mitchell,Personal Foul,CC,1,data/raw/foul/0022600158_2181_09.mp4
+0022600158_2183_11,0022600158,James Harden,Ajay Mitchell,Personal Foul,CC,1,data/raw/foul/0022600158_2183_11.mp4
+0022600158_2185_13,0022600158,Kenrich Williams,Donovan Mitchell,Shooting Foul,CNC,0,data/raw/no_foul/0022600158_2185_13.mp4
+0022600160_2093_00,0022600160,CJ McCollum,Jarace Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600160_2093_00.mp4
+0022600160_2095_02,0022600160,Jay Huff,CJ McCollum,Personal Foul,CNC,0,data/raw/no_foul/0022600160_2095_02.mp4
+0022600160_2096_03,0022600160,Quenton Jackson,Nickeil Alexander-Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600160_2096_03.mp4
+0022600160_2099_07,0022600160,Jarace Walker,Nickeil Alexander-Walker,Personal Foul,CNC,0,data/raw/no_foul/0022600160_2099_07.mp4
+0022600160_2100_08,0022600160,Jalen Slawson,Nickeil Alexander-Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600160_2100_08.mp4
+0022600160_2102_10,0022600160,Jay Huff,Onyeka Okongwu,Shooting Foul,CNC,0,data/raw/no_foul/0022600160_2102_10.mp4
+0022600160_2103_11,0022600160,Onyeka Okongwu,Jay Huff,Shooting Foul,CNC,0,data/raw/no_foul/0022600160_2103_11.mp4
+0022600165_2148_01,0022600165,Cedric Coward,Jeremiah Fears,Personal Foul,CC,1,data/raw/foul/0022600165_2148_01.mp4
+0022600165_2150_03,0022600165,Isaiah Stewart,Zion Williamson,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2150_03.mp4
+0022600165_2151_04,0022600165,Jaylen Wells,Jeremiah Fears,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2151_04.mp4
+0022600165_2152_05,0022600165,Cameron Boozer,Trey Murphy III,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2152_05.mp4
+0022600165_2153_06,0022600165,Cameron Boozer,Trey Murphy III,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2153_06.mp4
+0022600165_2154_07,0022600165,Isaiah Stewart,Zion Williamson,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2154_07.mp4
+0022600165_2156_09,0022600165,Zion Williamson,Ty Jerome,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2156_09.mp4
+0022600165_2159_12,0022600165,Isaiah Stewart,Zion Williamson,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2159_12.mp4
+0022600165_2160_13,0022600165,Ty Jerome,Trey Murphy III,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2160_13.mp4
+0022600165_2160_14,0022600165,Cedric Coward,Trey Murphy III,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2160_14.mp4
+0022600165_2163_17,0022600165,Karlo Matkovic,Ty Jerome,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2163_17.mp4
+0022600165_2165_19,0022600165,Cedric Coward,Saddiq Bey,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2165_19.mp4
+0022600165_2166_20,0022600165,Zion Williamson,Cameron Boozer,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2166_20.mp4
+0022600165_2167_21,0022600165,Zion Williamson,Cameron Boozer,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2167_21.mp4
+0022600165_2172_26,0022600165,Isaiah Stewart,Zion Williamson,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2172_26.mp4
+0022600165_2173_27,0022600165,Jaylen Wells,Saddiq Bey,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2173_27.mp4
+0022600165_2174_28,0022600165,Karlo Matkovic,Ty Jerome,Shooting Foul,CC,1,data/raw/foul/0022600165_2174_28.mp4
+0022600165_2175_29,0022600165,Isaiah Stewart,Zion Williamson,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2175_29.mp4
+0022600165_2176_30,0022600165,Isaiah Stewart,Zion Williamson,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2176_30.mp4
+0022600165_2178_32,0022600165,Isaiah Stewart,Saddiq Bey,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2178_32.mp4
+0022600165_2179_33,0022600165,Jaylen Wells,Jeremiah Fears,Shooting Foul,CC,1,data/raw/foul/0022600165_2179_33.mp4
+0022600165_2180_34,0022600165,Trey Murphy III,Ty Jerome,Personal Foul,CNC,0,data/raw/no_foul/0022600165_2180_34.mp4
+0022600165_2181_35,0022600165,Trey Murphy III,Ty Jerome,Shooting Foul,CNC,0,data/raw/no_foul/0022600165_2181_35.mp4
+0022600169_2102_00,0022600169,Toumani Camara,Nikola Jokic,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2102_00.mp4
+0022600169_2103_02,0022600169,Christian Braun,Damian Lillard,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2103_02.mp4
+0022600169_2104_03,0022600169,Jrue Holiday,Jamal Murray,Personal Foul,CC,1,data/raw/foul/0022600169_2104_03.mp4
+0022600169_2106_05,0022600169,Jrue Holiday,Jamal Murray,Personal Foul,CNC,0,data/raw/no_foul/0022600169_2106_05.mp4
+0022600169_2109_08,0022600169,Toumani Camara,Jamal Murray,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2109_08.mp4
+0022600169_2110_09,0022600169,Deni Avdija,DeMar DeRozan,Personal Foul,CNC,0,data/raw/no_foul/0022600169_2110_09.mp4
+0022600169_2113_12,0022600169,Sidy Cissoko,Aaron Gordon,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2113_12.mp4
+0022600169_2115_14,0022600169,Christian Braun,Deni Avdija,Personal Foul,CNC,0,data/raw/no_foul/0022600169_2115_14.mp4
+0022600169_2116_15,0022600169,Christian Braun,Deni Avdija,Personal Foul,CNC,0,data/raw/no_foul/0022600169_2116_15.mp4
+0022600169_2117_16,0022600169,Christian Braun,Deni Avdija,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2117_16.mp4
+0022600169_2118_17,0022600169,Toumani Camara,Nikola Jokic,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2118_17.mp4
+0022600169_2119_18,0022600169,Aaron Gordon,Deni Avdija,Personal Foul,CC,1,data/raw/foul/0022600169_2119_18.mp4
+0022600169_2120_19,0022600169,Jrue Holiday,Jamal Murray,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2120_19.mp4
+0022600169_2123_22,0022600169,Deni Avdija,Nikola Jokic,Shooting Foul,CNC,0,data/raw/no_foul/0022600169_2123_22.mp4
+0022600170_2124_00,0022600170,Stephen Curry,Devin Booker,Personal Foul,CNC,0,data/raw/no_foul/0022600170_2124_00.mp4
+0022600170_2125_01,0022600170,Jalen Green,Brandin Podziemski,Shooting Foul,CC,1,data/raw/foul/0022600170_2125_01.mp4
