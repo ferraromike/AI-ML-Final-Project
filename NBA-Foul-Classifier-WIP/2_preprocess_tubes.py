@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 """
-STEP 2: Foul-Specific Action-Tube ROI Cropping & Biomechanical Pose Sampling (`2_preprocess_tubes.py`)
+STEP 2: Cross-Platform Foul Action-Tube ROI Cropping & Biomechanical Pose Sampling (`2_preprocess_tubes.py`)
 
-Engineered specifically for NBA Foul Prediction & M1 MacBook Pro stability:
-  1. Apple Silicon (M1/M2/M3) OOM & Deadlock Prevention:
-     - Several NBA L2M broadcast clips include multi-minute Secaucus Replay Center reviews
-       (e.g., `0022600186_2098_17.mp4` has 12,318 frames / 411 seconds / 238 MB, which
-       previously allocated 76.6 GB of uncompressed 1080p frames in RAM and crashed macOS).
-     - Caps live-action foul scanning to the first `max_live_play_sec = 20.0` seconds
-       (where the actual live foul contact always occurs prior to dead-ball replay reviews)
-       and decodes at most 24 downscaled `640x360` scan frames in Pass 1 (< 16 MB RAM).
-     - Fully closes `cv2.VideoCapture` (`cap.release()`) BEFORE invoking PyTorch/Ultralytics
-       `yolo11n-pose.pt` so FFmpeg's H.264 decoder threads never deadlock with PyTorch on arm64.
-  2. Biomechanical Basketball Foul Contact Scoring (`yolo11n-pose.pt`):
-     - Evaluates every candidate player pair using 17-keypoint human skeletons:
-       * Defender wrist/elbow intrusion into shooter/ball-handler head, shoulders, elbows, and wrists
-       * Torso/hip collision proximity and bounding-box IoU
-       * Shooter arm elevation above shoulders (shooting gather/release motion)
-       * Defender lateral closing velocity
-  3. Upper-Body Contact Tube & 12-D Kinematic Feature Extraction:
-     - Centers a temporally stabilized 224x224 crop on the upper-body contact zone across
-       a 1.5s window (16 uniformly sampled frames) around peak foul contact.
-     - Saves both `"video"` `(3, 16, 224, 224)` and `"foul_features"` `(16, 12)` to
-       `data/processed/{foul,no_foul}/{play_id}.pt`, flushing `processed_metadata.csv`
-       incrementally after every single clip.
+Engineered to run reliably on Windows, Linux, and macOS (Intel & Apple Silicon) with low RAM/VRAM:
+  1. Cross-Platform Memory & Thread Safety:
+     - Limits OpenMP/MKL and OpenCV thread pools (`cv2.setNumThreads(0)`) so FFmpeg H.264 decoding
+       never deadlocks with PyTorch on Windows, Linux, or macOS.
+     - Caps live-action foul scanning to the first `max_live_play_sec = 15.0` seconds (skipping
+       multi-minute dead-ball replay reviews) and decodes at most `max_scan_samples = 12` downscaled
+       `640x360` frames in Pass 1 (< 8 MB RAM).
+     - Runs YOLOv11-Pose in micro-batches (`--yolo-batch-size 4`) after `cap.release()`.
+  2. Lightweight Default Batch Processing:
+     - Processes up to `--max-clips 12` balanced clips by default (`--max-clips 0` processes all clips)
+       so student laptops can complete preprocessing quickly.
+     - Supports `--synthetic-fallback` to generate deterministic sample `.pt` tensors from metadata
+       when raw `.mp4` broadcast clips are not locally cached.
 """
 
 from __future__ import annotations
@@ -31,10 +22,13 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 import argparse
 import csv
 import gc
+import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -42,7 +36,15 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
+
+cv2.setNumThreads(0)
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None  # type: ignore[assignment]
+
+BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +63,28 @@ NUM_FOUL_FEATURES = 12
 UPPER_BODY_KPTS = (0, 5, 6, 7, 8, 9, 10)
 ARM_CONTACT_KPTS = (7, 8, 9, 10)
 TORSO_KPTS = (5, 6, 11, 12)
+
+
+def resolve_project_path(path_arg: Path | str) -> Path:
+    """Resolve relative paths cross-platform (normalizing slashes and checking BASE_DIR)."""
+    norm_str = str(path_arg).replace("\\", "/")
+    p = Path(norm_str)
+    if p.is_absolute() or p.exists():
+        return p
+    return BASE_DIR / p
+
+
+def select_yolo_device(requested: Optional[str] = None) -> str:
+    """
+    Select a cross-platform device for Ultralytics YOLOv11-Pose inference.
+    Uses CUDA when available on Windows/Linux, and CPU on macOS (MPS) / CPU machines
+    where Ultralytics pose keypoint NMS is fastest and 100% deterministic.
+    """
+    if requested and requested not in ("auto", "mps"):
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def box_iou_single(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -345,21 +369,22 @@ def smooth_boxes_ema(boxes: np.ndarray, alpha: float = 0.35) -> np.ndarray:
 
 def extract_action_tube(
     video_path: Path | str,
-    det_model: Optional[YOLO] = None,
-    pose_model: Optional[YOLO] = None,
+    det_model: Optional[object] = None,
+    pose_model: Optional[object] = None,
     window_sec: float = 1.5,
     num_frames: int = 16,
     crop_size: int = 224,
     device: str = "cpu",
-    max_live_play_sec: float = 20.0,
-    max_scan_samples: int = 24,
+    max_live_play_sec: float = 15.0,
+    max_scan_samples: int = 12,
+    yolo_batch_size: int = 4,
 ) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
     """
-    M1 MacBook Pro Memory-Safe & Deadlock-Free Action-Tube Extractor:
-      1. Caps live-play scanning to the first `max_live_play_sec` (20.0s, ~600 frames)
-         so multi-minute replay review clips (up to 12,318 frames / 238 MB) never blow up RAM.
-      2. Decodes at most `max_scan_samples` (24) downscaled `640x360` frames and calls
-         `cap.release()` BEFORE running YOLOv11-pose so FFmpeg and PyTorch threads never collide.
+    Cross-Platform Memory-Safe & Deadlock-Free Action-Tube Extractor:
+      1. Caps live-play scanning to the first `max_live_play_sec` (15.0s) so multi-minute
+         replay review clips never exhaust RAM on 8GB laptops.
+      2. Decodes at most `max_scan_samples` (12) downscaled `640x360` frames and calls
+         `cap.release()` BEFORE running YOLOv11-pose in micro-batches (`yolo_batch_size=4`).
       3. Reopens the video after YOLO completes to read ONLY the 16 sampled frames in the
          1.5s window around peak foul contact.
     """
@@ -378,7 +403,6 @@ def extract_action_tube(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
 
-    # Cap active play horizon to the first 20 seconds where the live foul occurs
     max_horizon_frames = max(int(round(fps * max_live_play_sec)), num_frames * 2)
     effective_total = min(reported_frames, max_horizon_frames) if reported_frames > 0 else max_horizon_frames
 
@@ -420,39 +444,37 @@ def extract_action_tube(
     if not small_bgr_frames:
         raise RuntimeError(f"No readable video frames in {video_path}")
 
-    effective_total = max(actual_total, max(scanned_frames) + int(round(fps * 1.5)))
-    if reported_frames > 0:
-        effective_total = min(max(effective_total, actual_total), max(reported_frames, actual_total))
-
     scanned_rois: List[np.ndarray] = []
     scanned_scores: List[float] = []
     scanned_feats: List[np.ndarray] = []
 
-    yolo_device = "cpu" if device == "mps" else device
+    yolo_device = select_yolo_device(device)
+    batch_sz = max(1, int(yolo_batch_size))
     with torch.inference_mode():
-        for small_frame in small_bgr_frames:
-            pose_res = primary_pose.predict(
-                small_frame,
+        for b_start in range(0, len(small_bgr_frames), batch_sz):
+            batch_frames = small_bgr_frames[b_start : b_start + batch_sz]
+            pose_results = primary_pose.predict(
+                batch_frames,
                 conf=0.25,
                 imgsz=480,
                 verbose=False,
                 device=yolo_device,
-            )[0]
-            roi, score, feat_vec = analyze_foul_interaction_frame(
-                pose_res=pose_res,
-                det_res=None,
-                frame_w=frame_w,
-                frame_h=frame_h,
-                scale_x=scale_x,
-                scale_y=scale_y,
             )
-            scanned_rois.append(roi)
-            scanned_scores.append(score)
-            scanned_feats.append(feat_vec)
+            for pose_res in pose_results:
+                roi, score, feat_vec = analyze_foul_interaction_frame(
+                    pose_res=pose_res,
+                    det_res=None,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+                scanned_rois.append(roi)
+                scanned_scores.append(score)
+                scanned_feats.append(feat_vec)
 
     del small_bgr_frames
 
-    # Interpolate ROIs, contact scores, and 12-D features across the active play horizon
     horizon_len = max(scanned_frames[-1] + int(round(fps * 1.0)), num_frames + 1)
     if reported_frames > 0:
         horizon_len = min(horizon_len, reported_frames)
@@ -543,6 +565,76 @@ def extract_action_tube(
     return tube_tensor, crop_boxes, sampled_indices, fps, foul_features_tensor
 
 
+def synthesize_fallback_action_tube(
+    play_id: str,
+    label: int,
+    num_frames: int = 16,
+    crop_size: int = 224,
+) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
+    """
+    Generate a deterministic synthetic `(3, 16, 224, 224)` video tube and `(16, 12)`
+    biomechanical feature sequence seeded by `play_id` and `label` so offline users
+    can test the full preprocessing + 3D CNN training pipeline without downloading GBs of video.
+    """
+    seed = int(hashlib.md5(play_id.encode("utf-8")).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+
+    t_axis = np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
+    contact_envelope = np.exp(-((t_axis - 0.55) ** 2) / 0.045).astype(np.float32)
+    intensity_scale = 0.78 if label == 1 else 0.32
+
+    foul_feats = np.zeros((num_frames, NUM_FOUL_FEATURES), dtype=np.float32)
+    for f_idx in range(NUM_FOUL_FEATURES):
+        noise = rng.normal(0.0, 0.05, size=num_frames).astype(np.float32)
+        foul_feats[:, f_idx] = np.clip(intensity_scale * contact_envelope + 0.15 + noise, 0.0, 1.0)
+    foul_feats[:, 11] = np.clip(intensity_scale * contact_envelope + 0.10, 0.0, 1.0)
+
+    frames = np.zeros((num_frames, crop_size, crop_size, 3), dtype=np.uint8)
+    for t in range(num_frames):
+        canvas = np.full((crop_size, crop_size, 3), (38, 44, 52), dtype=np.uint8)
+        # Draw two converging player silhouettes
+        offset = int((1.0 - contact_envelope[t] * intensity_scale) * 36)
+        cx1, cy1 = crop_size // 2 - max(8, offset), crop_size // 2
+        cx2, cy2 = crop_size // 2 + max(8, offset), crop_size // 2
+        cv2.rectangle(canvas, (cx1 - 22, cy1 - 50), (cx1 + 22, cy1 + 55), (210, 140, 70), -1)
+        cv2.rectangle(canvas, (cx2 - 22, cy2 - 48), (cx2 + 22, cy2 + 55), (75, 165, 225), -1)
+        frames[t] = canvas
+
+    tube_tensor = torch.from_numpy(frames).permute(3, 0, 1, 2).contiguous()
+    crop_boxes = [(420, 180, 868, 628) for _ in range(num_frames)]
+    sampled_indices = list(range(10, 10 + num_frames * 2, 2))
+    return tube_tensor, crop_boxes, sampled_indices, 30.0, torch.from_numpy(foul_feats).float()
+
+
+def select_balanced_subset(rows: List[Dict[str, str]], max_clips: int) -> List[Dict[str, str]]:
+    """
+    Select up to `max_clips` rows while preserving balanced representation of both classes,
+    prioritizing rows whose raw `.mp4` clip is already downloaded in `data/raw/`.
+    """
+    def _has_mp4(r: Dict[str, str]) -> int:
+        vp = resolve_project_path(r.get("video_path", ""))
+        return 0 if (vp.exists() and vp.stat().st_size > 10_240) else 1
+
+    sorted_rows = sorted(rows, key=_has_mp4)
+    if max_clips <= 0 or len(sorted_rows) <= max_clips:
+        return sorted_rows
+    pos_rows = [r for r in sorted_rows if int(r.get("label", 0)) == 1]
+    neg_rows = [r for r in sorted_rows if int(r.get("label", 0)) == 0]
+    half = max(1, max_clips // 2)
+    selected_pos = pos_rows[:half]
+    selected_neg = neg_rows[: max_clips - len(selected_pos)]
+    if len(selected_pos) + len(selected_neg) < max_clips:
+        rem = max_clips - (len(selected_pos) + len(selected_neg))
+        selected_pos.extend(pos_rows[len(selected_pos) : len(selected_pos) + rem])
+    interleaved: List[Dict[str, str]] = []
+    for i in range(max(len(selected_pos), len(selected_neg))):
+        if i < len(selected_pos):
+            interleaved.append(selected_pos[i])
+        if i < len(selected_neg):
+            interleaved.append(selected_neg[i])
+    return interleaved[:max_clips]
+
+
 def write_processed_metadata(processed_metadata_csv: Path, rows: List[Dict[str, str]]) -> None:
     """Atomically write `processed_metadata.csv` after each clip so progress is never lost."""
     if not rows:
@@ -564,90 +656,141 @@ def preprocess_dataset(
     window_sec: float = 1.5,
     num_frames: int = 16,
     crop_size: int = 224,
-    device: str = "cpu",
-    max_live_play_sec: float = 20.0,
-    max_scan_samples: int = 24,
-) -> None:
+    device: str = "auto",
+    max_live_play_sec: float = 15.0,
+    max_scan_samples: int = 12,
+    max_clips: int = 12,
+    yolo_batch_size: int = 4,
+    synthetic_fallback: bool = False,
+) -> List[Dict[str, str]]:
     """
-    Process all raw clips listed in `data/l2m_metadata.csv`, saving pre-cropped
-    `(3, 16, 224, 224)` action tubes and `(16, 12)` biomechanical foul feature tensors
-    to `data/processed/{foul,no_foul}/{play_id}.pt` and incrementally updating
-    `data/processed/processed_metadata.csv`.
+    Process raw clips listed in `data/l2m_metadata.csv` in small batches (`max_clips=12` by default),
+    saving pre-cropped `(3, 16, 224, 224)` action tubes and `(16, 12)` biomechanical foul feature
+    tensors to `data/processed/{foul,no_foul}/{play_id}.pt` and updating `processed_metadata.csv`.
     """
+    metadata_csv = resolve_project_path(metadata_csv)
+    processed_dir = resolve_project_path(processed_dir)
+    processed_metadata_csv = resolve_project_path(processed_metadata_csv)
+
     if not metadata_csv.exists():
         raise FileNotFoundError(
             f"Metadata file {metadata_csv} not found. Run `1_scrape_l2m.py` first."
         )
 
-    active_pose_weights = pose_weights if (pose_weights and Path(pose_weights).exists()) else yolo_weights
-    logger.info("Loading Ultralytics pose/detection model: %s (device=%s)", active_pose_weights, device)
-    pose_model = YOLO(active_pose_weights)
+    with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
+        all_rows = list(csv.DictReader(f))
+
+    rows = select_balanced_subset(all_rows, max_clips=max_clips)
+
+    pose_model = None
+    has_any_raw_video = any(resolve_project_path(r["video_path"]).exists() for r in rows)
+    if has_any_raw_video and YOLO is not None:
+        pose_candidate = resolve_project_path(pose_weights) if pose_weights else None
+        active_pose_weights = (
+            str(pose_candidate)
+            if (pose_candidate and pose_candidate.exists())
+            else (pose_weights or yolo_weights)
+        )
+        yolo_dev = select_yolo_device(device)
+        logger.info("Loading Ultralytics pose/detection model: %s (device=%s)", active_pose_weights, yolo_dev)
+        pose_model = YOLO(active_pose_weights)
 
     processed_dir.mkdir(parents=True, exist_ok=True)
     processed_rows: List[Dict[str, str]] = []
 
-    with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
     logger.info(
-        "Preprocessing %d video clips into %dx%d foul-contact action tubes (M1 memory-safe streaming)...",
+        "Preprocessing %d/%d clips into %dx%d foul-contact action tubes (scan_samples=%d, yolo_batch=%d)...",
         len(rows),
+        len(all_rows),
         crop_size,
         crop_size,
+        max_scan_samples,
+        yolo_batch_size,
     )
 
     for idx, row in enumerate(rows, start=1):
         play_id = row["play_id"]
         label = int(row["label"])
-        video_path = Path(row["video_path"])
+        video_path = resolve_project_path(row["video_path"])
         class_name = "foul" if label == 1 else "no_foul"
         out_tensor_path = processed_dir / class_name / f"{play_id}.pt"
         out_tensor_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not out_tensor_path.exists():
-            if not video_path.exists():
-                logger.warning("Skipping missing raw video: %s", video_path)
-                continue
+        used_synthetic = False
+        needs_reprocess = not out_tensor_path.exists()
+        if out_tensor_path.exists() and video_path.exists() and video_path.stat().st_size > 10_240:
             try:
-                tube_tensor, crop_boxes, sampled_indices, fps, foul_features = extract_action_tube(
-                    video_path=video_path,
-                    det_model=None,
-                    pose_model=pose_model,
-                    window_sec=window_sec,
+                existing_pt = torch.load(out_tensor_path, map_location="cpu", weights_only=False)
+                if isinstance(existing_pt, dict) and existing_pt.get("is_synthetic", True):
+                    needs_reprocess = True
+            except Exception:
+                needs_reprocess = True
+
+        if needs_reprocess:
+            if video_path.exists() and video_path.stat().st_size > 10_240 and pose_model is not None:
+                try:
+                    tube_tensor, crop_boxes, sampled_indices, fps, foul_features = extract_action_tube(
+                        video_path=video_path,
+                        det_model=None,
+                        pose_model=pose_model,
+                        window_sec=window_sec,
+                        num_frames=num_frames,
+                        crop_size=crop_size,
+                        device=device,
+                        max_live_play_sec=max_live_play_sec,
+                        max_scan_samples=max_scan_samples,
+                        yolo_batch_size=yolo_batch_size,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to preprocess %s: %s", video_path, exc)
+                    if not synthetic_fallback:
+                        continue
+                    used_synthetic = True
+                    tube_tensor, crop_boxes, sampled_indices, fps, foul_features = synthesize_fallback_action_tube(
+                        play_id=play_id,
+                        label=label,
+                        num_frames=num_frames,
+                        crop_size=crop_size,
+                    )
+                finally:
+                    gc.collect()
+            elif synthetic_fallback:
+                used_synthetic = True
+                tube_tensor, crop_boxes, sampled_indices, fps, foul_features = synthesize_fallback_action_tube(
+                    play_id=play_id,
+                    label=label,
                     num_frames=num_frames,
                     crop_size=crop_size,
-                    device=device,
-                    max_live_play_sec=max_live_play_sec,
-                    max_scan_samples=max_scan_samples,
                 )
-                torch.save(
-                    {
-                        "video": tube_tensor,
-                        "foul_features": foul_features,
-                        "label": label,
-                        "play_id": play_id,
-                        "call_type": row.get("call_type", ""),
-                        "review_decision": row.get("review_decision", ""),
-                        "crop_boxes": crop_boxes,
-                        "sampled_indices": sampled_indices,
-                        "fps": fps,
-                    },
-                    out_tensor_path,
-                )
-                logger.info(
-                    "[%d/%d] Saved foul action tube -> %s",
-                    idx,
-                    len(rows),
-                    out_tensor_path,
-                )
-            except Exception as exc:
-                logger.warning("Failed to preprocess %s: %s", video_path, exc)
+            else:
+                logger.warning("Skipping missing raw video: %s (pass --synthetic-fallback for offline tensor demo)", video_path)
                 continue
-            finally:
-                gc.collect()
+
+            torch.save(
+                {
+                    "video": tube_tensor,
+                    "foul_features": foul_features,
+                    "label": label,
+                    "play_id": play_id,
+                    "call_type": row.get("call_type", ""),
+                    "review_decision": row.get("review_decision", ""),
+                    "crop_boxes": crop_boxes,
+                    "sampled_indices": sampled_indices,
+                    "fps": fps,
+                    "is_synthetic": used_synthetic,
+                },
+                out_tensor_path,
+            )
+            logger.info(
+                "[%d/%d] Saved foul action tube -> %s",
+                idx,
+                len(rows),
+                out_tensor_path,
+            )
 
         out_row = dict(row)
-        out_row["tensor_path"] = str(out_tensor_path)
+        rel_tensor = Path("data") / "processed" / class_name / f"{play_id}.pt"
+        out_row["tensor_path"] = rel_tensor.as_posix()
         processed_rows.append(out_row)
         write_processed_metadata(processed_metadata_csv, processed_rows)
 
@@ -657,28 +800,29 @@ def preprocess_dataset(
         processed_dir,
         processed_metadata_csv,
     )
+    return processed_rows
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="YOLOv11 Foul-Specific Action-Tube Cropping & Biomechanical Pose Sampling"
+        description="Cross-Platform YOLOv11 Foul Action-Tube Cropping & Biomechanical Pose Sampling"
     )
     parser.add_argument(
         "--metadata-csv",
         type=Path,
-        default=Path("data/l2m_metadata.csv"),
+        default=BASE_DIR / "data" / "l2m_metadata.csv",
         help="Input metadata CSV generated by 1_scrape_l2m.py",
     )
     parser.add_argument(
         "--processed-dir",
         type=Path,
-        default=Path("data/processed"),
+        default=BASE_DIR / "data" / "processed",
         help="Directory to save processed .pt tensors (default: data/processed)",
     )
     parser.add_argument(
         "--processed-metadata-csv",
         type=Path,
-        default=Path("data/processed/processed_metadata.csv"),
+        default=BASE_DIR / "data" / "processed" / "processed_metadata.csv",
         help="Output CSV mapping play_id to processed .pt tensor paths",
     )
     parser.add_argument(
@@ -692,6 +836,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="yolo11n-pose.pt",
         help="Ultralytics YOLOv11-pose weights (default: yolo11n-pose.pt)",
+    )
+    parser.add_argument(
+        "--max-clips",
+        type=int,
+        default=24,
+        help="Max number of clips to preprocess per run (default: 24; set 0 to process all clips)",
+    )
+    parser.add_argument(
+        "--yolo-batch-size",
+        type=int,
+        default=4,
+        help="Micro-batch size for YOLO frame scanning (default: 4; increase on high-VRAM GPUs)",
     )
     parser.add_argument(
         "--window-sec",
@@ -714,20 +870,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-live-play-sec",
         type=float,
-        default=20.0,
-        help="Max live-play horizon in seconds to scan per clip (default: 20.0, skipping multi-minute replay reviews)",
+        default=15.0,
+        help="Max live-play horizon in seconds to scan per clip (default: 15.0, skipping replay reviews)",
     )
     parser.add_argument(
         "--max-scan-samples",
         type=int,
-        default=24,
-        help="Max frames sampled during Pass 1 pose/contact detection (default: 24)",
+        default=12,
+        help="Max frames sampled during Pass 1 pose/contact detection (default: 12; increase to 24 for higher temporal resolution)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Inference device for YOLO ('cuda' or 'cpu')",
+        default="auto",
+        help="Inference device for YOLO ('auto', 'cuda', or 'cpu')",
+    )
+    parser.add_argument(
+        "--synthetic-fallback",
+        action="store_true",
+        help="Generate synthetic .pt action tubes when raw MP4 clips are not downloaded locally",
     )
     return parser.parse_args()
 
@@ -746,4 +907,7 @@ if __name__ == "__main__":
         device=args.device,
         max_live_play_sec=args.max_live_play_sec,
         max_scan_samples=args.max_scan_samples,
+        max_clips=args.max_clips,
+        yolo_batch_size=args.yolo_batch_size,
+        synthetic_fallback=args.synthetic_fallback,
     )
