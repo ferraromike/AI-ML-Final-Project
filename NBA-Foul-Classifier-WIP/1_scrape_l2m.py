@@ -30,10 +30,89 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
-import requests
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    HAS_REQUESTS = True
+except ImportError:
+    requests = None  # type: ignore[assignment]
+    HAS_REQUESTS = False
+
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    BeautifulSoup = None  # type: ignore[assignment]
+    HAS_BS4 = False
+
+
+class _StdlibResponse:
+    def __init__(self, status_code: int, content: bytes, stream_resp=None) -> None:
+        self.status_code = status_code
+        self.content = content
+        self._stream_resp = stream_resp
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8-sig", errors="replace")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise OSError(f"HTTP Error {self.status_code}")
+
+    def iter_content(self, chunk_size: int = 65536):
+        if self._stream_resp is not None:
+            while True:
+                chunk = self._stream_resp.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        else:
+            for i in range(0, len(self.content), chunk_size):
+                yield self.content[i : i + chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._stream_resp is not None:
+            try:
+                self._stream_resp.close()
+            except Exception:
+                pass
+
+
+class _StdlibSession:
+    def get(self, url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, str]] = None, timeout: int = 20, stream: bool = False) -> _StdlibResponse:
+        if params:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+        req_headers = dict(headers or {})
+        req_headers.pop("Accept-Encoding", None)
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        status = getattr(resp, "status", 200)
+        if stream:
+            return _StdlibResponse(status, b"", stream_resp=resp)
+        data = resp.read()
+        resp.close()
+        return _StdlibResponse(status, data)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_project_path(path_arg: Path | str) -> Path:
+    norm_str = str(path_arg).replace("\\", "/")
+    cand = Path(norm_str)
+    if cand.is_absolute() or cand.exists():
+        return cand
+    return BASE_DIR / cand
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,8 +191,10 @@ DAILY_INC_IC_COLUMNS = [
 ]
 
 
-def build_session(retries: int = 3, backoff_factor: float = 1.0) -> requests.Session:
-    """Create a resilient HTTP session with exponential retry backoff."""
+def build_session(retries: int = 3, backoff_factor: float = 1.0) -> Any:
+    """Create a resilient HTTP session with exponential retry backoff (or stdlib urllib fallback)."""
+    if not HAS_REQUESTS:
+        return _StdlibSession()
     session = requests.Session()
     retry = Retry(
         total=retries,
@@ -152,13 +233,15 @@ def discover_l2m_game_ids(
         try:
             resp = session.get(index_url, headers=OFFICIAL_HEADERS, timeout=20)
             resp.raise_for_status()
-        except requests.RequestException as exc:
+        except Exception as exc:
             logger.warning("Failed to fetch index URL %s: %s", index_url, exc)
             continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            href = anchor["href"]
+        if HAS_BS4 and BeautifulSoup is not None:
+            href_list = [a["href"] for a in BeautifulSoup(resp.text, "html.parser").find_all("a", href=True)]
+        else:
+            href_list = re.findall(r"""href\s*=\s*['"]([^'"]+)['"]""", resp.text, flags=re.IGNORECASE)
+        for href in href_list:
             if "L2MReport.html" not in href and "gameId=" not in href:
                 continue
             parsed = urlparse(href)
@@ -268,7 +351,7 @@ def fetch_l2m_report_entries(
                 if isinstance(l2m_rows, list) and l2m_rows:
                     logger.info("Loaded %d L2M play entries for game %s", len(l2m_rows), game_id)
                     return meta_dict, l2m_rows
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
         logger.debug("JSON endpoint fallback for game %s: %s", game_id, exc)
 
     html_url = L2M_HTML_ENDPOINT.format(game_id=game_id)
@@ -297,7 +380,7 @@ def fetch_l2m_report_entries(
                     }
                 )
         return {"GameId": game_id}, rows
-    except requests.RequestException as exc:
+    except Exception as exc:
         logger.warning("Failed to fetch L2M report for game %s: %s", game_id, exc)
         return {"GameId": game_id}, []
 
@@ -469,7 +552,7 @@ def resolve_mp4_url(
                 html_text,
                 flags=re.IGNORECASE,
             )
-            if not mp4_candidates:
+            if not mp4_candidates and HAS_BS4 and BeautifulSoup is not None:
                 soup = BeautifulSoup(html_text, "html.parser")
                 for tag in soup.find_all(["video", "source", "a"]):
                     src = tag.get("src") or tag.get("href") or ""
@@ -482,7 +565,7 @@ def resolve_mp4_url(
                     if "1509" in candidate or "1500" in candidate or "high" in candidate.lower():
                         return normalize_extracted_mp4_url(candidate, default_scheme=scheme)
                 return normalize_extracted_mp4_url(mp4_candidates[0], default_scheme=scheme)
-    except requests.RequestException as exc:
+    except Exception as exc:
         logger.debug("Failed fetching L2M video page for game=%s event=%s: %s", game_id, event_id, exc)
 
     return None
@@ -515,7 +598,7 @@ def download_mp4_clip(
             return True
         tmp_path.unlink(missing_ok=True)
         return False
-    except (requests.RequestException, OSError) as exc:
+    except Exception as exc:
         logger.warning("Failed downloading %s: %s", mp4_url, exc)
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -615,7 +698,10 @@ def extract_entry_fields(
 
 
 def write_metadata_rows(metadata_csv: Path, rows: List[Dict[str, Any]]) -> None:
-    """Write collected L2M metadata rows to CSV atomically."""
+    """Write collected L2M metadata rows to CSV atomically without wiping existing data if empty."""
+    if not rows and metadata_csv.exists() and metadata_csv.stat().st_size > 120:
+        logger.info("No new rows scraped; preserving existing %s", metadata_csv)
+        return
     metadata_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(metadata_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=MASTER_CSV_COLUMNS)
@@ -623,54 +709,143 @@ def write_metadata_rows(metadata_csv: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def download_missing_clips_from_rows(
+    session: requests.Session,
+    rows: List[Dict[str, Any]],
+    output_dir: Path,
+    max_clips: int = 30,
+    sleep_sec: float = 0.15,
+) -> int:
+    """
+    Ensure `data/raw/foul/` and `data/raw/no_foul/` are populated with downloaded `.mp4` clips
+    by resolving and downloading missing videos for rows in `rows` (interleaving foul and no_foul
+    plays so both classes are well-represented on disk).
+    """
+    output_dir = resolve_project_path(output_dir)
+    foul_dir = output_dir / "foul"
+    no_foul_dir = output_dir / "no_foul"
+    foul_dir.mkdir(parents=True, exist_ok=True)
+    no_foul_dir.mkdir(parents=True, exist_ok=True)
+
+    foul_rows = [r for r in rows if int(r.get("label", 0)) == 1]
+    no_foul_rows = [r for r in rows if int(r.get("label", 0)) == 0]
+    interleaved: List[Dict[str, Any]] = []
+    for i in range(max(len(foul_rows), len(no_foul_rows))):
+        if i < len(foul_rows):
+            interleaved.append(foul_rows[i])
+        if i < len(no_foul_rows):
+            interleaved.append(no_foul_rows[i])
+
+    downloaded = 0
+    for row in interleaved:
+        if max_clips > 0 and downloaded >= max_clips:
+            break
+        play_id = str(row.get("play_id", "")).strip()
+        game_id = normalize_game_id(str(row.get("game_id", "")))
+        label = int(row.get("label", 0))
+        if not play_id or not game_id:
+            continue
+
+        class_subdir = foul_dir if label == 1 else no_foul_dir
+        dest_path = class_subdir / f"{play_id}.mp4"
+        if dest_path.exists() and dest_path.stat().st_size > 10_240:
+            continue
+
+        parts = play_id.split("_")
+        event_id = parts[1] if len(parts) > 1 else ""
+        if not event_id:
+            continue
+
+        mp4_url = resolve_mp4_url(
+            session=session,
+            game_id=game_id,
+            video_event_id=event_id,
+        )
+        if mp4_url and download_mp4_clip(session, mp4_url, dest_path):
+            downloaded += 1
+            time.sleep(sleep_sec)
+
+    return downloaded
+
+
 def run_training_dataset_scraper(
     output_dir: Path,
     metadata_csv: Path,
-    daily_csv: Optional[Path] = Path("data/l2m_incorrect_fouls.csv"),
-    include_archive: bool = False,
-    max_games: int = 25,
-    max_clips: int = 200,
+    daily_csv: Optional[Path] = BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
+    include_archive: bool = True,
+    max_games: int = 10,
+    max_clips: int = 30,
     skip_download: bool = False,
-    sleep_sec: float = 0.25,
+    sleep_sec: float = 0.20,
 ) -> List[Dict[str, Any]]:
     """
-    Scrape NBA L2M reports, map Shooting/Personal fouls to binary labels (1=foul, 0=no_foul),
-    download MP4 clips to `data/raw/{foul,no_foul}/`, write `data/l2m_metadata.csv`,
-    and also append any `INC` / `IC` foul plays to `data/l2m_incorrect_fouls.csv`.
+    Scrape NBA L2M reports, create `data/raw/{foul,no_foul}/`, preserve existing rows in
+    `data/l2m_metadata.csv`, discover new games (across current + archive pages), and
+    download up to `max_clips` `.mp4` videos into `data/raw/{foul,no_foul}/`.
     """
-    session = build_session()
+    output_dir = resolve_project_path(output_dir)
+    metadata_csv = resolve_project_path(metadata_csv)
+    if daily_csv is not None:
+        daily_csv = resolve_project_path(daily_csv)
+
     foul_dir = output_dir / "foul"
     no_foul_dir = output_dir / "no_foul"
     foul_dir.mkdir(parents=True, exist_ok=True)
     no_foul_dir.mkdir(parents=True, exist_ok=True)
     metadata_csv.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Initialized raw video directories: %s and %s", foul_dir, no_foul_dir)
 
+    session = build_session()
     parsed_base = urlparse(CURRENT_SEASON_URL)
     official_root = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    # Load existing metadata rows so we never overwrite or lose already-scraped plays
+    collected_rows: List[Dict[str, Any]] = []
+    seen_play_ids: Set[str] = set()
+    existing_game_ids: List[str] = []
+    if metadata_csv.exists():
+        with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                pid = row.get("play_id")
+                gid = normalize_game_id(row.get("game_id", ""))
+                if pid and pid not in seen_play_ids:
+                    seen_play_ids.add(pid)
+                    collected_rows.append(row)
+                if gid and gid not in existing_game_ids:
+                    existing_game_ids.append(gid)
 
     existing_inc_ic_ids: Set[str] = set()
     if daily_csv is not None:
         daily_csv.parent.mkdir(parents=True, exist_ok=True)
         if daily_csv.exists():
             with open(daily_csv, "r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
+                for row in csv.DictReader(f):
                     if row.get("play_id"):
                         existing_inc_ic_ids.add(row["play_id"])
 
-    index_urls = [CURRENT_SEASON_URL]
+    season_urls = [
+        CURRENT_SEASON_URL,
+        f"{official_root}/2025-26-nba-officiating-last-two-minute-reports/",
+        f"{official_root}/2024-25-nba-officiating-last-two-minute-reports/",
+    ]
     if include_archive:
-        index_urls.append(ARCHIVE_URL)
+        season_urls.append(ARCHIVE_URL)
 
-    game_ids = discover_l2m_game_ids(session, index_urls, max_games=max_games)
-    collected_rows: List[Dict[str, Any]] = []
-    seen_play_ids: Set[str] = set()
+    # Discover more games than already in CSV so new games are always inspected
+    target_discover = max(max_games, len(existing_game_ids) + max_games)
+    discovered_ids = discover_l2m_game_ids(session, season_urls, max_games=target_discover)
+
+    # Prioritize newly discovered games first, then existing games
+    new_game_ids = [g for g in discovered_ids if g not in existing_game_ids]
+    game_ids = (new_game_ids + [g for g in discovered_ids if g in existing_game_ids] + existing_game_ids)[: max(max_games, len(new_game_ids[:max_games])) or max_games]
+
     pbp_cache: Dict[str, List[Dict[str, Any]]] = {}
     downloaded_count = 0
+    new_rows_added = 0
 
     try:
         for game_id in game_ids:
-            if len(collected_rows) >= max_clips:
+            if not skip_download and max_clips > 0 and downloaded_count >= max_clips:
                 break
 
             game_meta, entries = fetch_l2m_report_entries(session, game_id)
@@ -687,9 +862,6 @@ def run_training_dataset_scraper(
             game_added = 0
             game_inc_ic_rows: List[Dict[str, Any]] = []
             for idx, raw_entry in enumerate(entries):
-                if len(collected_rows) >= max_clips:
-                    break
-
                 parsed = extract_entry_fields(game_id, idx, raw_entry)
                 norm_call_type = is_shooting_or_personal_foul(parsed["call_type_raw"])
                 if norm_call_type is None:
@@ -702,39 +874,40 @@ def run_training_dataset_scraper(
                 label = LABEL_MAP[decision]
                 class_subdir = foul_dir if label == 1 else no_foul_dir
                 play_id = parsed["play_id"]
-                if play_id in seen_play_ids:
-                    continue
 
                 rel_video_path = Path("data") / "raw" / ("foul" if label == 1 else "no_foul") / f"{play_id}.mp4"
                 abs_video_path = class_subdir / f"{play_id}.mp4"
-                video_path_str = str(rel_video_path)
+                video_path_str = rel_video_path.as_posix()
 
+                need_clip = (not skip_download) and (max_clips <= 0 or downloaded_count < max_clips) and not (abs_video_path.exists() and abs_video_path.stat().st_size > 10_240)
                 mp4_url: Optional[str] = None
-                if not skip_download or decision in {"INC", "IC"}:
+                if need_clip or decision in {"INC", "IC"}:
                     mp4_url = resolve_mp4_url(
                         session=session,
                         game_id=game_id,
-                        video_event_id=parsed["video_event_id"],
+                        video_event_id=parsed['video_event_id'],
                         period_name=parsed["period"],
                         pc_time=parsed["time_remaining"],
                         pbp_cache=pbp_cache,
                     )
-                if not skip_download and mp4_url and download_mp4_clip(session, mp4_url, abs_video_path):
+                if need_clip and mp4_url and download_mp4_clip(session, mp4_url, abs_video_path):
                     downloaded_count += 1
 
-                row = {
-                    "play_id": play_id,
-                    "game_id": game_id,
-                    "player_committing": parsed["player_committing"],
-                    "player_disadvantaged": parsed["player_disadvantaged"],
-                    "call_type": norm_call_type,
-                    "review_decision": decision,
-                    "label": label,
-                    "video_path": video_path_str,
-                }
-                collected_rows.append(row)
-                seen_play_ids.add(play_id)
-                game_added += 1
+                if play_id not in seen_play_ids:
+                    row = {
+                        "play_id": play_id,
+                        "game_id": game_id,
+                        "player_committing": parsed["player_committing"],
+                        "player_disadvantaged": parsed["player_disadvantaged"],
+                        "call_type": norm_call_type,
+                        "review_decision": decision,
+                        "label": label,
+                        "video_path": video_path_str,
+                    }
+                    collected_rows.append(row)
+                    seen_play_ids.add(play_id)
+                    game_added += 1
+                    new_rows_added += 1
 
                 if daily_csv is not None and decision in {"INC", "IC"} and play_id not in existing_inc_ic_ids:
                     fallback_url = (
@@ -761,11 +934,11 @@ def run_training_dataset_scraper(
             if game_added > 0:
                 write_metadata_rows(metadata_csv, collected_rows)
                 logger.info(
-                    "Game %s: extracted %d foul plays (running total: %d saved to %s)",
+                    "Game %s: added %d new foul plays (total metadata rows: %d, downloaded clips: %d)",
                     game_id,
                     game_added,
                     len(collected_rows),
-                    metadata_csv,
+                    downloaded_count,
                 )
 
             if daily_csv is not None and game_inc_ic_rows:
@@ -775,24 +948,38 @@ def run_training_dataset_scraper(
                     if write_header:
                         writer.writeheader()
                     writer.writerows(game_inc_ic_rows)
-                logger.info(
-                    "Game %s: appended %d INC/IC plays to %s",
-                    game_id,
-                    len(game_inc_ic_rows),
-                    daily_csv,
-                )
 
             time.sleep(sleep_sec)
+
+        # If we still need more MP4 clips in data/raw/ to reach max_clips, backfill from collected_rows
+        if not skip_download and (max_clips <= 0 or downloaded_count < max_clips) and collected_rows:
+            remaining = (max_clips - downloaded_count) if max_clips > 0 else 0
+            logger.info(
+                "Backfilling up to %d missing MP4 video clips into %s from %d metadata rows...",
+                remaining,
+                output_dir,
+                len(collected_rows),
+            )
+            downloaded_count += download_missing_clips_from_rows(
+                session=session,
+                rows=collected_rows,
+                output_dir=output_dir,
+                max_clips=remaining,
+                sleep_sec=sleep_sec,
+            )
     except KeyboardInterrupt:
         logger.warning("Interrupted by user; saving %d collected rows to %s", len(collected_rows), metadata_csv)
     finally:
         write_metadata_rows(metadata_csv, collected_rows)
 
+    existing_mp4_total = len(list(output_dir.rglob("*.mp4")))
     logger.info(
-        "Saved %d labeled L2M foul plays (%d MP4 clips downloaded) to %s",
+        "Scraper complete: %d total metadata rows (%d newly added) | %d new MP4s downloaded (%d total MP4s in %s)",
         len(collected_rows),
+        new_rows_added,
         downloaded_count,
-        metadata_csv,
+        existing_mp4_total,
+        output_dir,
     )
     return collected_rows
 
@@ -854,7 +1041,7 @@ def run_daily_inc_ic_monitor(
             mp4_url = resolve_mp4_url(
                 session=session,
                 game_id=game_id,
-                video_event_id=parsed["video_event_id"],
+                video_event_id=parsed['video_event_id'],
                 period_name=parsed["period"],
                 pc_time=parsed["time_remaining"],
                 pbp_cache=pbp_cache,
@@ -915,8 +1102,8 @@ KNOWN_GAME_DATES: Dict[str, str] = {
 
 
 def populate_foul_csv_from_local_metadata(
-    metadata_csv: Path = Path("data/l2m_metadata.csv"),
-    daily_csv: Path = Path("data/l2m_incorrect_fouls.csv"),
+    metadata_csv: Path = BASE_DIR / "data" / "l2m_metadata.csv",
+    daily_csv: Path = BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
     include_confirmed_fouls: bool = True,
 ) -> List[Dict[str, Any]]:
     """
@@ -925,6 +1112,8 @@ def populate_foul_csv_from_local_metadata(
     confirmed foul plays when `include_confirmed_fouls=True`) so the CSV is completely
     populated even when offline.
     """
+    metadata_csv = resolve_project_path(metadata_csv)
+    daily_csv = resolve_project_path(daily_csv)
     if not metadata_csv.exists():
         logger.warning("Metadata file %s does not exist.", metadata_csv)
         return []
@@ -1016,13 +1205,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/raw"),
+        default=BASE_DIR / "data" / "raw",
         help="Directory to store downloaded raw MP4 clips (default: data/raw)",
     )
     parser.add_argument(
         "--metadata-csv",
         type=Path,
-        default=Path("data/l2m_metadata.csv"),
+        default=BASE_DIR / "data" / "l2m_metadata.csv",
         help="Path to master metadata CSV (default: data/l2m_metadata.csv)",
     )
     parser.add_argument(
@@ -1033,14 +1222,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-games",
         type=int,
-        default=25,
-        help="Maximum number of L2M game reports to inspect (default: 25)",
+        default=10,
+        help="Maximum number of L2M game reports to inspect (default: 10; increase for larger datasets)",
     )
     parser.add_argument(
         "--max-clips",
         type=int,
-        default=200,
-        help="Maximum number of foul/no_foul MP4 clips to download (default: 200)",
+        default=30,
+        help="Maximum number of foul/no_foul MP4 clips to download (default: 30; increase for larger datasets)",
     )
     parser.add_argument(
         "--skip-download",
@@ -1060,7 +1249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--daily-csv",
         type=Path,
-        default=Path("data/l2m_incorrect_fouls.csv"),
+        default=BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
         help="Target CSV for daily INC/IC foul monitoring (default: data/l2m_incorrect_fouls.csv)",
     )
     return parser.parse_args()

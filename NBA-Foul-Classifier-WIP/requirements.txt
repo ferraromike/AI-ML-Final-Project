@@ -1,4 +1,4 @@
-# Computer Vision Pipeline (PyTorch, Torchvision, Ultralytics YOLO, OpenCV)
+# Cross-Platform Computer Vision & Spatiotemporal Deep Learning Pipeline
 torch>=2.2.0
 torchvision>=0.17.0
 ultralytics>=8.3.0
@@ -6,12 +6,18 @@ opencv-python>=4.9.0.80
 numpy>=1.26.0
 scikit-learn>=1.4.0
 
-# NBA L2M Web & API Scraper
+# NBA L2M Web & JSON API Scraper
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 urllib3>=2.2.0
 
-# Discord Bot (Fred)
+# Interactive Jupyter Notebook Support
+jupyter>=1.0.0
+ipykernel>=6.29.0
+matplotlib>=3.8.0
+pandas>=2.2.0
+
+# Team Project Management Discord Bot (Fred)
 discord.py>=2.3.0
 openai>=1.14.0
 python-dotenv>=1.0.1

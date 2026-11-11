@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 """
-STEP 4: Foul Prediction Training, Threshold Calibration & Single-Clip Inference (`4_train_eval.py`)
+STEP 4: Cross-Platform Foul Training, Threshold Calibration & Single-Clip Inference (`4_train_eval.py`)
 
-Optimized for both Apple Silicon (M1/M2/M3 MacBook Pro) and 8GB VRAM Consumer GPUs:
+Engineered to run on ALL machines (Windows, Linux, Intel Mac, Apple Silicon M1/M2/M3/M4, CUDA GPUs, or CPU laptops):
   - Auto-selects compute device (`cuda`, `mps`, or `cpu`) and configures safe DataLoader
-    multiprocessing on macOS.
-  - Uses `torch.amp.autocast('cuda')` (FP16 mixed precision) and `GradScaler` when on CUDA.
-  - Uses `batch_size=4` with gradient accumulation (`accum_steps=4`, effective batch size 16).
-  - Combines class-weighted `BCEWithLogitsLoss(pos_weight=...)` with Focal Foul Loss
-    modulation so borderline shooting/personal fouls receive strong gradient weight.
-  - Calibrates the optimal foul probability threshold (`optimal_threshold`) on the validation
-    set each epoch to maximize Foul F1-Score, saving `best_foul_r2plus1d.pt`.
-  - CLI inference mode (`--predict path/to/clip.mp4`) runs the full YOLOv11-pose foul-contact
-    crop + `R(2+1)D-18` + Biomechanical Pose Fusion pipeline and outputs an annotated MP4
-    with the contact ROI box, biomechanical contact meter, and predicted foul probability.
+    worker settings (`num_workers=0` on Windows and macOS to prevent multiprocessing spawn hangs).
+  - Lightweight Default Batch Sizes:
+    * `--batch-size 2` with `--accum-steps 2` (effective batch size 4, cutting peak RAM/VRAM in half).
+    * `--epochs 5` and `--max-samples 20` by default so training completes in minutes on any machine.
+  - Uses `FoulFocalBCEWithLogitsLoss` (`gamma=1.5`) and calibrates `optimal_threshold` on validation
+    data each epoch to maximize Foul F1-Score (`best_foul_r2plus1d.pt`).
+  - CLI inference (`--predict path/to/clip.mp4`) includes cross-OS video codec fallback (`mp4v`, `avc1`, `XVID`).
 """
 
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 import argparse
+import contextlib
 import importlib
 import logging
 import platform
 import random
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -46,12 +51,20 @@ from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from ultralytics import YOLO
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None  # type: ignore[assignment]
+
+cv2.setNumThreads(0)
 
 preprocess_mod = importlib.import_module("2_preprocess_tubes")
 model_mod = importlib.import_module("3_model_and_dataset")
 
 extract_action_tube = preprocess_mod.extract_action_tube
+resolve_project_path = model_mod.resolve_project_path
+load_torch_file_safe = model_mod.load_torch_file_safe
 ConsistentVideoAugmentor = model_mod.ConsistentVideoAugmentor
 FoulClassifier3D = model_mod.FoulClassifier3D
 L2MFoulDataset = model_mod.L2MFoulDataset
@@ -73,14 +86,32 @@ def seed_everything(seed: int = 42) -> None:
 
 
 def select_compute_device(requested: Optional[str] = None) -> torch.device:
-    """Select the best available device ('cuda', 'mps' on M1/M2/M3 Mac, or 'cpu')."""
-    if requested:
+    """Select the best available compute device ('cuda', 'mps', or 'cpu') across all OSes."""
+    if requested and requested.lower() != "auto":
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def get_safe_num_workers(requested_workers: int) -> int:
+    """
+    Return a crash-free DataLoader `num_workers` count across operating systems.
+    On Windows and macOS (`Darwin`), Python's `spawn` multiprocessing start method
+    duplicates PyTorch memory and can hang with 3D video tensors, so `0` is safest.
+    """
+    if platform.system() in ("Darwin", "Windows"):
+        return 0
+    return max(0, requested_workers)
+
+
+def get_autocast_context(device: torch.device):
+    """Return a cross-platform FP16 autocast context on CUDA and a no-op context on MPS/CPU."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        return torch.amp.autocast("cuda", enabled=True)
+    return contextlib.nullcontext()
 
 
 class FoulFocalBCEWithLogitsLoss(nn.Module):
@@ -163,38 +194,43 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: Optional[torch.amp.GradScaler],
     device: torch.device,
-    accum_steps: int = 4,
+    accum_steps: int = 2,
 ) -> float:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
     total_samples = 0
-    use_cuda_amp = device.type == "cuda"
+    accum_steps = max(1, int(accum_steps))
 
     for step, batch in enumerate(loader):
         videos, foul_feats, targets = batch
-        videos = videos.to(device, non_blocking=True)
-        foul_feats = foul_feats.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True).unsqueeze(1)
+        videos = videos.to(device, non_blocking=(device.type == "cuda"))
+        foul_feats = foul_feats.to(device, non_blocking=(device.type == "cuda"))
+        targets = targets.to(device, non_blocking=(device.type == "cuda")).unsqueeze(1)
 
-        with torch.amp.autocast("cuda", enabled=use_cuda_amp):
+        with get_autocast_context(device):
             logits = model(videos, foul_feats)
             raw_loss = criterion(logits, targets)
             scaled_loss = raw_loss / accum_steps
 
-        scaler.scale(scaled_loss).backward()
+        if scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         is_update_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(loader))
         if is_update_step:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                max_norm=1.0,
-            )
-            scaler.step(optimizer)
-            scaler.update()
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         batch_sz = videos.size(0)
@@ -216,15 +252,14 @@ def evaluate(
     total_samples = 0
     all_targets: List[int] = []
     all_probs: List[float] = []
-    use_cuda_amp = device.type == "cuda"
 
     for batch in loader:
         videos, foul_feats, targets = batch
-        videos = videos.to(device, non_blocking=True)
-        foul_feats = foul_feats.to(device, non_blocking=True)
-        targets_dev = targets.to(device, non_blocking=True).unsqueeze(1)
+        videos = videos.to(device, non_blocking=(device.type == "cuda"))
+        foul_feats = foul_feats.to(device, non_blocking=(device.type == "cuda"))
+        targets_dev = targets.to(device, non_blocking=(device.type == "cuda")).unsqueeze(1)
 
-        with torch.amp.autocast("cuda", enabled=use_cuda_amp):
+        with get_autocast_context(device):
             logits = model(videos, foul_feats)
             loss = criterion(logits, targets_dev)
             probs = torch.sigmoid(logits).squeeze(1)
@@ -244,18 +279,19 @@ def evaluate(
 def run_training_pipeline(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = select_compute_device(args.device)
-    logger.info("Using compute device: %s", device)
+    logger.info("Using compute device: %s (OS: %s)", device, platform.system())
 
     base_dataset = L2MFoulDataset(
         processed_dir=args.processed_dir,
         metadata_csv=args.metadata_csv,
         is_train=True,
+        max_samples=args.max_samples,
         return_foul_features=True,
     )
     if len(base_dataset) < 2:
         raise RuntimeError(
             f"Found {len(base_dataset)} processed samples in {args.processed_dir}. "
-            "Run `1_scrape_l2m.py` and `2_preprocess_tubes.py` first."
+            "Run `1_scrape_l2m.py` and `2_preprocess_tubes.py` (or `--synthetic-fallback`) first."
         )
 
     all_samples = base_dataset.samples
@@ -280,34 +316,38 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
         return_foul_features=True,
     )
 
-    # On macOS (Darwin), DataLoader num_workers=0 avoids fork/MPS crashes
-    safe_workers = 0 if platform.system() == "Darwin" else args.num_workers
+    safe_workers = get_safe_num_workers(args.num_workers)
+    use_pin_memory = device.type == "cuda"
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=safe_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=use_pin_memory,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=safe_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=use_pin_memory,
     )
 
     model = FoulClassifier3D(
-        pretrained=True,
+        pretrained=not args.no_pretrained,
         dropout_p=args.dropout,
         freeze_early=True,
     ).to(device)
     param_info = model.trainable_parameter_summary()
     logger.info(
-        "Initialized R(2+1)D-18 + Biomechanical Foul-Pose Classifier | Trainable: %s / %s params",
+        "Initialized R(2+1)D-18 + Biomechanical Foul-Pose Classifier | Trainable: %s / %s params | "
+        "batch_size=%d, accum_steps=%d (effective batch=%d)",
         f"{param_info['trainable_params']:,}",
         f"{param_info['total_params']:,}",
+        args.batch_size,
+        args.accum_steps,
+        args.batch_size * args.accum_steps,
     )
 
     pos_weight = compute_pos_weight(train_samples, device=device)
@@ -321,13 +361,18 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
     )
     scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=args.epochs,
+        T_max=max(1, args.epochs),
         eta_min=args.lr * 0.01,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=True)
+        if (device.type == "cuda" and torch.cuda.is_available())
+        else None
+    )
 
     best_f1 = -1.0
     best_roc_auc = -1.0
+    ckpt_path = resolve_project_path(args.checkpoint_path)
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
@@ -369,6 +414,7 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
         ):
             best_f1 = metrics["f1"]
             best_roc_auc = metrics["roc_auc"]
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "epoch": epoch,
@@ -378,15 +424,30 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
                     "optimal_threshold": metrics["threshold"],
                     "val_loss": val_loss,
                 },
-                args.checkpoint_path,
+                ckpt_path,
             )
             logger.info(
                 "Saved new best foul checkpoint -> %s (F1=%.3f, ROC-AUC=%.3f, threshold=%.2f)",
-                args.checkpoint_path,
+                ckpt_path,
                 best_f1,
                 best_roc_auc,
                 metrics["threshold"],
             )
+
+
+def create_cross_platform_video_writer(
+    output_path: Path,
+    fps: float,
+    width: int,
+    height: int,
+) -> cv2.VideoWriter:
+    """Create an OpenCV VideoWriter with cross-OS codec fallback (`mp4v` -> `avc1` -> `XVID`)."""
+    for codec in ("mp4v", "avc1", "XVID"):
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if writer.isOpened():
+            return writer
+    raise RuntimeError(f"Could not initialize VideoWriter for {output_path} on {platform.system()}")
 
 
 @torch.no_grad()
@@ -397,24 +458,34 @@ def predict_single_clip(
     yolo_weights: str = "yolo11n.pt",
     pose_weights: Optional[str] = "yolo11n-pose.pt",
 ) -> float:
+    video_path = resolve_project_path(video_path)
+    checkpoint_path = resolve_project_path(checkpoint_path)
+
     if not video_path.exists():
         raise FileNotFoundError(f"Input clip not found: {video_path}")
+    if YOLO is None:
+        raise ImportError("Ultralytics is required for raw MP4 clip inference (`pip install ultralytics`).")
 
     device = select_compute_device()
-    active_pose = pose_weights if (pose_weights and Path(pose_weights).exists()) else yolo_weights
+    pose_candidate = resolve_project_path(pose_weights) if pose_weights else None
+    active_pose = (
+        str(pose_candidate)
+        if (pose_candidate and pose_candidate.exists())
+        else (pose_weights or yolo_weights)
+    )
     pose_model = YOLO(active_pose)
 
     tube_tensor, crop_boxes, sampled_indices, fps, foul_features = extract_action_tube(
         video_path=video_path,
         det_model=None,
         pose_model=pose_model,
-        device="cpu",
+        device=str(device),
     )
 
     model = FoulClassifier3D(pretrained=False, freeze_early=False).to(device)
     threshold = 0.50
     if checkpoint_path.exists():
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt = load_torch_file_safe(checkpoint_path, map_location=device)
         state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         model.load_state_dict(state_dict, strict=False)
         if isinstance(ckpt, dict) and "optimal_threshold" in ckpt:
@@ -431,7 +502,7 @@ def predict_single_clip(
     input_batch = augmentor(tube_tensor).unsqueeze(0).to(device)
     feats_batch = foul_features.unsqueeze(0).to(device)
 
-    with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+    with get_autocast_context(device):
         logit = model(input_batch, feats_batch)
         foul_prob = float(torch.sigmoid(logit).item())
 
@@ -448,6 +519,8 @@ def predict_single_clip(
 
     if output_mp4_path is None:
         output_mp4_path = video_path.with_name(f"{video_path.stem}_annotated.mp4")
+    else:
+        output_mp4_path = resolve_project_path(output_mp4_path)
 
     sample_box_map = dict(zip(sampled_indices, crop_boxes))
     min_sampled, max_sampled = min(sampled_indices), max(sampled_indices)
@@ -455,8 +528,7 @@ def predict_single_clip(
     cap = cv2.VideoCapture(str(video_path))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_mp4_path), fourcc, fps, (width, height))
+    writer = create_cross_platform_video_writer(output_mp4_path, fps, width, height)
 
     active_box = crop_boxes[0]
     frame_idx = 0
@@ -529,43 +601,49 @@ def predict_single_clip(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Foul Prediction Training, Threshold Calibration & Inference"
+        description="Cross-Platform Foul Prediction Training, Threshold Calibration & Inference"
     )
     parser.add_argument(
         "--processed-dir",
         type=Path,
-        default=Path("data/processed"),
+        default=BASE_DIR / "data" / "processed",
         help="Directory containing preprocessed .pt action tube tensors",
     )
     parser.add_argument(
         "--metadata-csv",
         type=Path,
-        default=Path("data/processed/processed_metadata.csv"),
+        default=BASE_DIR / "data" / "processed" / "processed_metadata.csv",
         help="Processed metadata CSV path",
     )
     parser.add_argument(
         "--checkpoint-path",
         type=Path,
-        default=Path("best_foul_r2plus1d.pt"),
+        default=BASE_DIR / "best_foul_r2plus1d.pt",
         help="Path to save/load best model checkpoint (default: best_foul_r2plus1d.pt)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20,
-        help="Number of training epochs (default: 20)",
+        default=5,
+        help="Number of training epochs (default: 5; increase to 20-30 for full convergence)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
-        help="Micro-batch size per step (default: 4)",
+        default=2,
+        help="Micro-batch size per step (default: 2 for low RAM/VRAM; increase to 4-8 on GPUs)",
     )
     parser.add_argument(
         "--accum-steps",
         type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4 -> effective batch size 16)",
+        default=2,
+        help="Gradient accumulation steps (default: 2 -> effective batch size 4; increase to 4-8)",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=20,
+        help="Max processed samples to load per run (default: 20; set 0 to train on all processed tensors)",
     )
     parser.add_argument(
         "--lr",
@@ -594,14 +672,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=2,
-        help="DataLoader worker processes (auto-set to 0 on macOS for stability)",
+        default=0,
+        help="DataLoader worker processes (default: 0 for cross-OS stability on Windows/macOS)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Compute device override ('cuda', 'mps', or 'cpu')",
+        default="auto",
+        help="Compute device ('auto', 'cuda', 'mps', or 'cpu')",
+    )
+    parser.add_argument(
+        "--no-pretrained",
+        action="store_true",
+        help="Initialize R(2+1)D-18 without downloading Kinetics-400 weights (offline mode)",
     )
     parser.add_argument(
         "--seed",

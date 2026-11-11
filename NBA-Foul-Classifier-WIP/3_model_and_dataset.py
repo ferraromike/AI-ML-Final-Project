@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-STEP 3: PyTorch 3D CNN + Biomechanical Foul-Contact Architecture (`3_model_and_dataset.py`)
+STEP 3: Cross-Platform PyTorch 3D CNN + Biomechanical Foul-Contact Architecture (`3_model_and_dataset.py`)
 
-Implements:
-  1. `L2MFoulDataset`: Loads pre-cropped 16-frame 224x224 action tubes `(3, 16, 224, 224)`
-     along with 12-D per-frame biomechanical foul-contact features `(16, 12)` (synthesizing
-     motion-energy contact proxies automatically for legacy `.pt` files), applying temporally
-     consistent video-level augmentations (horizontal flip and color jitter across all 16 frames).
-  2. `FoulClassifier3D`: Wraps `torchvision.models.video.r2plus1d_18(weights=R2Plus1D_18_Weights.KINETICS400_V1)`
-     with `freeze_early_layers()` (`stem`, `layer1`, `layer2` frozen; `layer3`, `layer4` fine-tuned)
-     and fuses the 512-D 3D CNN representation with a Temporal Foul-Contact Kinematic Encoder
-     (`Conv1d` + temporal attention pooling over the 16-frame pose-contact features) to predict
-     binary foul probability.
+Works seamlessly across Windows, macOS (Intel & Apple Silicon MPS), and Linux (CUDA / CPU):
+  1. `L2MFoulDataset`: Resolves `.pt` tensor paths across POSIX/Windows path conventions,
+     loads pre-cropped 16-frame 224x224 action tubes `(3, 16, 224, 224)` along with 12-D
+     per-frame biomechanical foul-contact features `(16, 12)`, and applies temporally
+     consistent video-level augmentations.
+  2. `FoulClassifier3D`: Wraps `torchvision.models.video.r2plus1d_18` (with automatic
+     offline fallback if pretrained weights cannot be downloaded), freezes early layers
+     (`stem`, `layer1`, `layer2`), and fuses the 512-D 3D CNN visual representation with
+     `BiomechanicalFoulEncoder` (`Conv1d` + temporal attention pooling -> 64-D) to predict
+     binary foul logits.
 """
 
 from __future__ import annotations
 
 import csv
+import logging
 import random
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -29,9 +30,29 @@ from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 from torchvision.models.video import R2Plus1D_18_Weights, r2plus1d_18
 
+BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger("model_and_dataset")
+
 KINETICS400_MEAN = (0.43216, 0.394666, 0.37645)
 KINETICS400_STD = (0.22803, 0.22145, 0.216989)
 NUM_FOUL_FEATURES = 12
+
+
+def resolve_project_path(path_arg: Path | str) -> Path:
+    """Resolve paths across Windows/macOS/Linux regardless of current working directory."""
+    norm_str = str(path_arg).replace("\\", "/")
+    p = Path(norm_str)
+    if p.is_absolute() or p.exists():
+        return p
+    return BASE_DIR / p
+
+
+def load_torch_file_safe(path: Path, map_location: str | torch.device = "cpu") -> Any:
+    """Load a `.pt` file safely across PyTorch 1.13+ and PyTorch 2.0-2.6+."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def derive_motion_foul_features_from_rgb(video_u8_or_float: torch.Tensor) -> torch.Tensor:
@@ -44,7 +65,6 @@ def derive_motion_foul_features_from_rgb(video_u8_or_float: torch.Tensor) -> tor
     if v.max() > 1.5:
         v = v / 255.0
     _, t_len, h, w = v.shape
-    # Focus on central upper-body interaction zone
     center_crop = v[:, :, int(h * 0.15) : int(h * 0.75), int(w * 0.20) : int(w * 0.80)]
     diffs = torch.zeros(t_len, dtype=torch.float32)
     diffs[1:] = torch.mean(torch.abs(center_crop[:, 1:] - center_crop[:, :-1]), dim=(0, 2, 3)) * 6.0
@@ -128,7 +148,7 @@ class ConsistentVideoAugmentor:
 
 class L2MFoulDataset(Dataset):
     """
-    Custom PyTorch Dataset for NBA Foul Detection action tubes.
+    Cross-Platform PyTorch Dataset for NBA Foul Detection action tubes.
     Loads pre-saved `.pt` tensors from `data/processed/` containing:
       - `video`: `(3, 16, 224, 224)` RGB action tube centered on the foul interaction
       - `foul_features`: `(16, 12)` per-frame biomechanical foul-contact feature sequence
@@ -138,16 +158,17 @@ class L2MFoulDataset(Dataset):
     def __init__(
         self,
         samples: Optional[List[Tuple[Path, int]]] = None,
-        processed_dir: Path = Path("data/processed"),
+        processed_dir: Path = BASE_DIR / "data" / "processed",
         metadata_csv: Optional[Path] = None,
         is_train: bool = True,
         num_frames: int = 16,
         crop_size: int = 224,
+        max_samples: int = 0,
         return_foul_features: bool = False,
         transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> None:
         super().__init__()
-        self.processed_dir = Path(processed_dir)
+        self.processed_dir = resolve_project_path(processed_dir)
         self.is_train = is_train
         self.num_frames = num_frames
         self.crop_size = crop_size
@@ -157,7 +178,11 @@ class L2MFoulDataset(Dataset):
         if samples is not None:
             self.samples = samples
         else:
-            self.samples = self._discover_samples(metadata_csv)
+            resolved_csv = resolve_project_path(metadata_csv) if metadata_csv is not None else None
+            self.samples = self._discover_samples(resolved_csv)
+
+        if max_samples > 0 and len(self.samples) > max_samples:
+            self.samples = self.samples[:max_samples]
 
     def _discover_samples(self, metadata_csv: Optional[Path]) -> List[Tuple[Path, int]]:
         discovered: List[Tuple[Path, int]] = []
@@ -167,9 +192,11 @@ class L2MFoulDataset(Dataset):
                 for row in reader:
                     label = int(row["label"])
                     tensor_path = row.get("tensor_path")
-                    if tensor_path and Path(tensor_path).exists():
-                        discovered.append((Path(tensor_path), label))
-                        continue
+                    if tensor_path:
+                        resolved_tp = resolve_project_path(tensor_path)
+                        if resolved_tp.exists():
+                            discovered.append((resolved_tp, label))
+                            continue
                     play_id = row["play_id"]
                     cls_dir = "foul" if label == 1 else "no_foul"
                     candidate_pt = self.processed_dir / cls_dir / f"{play_id}.pt"
@@ -190,7 +217,7 @@ class L2MFoulDataset(Dataset):
 
     def _load_video_and_features(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
         if path.suffix == ".pt":
-            payload = torch.load(path, map_location="cpu", weights_only=False)
+            payload = load_torch_file_safe(path, map_location="cpu")
             video = payload["video"] if isinstance(payload, dict) else payload
             if video.shape != (3, self.num_frames, self.crop_size, self.crop_size):
                 video = TF.resize(
@@ -260,7 +287,6 @@ class BiomechanicalFoulEncoder(nn.Module):
         self.attn_Readout = nn.Linear(embed_dim, 1)
 
     def forward(self, foul_features: torch.Tensor) -> torch.Tensor:
-        # foul_features: (B, T, F) -> (B, F, T)
         x = foul_features.permute(0, 2, 1).contiguous()
         h = self.conv_net(x).permute(0, 2, 1)  # (B, T, embed_dim)
         attn_weights = torch.softmax(self.attn_Readout(h), dim=1)  # Peak contact frame weighting
@@ -270,7 +296,7 @@ class BiomechanicalFoulEncoder(nn.Module):
 
 class FoulClassifier3D(nn.Module):
     """
-    3D Spatiotemporal ResNet (`R(2+1)D-18`) + Biomechanical Foul-Contact Fusion Model.
+    Dual-Stream 3D Spatiotemporal ResNet (`R(2+1)D-18`) + Biomechanical Foul-Contact Fusion Model.
     Wraps `torchvision.models.video.r2plus1d_18(weights=R2Plus1D_18_Weights.KINETICS400_V1)`
     with `stem`, `layer1`, and `layer2` frozen so `layer3`, `layer4`, the biomechanical
     foul encoder, and the binary foul classification head (`nn.Linear(..., 1)`) are fine-tuned.
@@ -285,10 +311,16 @@ class FoulClassifier3D(nn.Module):
     ) -> None:
         super().__init__()
         weights = R2Plus1D_18_Weights.KINETICS400_V1 if pretrained else None
-        self.backbone = r2plus1d_18(weights=weights)
+        try:
+            self.backbone = r2plus1d_18(weights=weights)
+        except Exception as exc:
+            logger.warning(
+                "Could not download pretrained Kinetics-400 weights (%s); falling back to random init.",
+                exc,
+            )
+            self.backbone = r2plus1d_18(weights=None)
 
         in_features = self.backbone.fc.in_features  # 512
-        # Replace backbone.fc with Identity so we can fuse 512-D visual features + 64-D foul kinematics
         self.backbone.fc = nn.Identity()
 
         self.pose_encoder = BiomechanicalFoulEncoder(
@@ -341,7 +373,6 @@ class FoulClassifier3D(nn.Module):
     ) -> torch.Tensor:
         visual_feat = self.backbone(x)  # (B, 512)
         if foul_features is None:
-            # Synthesize motion-energy contact features on the fly if only video tensor was passed
             batch_feats = [derive_motion_foul_features_from_rgb(x[b].detach().cpu()) for b in range(x.size(0))]
             foul_features = torch.stack(batch_feats, dim=0).to(x.device)
         pose_feat = self.pose_encoder(foul_features.to(x.device))  # (B, 64)
