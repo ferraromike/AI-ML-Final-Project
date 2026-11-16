@@ -226,11 +226,21 @@ __marimo__/
 weights/*.pt
 **/weights/*.pt
 
-# Video Outputs
+# Video Outputs & Datasets
 *_annotated.mp4
 data/annotated/*.mp4
 data/raw/
 data/processed/
+
+# Test Data (Video files ignored to keep repo lean)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+**/data/test/*
+!**/data/test/README.md
+!**/data/test/.gitkeep
 
 # macOS & IDE
 .DS_Store
