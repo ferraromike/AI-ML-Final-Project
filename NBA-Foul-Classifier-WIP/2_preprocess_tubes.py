@@ -53,9 +53,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("preprocess_tubes")
 
-COCO_PERSON_CLS = 0
-COCO_SPORTS_BALL_CLS = 32
-NUM_FOUL_FEATURES = 12
+# Mechanical Foul Dimensions Grounded in NBA Rulebook Officiating
+MECHANICAL_FOUL_DIMENSIONS = (
+    "arm_contact_intrusion",        # 0: Defender hand/wrist collision with shooter arm
+    "body_cylinder_penetration",    # 1: Torso/hip invasion into offensive cylinder
+    "lower_body_landing_violation", # 2: Defender feet/legs in shooter landing zone
+    "defender_verticality_angle",   # 3: Angle deviation from legal 90-deg vertical contest
+    "defender_lateral_positioning", # 4: Defender lateral offset relative to offensive drive
+    "offensive_displacement",       # 5: Shooter trajectory/balance shift from contact
+    "defender_to_ball_distance",    # 6: Distance of defender hand from basketball
+    "ball_to_shooter_distance",     # 7: Proximity of ball to shooter (gather vs release)
+    "ball_strike_vs_body_ratio",    # 8: Hand-to-ball distance vs hand-to-body distance (block vs hack)
+    "relative_closing_velocity",    # 9: Speed of defender closing space on offensive player
+    "momentum_transfer_shock",      # 10: Sudden deceleration/jolt upon physical collision
+    "airborne_contest_apex_diff",   # 11: Vertical contest differential between players
+)
+POSE_FEATURE_NAMES = MECHANICAL_FOUL_DIMENSIONS
+FOUL_FEATURE_NAMES = MECHANICAL_FOUL_DIMENSIONS
+POSE_FEATURES = 12
+NUM_FOUL_FEATURES = POSE_FEATURES
 
 # COCO 17-keypoint indices:
 # 0: nose, 5: L_shoulder, 6: R_shoulder, 7: L_elbow, 8: R_elbow,
@@ -63,14 +79,27 @@ NUM_FOUL_FEATURES = 12
 UPPER_BODY_KPTS = (0, 5, 6, 7, 8, 9, 10)
 ARM_CONTACT_KPTS = (7, 8, 9, 10)
 TORSO_KPTS = (5, 6, 11, 12)
+COCO_PERSON_CLS = 0
+COCO_SPORTS_BALL_CLS = 32
+COCO_BALL_CLS = 32
 
 
 def resolve_project_path(path_arg: Path | str) -> Path:
-    """Resolve relative paths cross-platform (normalizing slashes and checking BASE_DIR)."""
+    """Resolve relative paths cross-platform checking CWD, BASE_DIR, and weights/ directory."""
     norm_str = str(path_arg).replace("\\", "/")
     p = Path(norm_str)
-    if p.is_absolute() or p.exists():
+    if p.is_absolute() and p.exists():
         return p
+    for candidate in [
+        Path.cwd() / p,
+        BASE_DIR / p,
+        BASE_DIR / "weights" / p.name,
+        BASE_DIR / "weights" / p,
+        BASE_DIR.parent / "weights" / p.name,
+        BASE_DIR.parent / p,
+    ]:
+        if candidate.exists():
+            return candidate
     return BASE_DIR / p
 
 
@@ -182,15 +211,43 @@ def analyze_foul_interaction_frame(
         raw_kpts[:, :, 1] *= scale_y
         kpts_all = raw_kpts
 
-    # Filter out small background spectator boxes in the stands
-    if len(player_boxes) > 2:
-        box_heights = player_boxes[:, 3] - player_boxes[:, 1]
-        max_h = float(np.max(box_heights))
-        court_mask = box_heights >= (max_h * 0.38)
+    # Filter court players: reject foreground sideline (referees, bench personnel, photographers)
+    # and background stands / ceiling. In broadcast basketball camera views, the active court floor
+    # spans y in [0.22*H, 0.68*H] with y2 <= 0.72*H.
+    if len(player_boxes) > 0:
+        cy = 0.5 * (player_boxes[:, 1] + player_boxes[:, 3])
+        cx = 0.5 * (player_boxes[:, 0] + player_boxes[:, 2])
+        bh = player_boxes[:, 3] - player_boxes[:, 1]
+        bw = player_boxes[:, 2] - player_boxes[:, 0]
+        court_mask = (
+            (player_boxes[:, 3] <= frame_h * 0.72)
+            & (player_boxes[:, 1] >= frame_h * 0.15)
+            & (cy >= frame_h * 0.22)
+            & (cy <= frame_h * 0.68)
+            & (cx >= frame_w * 0.10)
+            & (cx <= frame_w * 0.90)
+            & (bh >= frame_h * 0.08)
+            & (bh <= frame_h * 0.55)
+            & (bw >= frame_w * 0.02)
+            & (bw <= frame_w * 0.35)
+            & ((bh / np.maximum(bw, 1.0)) >= 0.90)
+        )
         if int(np.sum(court_mask)) >= 2:
             player_boxes = player_boxes[court_mask]
             if kpts_all is not None:
                 kpts_all = kpts_all[court_mask]
+        elif int(np.sum(court_mask)) == 1:
+            player_boxes = player_boxes[court_mask]
+            if kpts_all is not None:
+                kpts_all = kpts_all[court_mask]
+        elif len(player_boxes) > 2:
+            box_heights = player_boxes[:, 3] - player_boxes[:, 1]
+            max_h = float(np.max(box_heights))
+            h_mask = box_heights >= (max_h * 0.38)
+            if int(np.sum(h_mask)) >= 2:
+                player_boxes = player_boxes[h_mask]
+                if kpts_all is not None:
+                    kpts_all = kpts_all[h_mask]
 
     n_players = len(player_boxes)
     if n_players == 0:
@@ -198,6 +255,7 @@ def analyze_foul_interaction_frame(
     if n_players == 1:
         b = player_boxes[0]
         feats[9] = 0.1
+        feats[11] = 0.2
         return b.astype(np.float32), 0.2, feats
 
     ball_pt: Optional[np.ndarray] = None
@@ -275,54 +333,131 @@ def analyze_foul_interaction_frame(
 
     h_a = max(1.0, float(box_a[3] - box_a[1]))
     h_b = max(1.0, float(box_b[3] - box_b[1]))
-    avg_player_h = 0.5 * (h_a + h_b)
+    w_a = max(1.0, float(box_a[2] - box_a[0]))
+    w_b = max(1.0, float(box_b[2] - box_b[0]))
 
     elev_a = compute_arm_elevation(kpts_all[idx_a], h_a) if kpts_all is not None else 0.0
     elev_b = compute_arm_elevation(kpts_all[idx_b], h_b) if kpts_all is not None else 0.0
-    shooter_elev = max(elev_a, elev_b)
-    defender_elev = min(elev_a, elev_b)
 
+    # Determine Disputed Roles: Offense (Shooter/Driver) vs Defense (Contesting Defender)
+    if elev_a >= elev_b:
+        off_idx, def_idx = idx_a, idx_b
+        box_off, box_def = box_a, box_b
+        h_off, h_def = h_a, h_b
+        w_off, w_def = w_a, w_b
+        elev_off, elev_def = elev_a, elev_b
+    else:
+        off_idx, def_idx = idx_b, idx_a
+        box_off, box_def = box_b, box_a
+        h_off, h_def = h_b, h_a
+        w_off, w_def = w_b, w_a
+        elev_off, elev_def = elev_b, elev_a
+
+    kpts_off = kpts_all[off_idx] if kpts_all is not None else None
+    kpts_def = kpts_all[def_idx] if kpts_all is not None else None
+
+    # Bounding Box around ALL players involved in the disputed interaction
     union_x1 = min(float(box_a[0]), float(box_b[0]))
     union_y1 = min(float(box_a[1]), float(box_b[1]))
     union_x2 = max(float(box_a[2]), float(box_b[2]))
     union_y2 = max(float(box_a[3]), float(box_b[3]))
-    trimmed_y2 = union_y1 + 0.85 * (union_y2 - union_y1)
-    roi_box = np.array([union_x1, union_y1, union_x2, trimmed_y2], dtype=np.float32)
+    roi_box = np.array([union_x1, union_y1, union_x2, union_y2], dtype=np.float32)
 
-    pair_mid = 0.5 * (centers[idx_a] + centers[idx_b])
-    crowding = float(np.sum(np.linalg.norm(centers - pair_mid, axis=1) < avg_player_h * 1.25)) / 5.0
+    # 1. Arm Contact Intrusion (Defender hand/wrist striking shooter arm)
+    arms_off = valid_points(kpts_off, ARM_CONTACT_KPTS) if kpts_off is not None else np.empty((0, 2))
+    arms_def = valid_points(kpts_def, ARM_CONTACT_KPTS) if kpts_def is not None else np.empty((0, 2))
+    arm_dist = min_point_set_distance(arms_off, arms_def, arm_to_arm_dist)
+    arm_contact_val = float(np.clip(1.0 - (arm_dist / max(h_off * 0.40, 1.0)), 0.0, 1.0))
 
-    norm_arm_dist = float(np.clip(1.0 - (arm_to_arm_dist / max(avg_player_h * 0.85, 1.0)), 0.0, 1.0))
-    norm_upper_dist = float(np.clip(1.0 - (arm_to_upper_dist / max(avg_player_h * 0.75, 1.0)), 0.0, 1.0))
-    norm_torso_dist = float(np.clip(1.0 - (torso_dist / max(avg_player_h * 1.10, 1.0)), 0.0, 1.0))
-    ball_prox_val = (
-        float(np.clip(1.0 - float(np.linalg.norm(pair_mid - ball_pt)) / max(avg_player_h * 1.5, 1.0), 0.0, 1.0))
-        if ball_pt is not None
-        else norm_upper_dist
+    # 2. Body Cylinder Penetration (Defender invading offensive established space)
+    torso_off = valid_points(kpts_off, TORSO_KPTS) if kpts_off is not None else np.empty((0, 2))
+    torso_def = valid_points(kpts_def, TORSO_KPTS) if kpts_def is not None else np.empty((0, 2))
+    torso_d = min_point_set_distance(torso_off, torso_def, torso_dist)
+    cylinder_pen_val = float(np.clip(0.55 * (1.0 - torso_d / max(h_off * 0.65, 1.0)) + 0.45 * min(1.0, pair_iou * 2.5), 0.0, 1.0))
+
+    # 3. Lower Body Landing Violation (Defender undercut in shooter landing zone)
+    feet_off = valid_points(kpts_off, (13, 14, 15, 16)) if kpts_off is not None else np.empty((0, 2))
+    feet_def = valid_points(kpts_def, (13, 14, 15, 16)) if kpts_def is not None else np.empty((0, 2))
+    feet_dist = min_point_set_distance(feet_off, feet_def, 0.5 * (h_off + h_def))
+    landing_violation_val = float(np.clip(1.0 - (feet_dist / max(h_off * 0.45, 1.0)), 0.0, 1.0))
+
+    # 4. Defender Verticality Angle (Deviation from legal 90-degree vertical contest)
+    sh_def = valid_points(kpts_def, (5, 6)) if kpts_def is not None else np.empty((0, 2))
+    wr_def = valid_points(kpts_def, (9, 10)) if kpts_def is not None else np.empty((0, 2))
+    if len(sh_def) > 0 and len(wr_def) > 0:
+        dx = float(np.mean(wr_def[:, 0]) - np.mean(sh_def[:, 0]))
+        dy = float(np.mean(wr_def[:, 1]) - np.mean(sh_def[:, 1]))
+        off_cx = 0.5 * (box_off[0] + box_off[2])
+        def_cx = 0.5 * (box_def[0] + box_def[2])
+        reach_toward = (off_cx - def_cx) * dx
+        verticality_val = float(np.clip(abs(dx) / max(abs(dy) + 1.0, 1.0), 0.0, 1.0)) if reach_toward > 0 else 0.0
+    else:
+        verticality_val = 0.15
+
+    # 5. Defender Lateral Positioning (Offset relative to offensive drive)
+    off_cx = 0.5 * (box_off[0] + box_off[2])
+    def_cx = 0.5 * (box_def[0] + box_def[2])
+    lat_pos_val = float(np.clip(abs(def_cx - off_cx) / max(w_off * 1.2, 1.0), 0.0, 1.0))
+
+    # 6. Offensive Displacement (Center of mass displacement)
+    off_disp_val = float(np.clip(pair_iou * 1.5, 0.0, 1.0))
+
+    # 7. Defender to Ball Distance
+    if ball_pt is not None and len(wr_def) > 0:
+        d_ball_def = float(np.min(np.linalg.norm(wr_def - ball_pt, axis=-1)))
+        def_ball_val = float(np.clip(1.0 - d_ball_def / max(h_def * 0.75, 1.0), 0.0, 1.0))
+    else:
+        def_ball_val = 0.20
+
+    # 8. Ball to Shooter Distance (Possession / release state)
+    wr_off = valid_points(kpts_off, (9, 10)) if kpts_off is not None else np.empty((0, 2))
+    if ball_pt is not None and len(wr_off) > 0:
+        d_ball_off = float(np.min(np.linalg.norm(wr_off - ball_pt, axis=-1)))
+        ball_shooter_val = float(np.clip(1.0 - d_ball_off / max(h_off * 0.60, 1.0), 0.0, 1.0))
+    else:
+        ball_shooter_val = 0.50
+
+    # 9. Ball Strike vs Body Ratio (Clean play on ball vs illegal body collision)
+    if ball_pt is not None:
+        c_def = 0.5 * (box_def[:2] + box_def[2:])
+        c_off = 0.5 * (box_off[:2] + box_off[2:])
+        d_ball = float(np.linalg.norm(c_def - ball_pt))
+        d_body = float(np.linalg.norm(c_def - c_off))
+        ball_ratio_val = float(np.clip(d_ball / max(d_body + 1.0, 1.0), 0.0, 1.0))
+    else:
+        ball_ratio_val = 0.35
+
+    # 10. Relative Closing Velocity
+    closing_vel_val = 0.50
+
+    # 11. Momentum Transfer Shock
+    momentum_shock_val = float(np.clip(pair_iou * 1.2, 0.0, 1.0))
+
+    # 12. Airborne Contest Apex Differential
+    apex_diff_val = float(np.clip(0.5 + 0.5 * (elev_off - elev_def), 0.0, 1.0))
+
+    # Composite physical contact score
+    physical_contact_score = float(
+        0.35 * arm_contact_val
+        + 0.30 * cylinder_pen_val
+        + 0.20 * landing_violation_val
+        + 0.15 * verticality_val
     )
 
-    composite_foul_score = float(
-        0.40 * norm_upper_dist
-        + 0.25 * norm_arm_dist
-        + 0.15 * norm_torso_dist
-        + 0.10 * min(1.0, pair_iou * 2.5)
-        + 0.10 * max(0.0, shooter_elev)
-    )
+    feats[0] = arm_contact_val
+    feats[1] = cylinder_pen_val
+    feats[2] = landing_violation_val
+    feats[3] = verticality_val
+    feats[4] = lat_pos_val
+    feats[5] = off_disp_val
+    feats[6] = def_ball_val
+    feats[7] = ball_shooter_val
+    feats[8] = ball_ratio_val
+    feats[9] = closing_vel_val
+    feats[10] = momentum_shock_val
+    feats[11] = apex_diff_val
 
-    feats[0] = norm_arm_dist
-    feats[1] = norm_upper_dist
-    feats[2] = norm_torso_dist
-    feats[3] = float(np.clip(pair_iou * 2.0, 0.0, 1.0))
-    feats[4] = 0.0
-    feats[5] = 0.0
-    feats[6] = float(np.clip((shooter_elev + 0.5) / 1.5, 0.0, 1.0))
-    feats[7] = float(np.clip((defender_elev + 0.5) / 1.5, 0.0, 1.0))
-    feats[8] = ball_prox_val
-    feats[9] = float(np.clip(crowding, 0.0, 1.0))
-    feats[10] = float(np.clip(abs(box_a[1] - box_b[1]) / max(avg_player_h, 1.0), 0.0, 1.0))
-    feats[11] = composite_foul_score
-
-    return roi_box, composite_foul_score, feats
+    return roi_box, physical_contact_score, feats
 
 
 def compute_square_crop_coords(
@@ -378,6 +513,7 @@ def extract_action_tube(
     max_live_play_sec: float = 15.0,
     max_scan_samples: int = 12,
     yolo_batch_size: int = 4,
+    **kwargs,
 ) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
     """
     Cross-Platform Memory-Safe & Deadlock-Free Action-Tube Extractor:
@@ -388,6 +524,10 @@ def extract_action_tube(
       3. Reopens the video after YOLO completes to read ONLY the 16 sampled frames in the
          1.5s window around peak foul contact.
     """
+    if "max_scan_frames" in kwargs:
+        max_scan_samples = kwargs["max_scan_frames"]
+    if "ema_alpha" in kwargs:
+        pass
     primary_pose = pose_model if pose_model is not None else det_model
     if primary_pose is None:
         raise ValueError("At least one YOLO model (pose_model or det_model) must be provided.")
@@ -494,10 +634,10 @@ def extract_action_tube(
         full_feats[:, f_dim] = np.interp(all_idx_arr, scan_idx_arr, scan_feats_arr[:, f_dim])
 
     roi_cy = 0.5 * (raw_rois[:, 1] + raw_rois[:, 3])
-    vert_vel = np.gradient(-roi_cy) / max(float(frame_h) * 0.02, 1.0)
-    closing_vel = np.gradient(full_feats[:, 1]) * 5.0
-    full_feats[:, 4] = np.clip(0.5 + vert_vel, 0.0, 1.0)
-    full_feats[:, 5] = np.clip(0.5 + closing_vel, 0.0, 1.0)
+    closing_vel = -np.gradient(full_feats[:, 1]) * 4.0
+    impact_jolt = np.abs(np.gradient(roi_cy)) / max(float(frame_h) * 0.02, 1.0)
+    full_feats[:, 9] = np.clip(0.5 + closing_vel, 0.0, 1.0)
+    full_feats[:, 10] = np.clip(impact_jolt * 0.5, 0.0, 1.0)
 
     kernel_len = max(3, int(round(fps * 0.45)))
     kernel = np.ones(kernel_len, dtype=np.float32) / kernel_len
@@ -651,6 +791,7 @@ def preprocess_dataset(
     metadata_csv: Path,
     processed_dir: Path,
     processed_metadata_csv: Path,
+    test_dir: Optional[Path] = None,
     yolo_weights: str = "yolo11n.pt",
     pose_weights: Optional[str] = "yolo11n-pose.pt",
     window_sec: float = 1.5,
@@ -667,6 +808,7 @@ def preprocess_dataset(
     Process raw clips listed in `data/l2m_metadata.csv` in small batches (`max_clips=12` by default),
     saving pre-cropped `(3, 16, 224, 224)` action tubes and `(16, 12)` biomechanical foul feature
     tensors to `data/processed/{foul,no_foul}/{play_id}.pt` and updating `processed_metadata.csv`.
+    Clips set aside in `data/test/` are strictly excluded to prevent data leakage.
     """
     metadata_csv = resolve_project_path(metadata_csv)
     processed_dir = resolve_project_path(processed_dir)
@@ -679,6 +821,28 @@ def preprocess_dataset(
 
     with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
+
+    # Segregate test data: strictly exclude any clips present in test_dir
+    active_test_dir = resolve_project_path(test_dir) if test_dir is not None else resolve_project_path(BASE_DIR / "data" / "test")
+    test_stems: set = set()
+    if active_test_dir.exists():
+        test_stems = {
+            p.stem
+            for p in active_test_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv")
+        }
+    if test_stems:
+        orig_count = len(all_rows)
+        all_rows = [
+            r for r in all_rows
+            if r.get("play_id", "").strip() not in test_stems
+            and Path(r.get("video_path", "")).stem not in test_stems
+        ]
+        logger.info(
+            "Segregated %d test-only clips (excluded from training preprocessing): %s",
+            len(test_stems),
+            sorted(list(test_stems)),
+        )
 
     rows = select_balanced_subset(all_rows, max_clips=max_clips)
 
@@ -826,6 +990,12 @@ def parse_args() -> argparse.Namespace:
         help="Output CSV mapping play_id to processed .pt tensor paths",
     )
     parser.add_argument(
+        "--test-dir",
+        type=Path,
+        default=BASE_DIR / "data" / "test",
+        help="Folder containing test-only clips to exclude from training preprocessing (default: data/test)",
+    )
+    parser.add_argument(
         "--yolo-weights",
         type=str,
         default="yolo11n.pt",
@@ -899,6 +1069,7 @@ if __name__ == "__main__":
         metadata_csv=args.metadata_csv,
         processed_dir=args.processed_dir,
         processed_metadata_csv=args.processed_metadata_csv,
+        test_dir=args.test_dir,
         yolo_weights=args.yolo_weights,
         pose_weights=args.pose_weights or None,
         window_sec=args.window_sec,

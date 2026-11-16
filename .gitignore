@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PyTorch / YOLO Checkpoints & Weights
+*.pt
+*.pth
+*.onnx
+weights/*.pt
+**/weights/*.pt
+
+# Video Outputs
+*_annotated.mp4
+data/annotated/*.mp4
+data/raw/
+data/processed/
+
+# macOS & IDE
+.DS_Store
+.dist/
+
