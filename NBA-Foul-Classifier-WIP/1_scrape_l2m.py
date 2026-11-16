@@ -26,6 +26,7 @@ import csv
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -768,6 +769,90 @@ def download_missing_clips_from_rows(
     return downloaded
 
 
+def bulk_download_missing_clips(
+    metadata_csv: Optional[Path | str] = None,
+    output_dir: Optional[Path | str] = None,
+    max_workers: int = 4,
+    max_clips: int = 0,
+) -> int:
+    """
+    High-throughput multithreaded downloader for Google Colab and high-compute environments.
+    Concurrently resolves CDN video URLs and downloads missing `.mp4` clips for rows in `metadata_csv`.
+    """
+    csv_path = resolve_project_path(metadata_csv or (BASE_DIR / "data" / "l2m_metadata.csv"))
+    raw_dir = resolve_project_path(output_dir or (BASE_DIR / "data" / "raw"))
+    foul_dir = raw_dir / "foul"
+    no_foul_dir = raw_dir / "no_foul"
+    foul_dir.mkdir(parents=True, exist_ok=True)
+    no_foul_dir.mkdir(parents=True, exist_ok=True)
+
+    if not csv_path.exists():
+        logger.warning("Metadata CSV not found: %s", csv_path)
+        return 0
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    # Identify rows whose video files are missing on disk
+    to_download: List[Dict[str, Any]] = []
+    for r in rows:
+        play_id = str(r.get("play_id", "")).strip()
+        label = int(r.get("label", 0))
+        target_dir = foul_dir if label == 1 else no_foul_dir
+        dest = target_dir / f"{play_id}.mp4"
+        if not dest.exists() or dest.stat().st_size < 10_240:
+            to_download.append(r)
+
+    if not to_download:
+        logger.info("All %d videos in metadata are already present on disk!", len(rows))
+        return 0
+
+    if max_clips > 0:
+        to_download = to_download[:max_clips]
+
+    logger.info(
+        "Initiating parallel download for %d missing clips (Workers: %d)...",
+        len(to_download),
+        max_workers,
+    )
+
+    session = build_session()
+    downloaded = 0
+
+    def _worker(row: Dict[str, Any]) -> bool:
+        play_id = str(row.get("play_id", "")).strip()
+        game_id = normalize_game_id(str(row.get("game_id", "")))
+        label = int(row.get("label", 0))
+        target_dir = foul_dir if label == 1 else no_foul_dir
+        dest = target_dir / f"{play_id}.mp4"
+
+        parts = play_id.split("_")
+        event_id = parts[1] if len(parts) > 1 else ""
+        if not event_id:
+            return False
+
+        mp4_url = resolve_mp4_url(session, game_id, event_id)
+        if not mp4_url:
+            return False
+        return download_mp4_clip(session, mp4_url, dest)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_worker, r): r.get("play_id") for r in to_download}
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            try:
+                ok = fut.result()
+                if ok:
+                    downloaded += 1
+                    if downloaded % 10 == 0 or downloaded == len(to_download):
+                        logger.info("Progress: %d / %d clips downloaded", downloaded, len(to_download))
+            except Exception as exc:
+                logger.debug("Download failed for %s: %s", pid, exc)
+
+    logger.info("Bulk download complete! Successfully retrieved %d clips.", downloaded)
+    return downloaded
+
+
 def run_training_dataset_scraper(
     output_dir: Path,
     metadata_csv: Path,
@@ -1252,12 +1337,30 @@ def parse_args() -> argparse.Namespace:
         default=BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
         help="Target CSV for daily INC/IC foul monitoring (default: data/l2m_incorrect_fouls.csv)",
     )
+    parser.add_argument(
+        "--download-missing",
+        action="store_true",
+        help="Bulk download all missing MP4 video clips present in metadata CSV using parallel threads",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Worker threads for concurrent downloading (default: 4)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.fill_from_local:
+    if args.download_missing:
+        bulk_download_missing_clips(
+            metadata_csv=args.metadata_csv,
+            output_dir=args.output_dir,
+            max_workers=args.workers,
+            max_clips=args.max_clips if args.max_clips > 30 else 0,
+        )
+    elif args.fill_from_local:
         populate_foul_csv_from_local_metadata(
             metadata_csv=args.metadata_csv,
             daily_csv=args.daily_csv,

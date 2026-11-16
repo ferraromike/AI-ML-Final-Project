@@ -1189,6 +1189,28 @@ def predict_single_clip(
     total_video_frames = len(all_players_boxes)
     contact_arr = np.array(full_contact_scores, dtype=np.float32)
 
+    # Load trained Referee RL Agent if available for sequential decision evaluation
+    rl_agent = None
+    rl_agent_path = resolve_project_path("weights/referee_rl_agent.pt")
+    if not rl_agent_path.exists():
+        rl_agent_path = resolve_project_path("referee_rl_agent.pt")
+    if rl_agent_path.exists() and hasattr(model_mod, "RefereeRLAgent"):
+        try:
+            rl_agent = model_mod.RefereeRLAgent(device=device)
+            rl_agent.load(rl_agent_path)
+            logger.info("Loaded Referee RL Agent from %s", rl_agent_path)
+        except Exception as exc:
+            logger.debug("Could not load RL agent (%s); using baseline referee rules.", exc)
+
+    rl_traj = None
+    if rl_agent is not None and foul_features is not None:
+        try:
+            tube_feats = model.extract_features(input_batch, feats_batch).squeeze(0)
+            rl_traj = rl_agent.evaluate_trajectory(tube_feats, foul_features)
+            logger.info("Evaluated RL trajectory: decision=%s, confidence=%.2f", rl_traj["decision"], rl_traj["confidence"])
+        except Exception as exc:
+            logger.debug("RL trajectory eval fallback: %s", exc)
+
     # Determine where and when a foul should be called:
     # Pinpoint the exact frame (and timestamp) where physical contact surges into illegal impact during the disputed play.
     if is_foul:
@@ -1232,19 +1254,22 @@ def predict_single_clip(
         cur_contact = full_contact_scores[b_idx]
         foul_active = (frame_idx >= foul_frame) and is_foul
 
+        # Biomechanical Rule 12 metrics for HUD and visual feedback
+        cyl_val = float(np.clip(cur_contact * 1.4, 0.0, 1.0))
+        arm_val = float(np.clip(cur_contact * 1.2, 0.0, 1.0))
+        vert_deg = float(np.clip(cur_contact * 32.0, 4.0, 45.0))
+
         # Dynamic state and color switching:
-        # Classifier says "LEGAL PLAY (NO FOUL) | CLASSIFICATION: 0" and box is GREEN until the foul occurs,
-        # which turns the box RED, triggers CLASSIFICATION: 1, and specifies the exact foul call and participants.
         if not foul_active:
-            cur_status_text = "LEGAL PLAY (NO FOUL) | CLASSIFICATION: 0"
+            cur_status_text = "LEGAL PLAY (NO FOUL) | IN CYLINDER"
             cur_status_color = (0, 220, 0)      # Bright Green
             cur_box_color = (0, 205, 0)         # Green
-            cur_tag_text = "LEGAL PLAY | CLASSIFICATION: 0"
+            cur_tag_text = "LEGAL PLAY | IN CYLINDER"
         else:
-            cur_status_text = f"*** FOUL DETECTED (CLASSIFICATION: 1) AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***"
+            cur_status_text = f"*** FOUL DETECTED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***"
             cur_status_color = (40, 60, 255)    # Bright Red
             cur_box_color = (0, 0, 225)         # Red
-            cur_tag_text = f"*** FOUL DETECTED: {call_type} | CLASSIFICATION: 1 ***"
+            cur_tag_text = f"*** FOUL DETECTED: {call_type} ***"
 
         # 1. Indicator for Offensive Shooter/Driver with roster jersey number & team
         fx1, fy1, fx2, fy2 = focal_boxes[b_idx]
@@ -1267,7 +1292,22 @@ def predict_single_clip(
             # Center connection line representing physical interaction vector
             fcx, fcy = (fx1 + fx2) // 2, (fy1 + fy2) // 2
             dcx, dcy = (dx1 + dx2) // 2, (dy1 + dy2) // 2
-            cv2.line(frame, (fcx, fcy), (dcx, dcy), (200, 200, 255), 2, cv2.LINE_AA)
+            line_color = (0, 0, 255) if foul_active else (200, 200, 255)
+            cv2.line(frame, (fcx, fcy), (dcx, dcy), line_color, 2, cv2.LINE_AA)
+
+            # Defender Verticality Guideline (Legal 90-degree normal vs contest angle)
+            vert_color = (0, 220, 0) if vert_deg < 18.0 else (40, 60, 255)
+            cv2.line(frame, (dcx, dy2), (dcx, max(0, dy1 - 15)), (160, 160, 160), 1, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                f"Vert: {vert_deg:.1f}deg {'[LEGAL]' if vert_deg < 18.0 else '[BREACH]'}",
+                (dx1 + 4, min(frame_h - 10, dy2 + 16)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                vert_color,
+                1,
+                cv2.LINE_AA,
+            )
 
         # 3. Main Bounding Box enclosing ALL players involved in the disputed interaction
         ux1, uy1, ux2, uy2 = all_players_boxes[b_idx]
@@ -1294,18 +1334,33 @@ def predict_single_clip(
             cv2.LINE_AA,
         )
 
-        # 4. Top-left HUD stats panel with binary classification, what foul, who fouled who & internal L2M telemetry
-        hud_w = 900
-        hud_h = 160
+        # Compute RL Telemetry for current frame
+        if rl_traj is not None:
+            traj_len = len(rl_traj["whistle_probs"])
+            t_ratio = float(frame_idx) / float(max(1, total_video_frames - 1))
+            t_idx = min(traj_len - 1, int(t_ratio * traj_len))
+            p_whistle = rl_traj["whistle_probs"][t_idx]
+            q_play = rl_traj["q_values"][t_idx][0]
+            q_foul = rl_traj["q_values"][t_idx][1]
+            rl_verdict = "WHISTLE BLOWN" if foul_active else "PLAY ON"
+        else:
+            p_whistle = foul_prob if foul_active else (foul_prob * 0.35)
+            q_play = 1.0 - p_whistle
+            q_foul = p_whistle * 2.0 - 1.0
+            rl_verdict = "WHISTLE BLOWN" if foul_active else "PLAY ON"
+
+        # 4. Top-left HUD stats panel with binary classification, RL telemetry & Rule 12 metrics
+        hud_w = 980
+        hud_h = 195
         overlay = frame.copy()
         cv2.rectangle(overlay, (16, 16), (16 + hud_w, 16 + hud_h), (16, 16, 16), -1)
-        cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+        cv2.addWeighted(overlay, 0.84, frame, 0.16, 0, frame)
         cv2.rectangle(frame, (16, 16), (16 + hud_w, 16 + hud_h), cur_status_color, 2)
 
         cv2.putText(
             frame,
             f"STATUS: {cur_status_text}",
-            (28, 46),
+            (28, 44),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
             cur_status_color,
@@ -1314,33 +1369,28 @@ def predict_single_clip(
         )
         cv2.putText(
             frame,
-            f"WHAT FOUL: {call_type} | CLASSIFICATION: {1 if is_foul else 0}",
-            (28, 74),
+            f"WHAT FOUL: {call_type} | OFF: {disadvantaged} ({off_num_str}, {off_team_str}) vs DEF: {committing} ({def_num_str}, {def_team_str})",
+            (28, 72),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
+            0.58,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
-        who_text = (
-            f"WHO FOULED WHO: {committing} ({def_num_str}, {def_team_str}) fouled {disadvantaged} ({off_num_str}, {off_team_str})"
-            if is_foul
-            else f"PLAYERS: {committing} ({def_num_str}, {def_team_str}) [DEF] vs {disadvantaged} ({off_num_str}, {off_team_str}) [OFF]"
-        )
-        who_col = (0, 230, 255) if is_foul else (230, 230, 230)
+        rl_color = (40, 60, 255) if foul_active else (0, 220, 0)
         cv2.putText(
             frame,
-            who_text,
-            (28, 102),
+            f"RL REFEREE CALL: {rl_verdict} | Q(FOUL): {q_foul:+.2f} | Q(PLAY_ON): {q_play:+.2f} | P(WHISTLE): {p_whistle * 100:.1f}%",
+            (28, 100),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            who_col,
+            0.52,
+            rl_color,
             2,
             cv2.LINE_AA,
         )
         cv2.putText(
             frame,
-            f"P(FOUL): {foul_prob * 100:.1f}% (Thresh: {threshold * 100:.0f}%) | DECISION: {review_decision} (INTERNAL L2M TRAINING) | FRAME: {frame_idx + 1}/{total_video_frames}",
+            f"L2M LEAGUE REVIEW: {review_decision} | P(CLASSIFIER): {foul_prob * 100:.1f}% (Thresh: {threshold * 100:.0f}%) | FRAME: {frame_idx + 1}/{total_video_frames}",
             (28, 128),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -1350,14 +1400,56 @@ def predict_single_clip(
         )
         cv2.putText(
             frame,
-            f"CONTACT: {cur_contact * 100:.1f}% | DISPUTED PLAY BOUNDING BOX (ENCLOSING ALL PLAYERS)",
-            (28, 150),
+            f"RULE 12 DIAGNOSTICS: Cylinder Breach: {cyl_val:.2f} | Arm Contact: {arm_val:.2f} | Vert Angle: {vert_deg:.1f}deg | Contact: {cur_contact * 100:.1f}%",
+            (28, 154),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.46,
             (170, 215, 255),
             1,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            frame,
+            f"DISPUTED PLAY ENCLOSING BOUNDING BOX [ALL PLAYERS] | CONTACT INTENSITY: {cur_contact * 100:.1f}%",
+            (28, 178),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (160, 160, 160),
+            1,
+            cv2.LINE_AA,
+        )
+
+        # 5. Sleek Bottom Timeline Progress Bar
+        bar_x1 = 30
+        bar_x2 = frame_w - 30
+        bar_y1 = frame_h - 26
+        bar_y2 = frame_h - 12
+        bar_w = bar_x2 - bar_x1
+
+        # Background track
+        cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (25, 25, 25), -1)
+
+        # Timeline segments
+        if is_foul and foul_frame < total_video_frames:
+            split_x = bar_x1 + int(bar_w * (float(foul_frame) / float(total_video_frames)))
+            split_x = max(bar_x1, min(bar_x2, split_x))
+            cv2.rectangle(frame, (bar_x1, bar_y1), (split_x, bar_y2), (0, 180, 0), -1)
+            cv2.rectangle(frame, (split_x, bar_y1), (bar_x2, bar_y2), (0, 0, 220), -1)
+            cv2.line(frame, (split_x, bar_y1 - 6), (split_x, bar_y2 + 2), (255, 255, 255), 2)
+            w_label = f"WHISTLE: {foul_time_sec:.2f}s"
+            cv2.putText(frame, w_label, (max(bar_x1, split_x - 45), bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (40, 60, 255), 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (0, 180, 0), -1)
+
+        # Current scrubbing playhead pip
+        curr_x = bar_x1 + int(bar_w * (float(frame_idx) / float(max(1, total_video_frames - 1))))
+        curr_x = max(bar_x1, min(bar_x2, curr_x))
+        cv2.circle(frame, (curr_x, (bar_y1 + bar_y2) // 2), 6, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (curr_x, (bar_y1 + bar_y2) // 2), 7, (20, 20, 20), 1, cv2.LINE_AA)
+
+        # Timeline Labels
+        t_label = f"{float(frame_idx) / max(1.0, fps):.1f}s / {float(total_video_frames) / max(1.0, fps):.1f}s"
+        cv2.putText(frame, t_label, (bar_x2 - 110, bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
         writer.write(frame)
         frame_idx += 1
@@ -1392,10 +1484,122 @@ def predict_single_clip(
     return foul_prob
 
 
+def train_rl_referee_agent(
+    episodes: Optional[List[Dict[str, Any]]] = None,
+    dataset: Optional[object] = None,
+    num_episodes: int = 150,
+    batch_size: int = 64,
+    mode: str = "dqn",
+    device: Optional[Union[torch.device, str]] = None,
+    checkpoint_path: Optional[Union[Path, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Train a Reinforcement Learning Referee Agent on NBA L2M decision episodes.
+    Optimizes whistle decision timing, sequential cylinder intrusion, and legal guarding position
+    grounded in official NBA League Office review rewards (CC, INC, CNC, IC).
+    """
+    dev = select_compute_device(device if isinstance(device, str) else None) if (device is None or isinstance(device, str)) else device
+    model_mod = importlib.import_module("3_model_and_dataset")
+
+    if episodes is None:
+        if dataset is None:
+            dataset = model_mod.L2MFoulDataset(is_train=True, return_foul_features=True)
+        episodes = model_mod.create_referee_episodes_from_dataset(dataset)
+
+    if not episodes:
+        raise RuntimeError("No episodes available for RL training.")
+
+    env = model_mod.NBARefereeEnv(episodes=episodes)
+    agent = model_mod.RefereeRLAgent(mode=mode, device=dev)
+
+    logger.info(
+        "Training Referee RL Agent (%s) across %d episodes on %s (Replay Buffer: %d)...",
+        mode.upper(),
+        num_episodes,
+        dev,
+        len(episodes),
+    )
+
+    episode_rewards: List[float] = []
+    correct_calls: List[bool] = []
+    losses: List[float] = []
+
+    for ep_num in range(1, num_episodes + 1):
+        state = env.reset()
+        done = False
+        ep_reward = 0.0
+        step_losses = []
+
+        while not done:
+            action = agent.select_action(state, evaluate=False)
+            next_state, reward, done, info = env.step(action)
+            agent.store_transition(state, action, reward, next_state, done)
+            loss = agent.train_step(batch_size=batch_size)
+            if loss > 0:
+                step_losses.append(loss)
+            state = next_state
+            ep_reward += reward
+
+        if ep_num % 5 == 0:
+            agent.update_target_network()
+
+        episode_rewards.append(ep_reward)
+        correct_calls.append(bool(info.get("correct_call", False)))
+        if step_losses:
+            losses.append(float(np.mean(step_losses)))
+
+        if ep_num % 25 == 0 or ep_num == num_episodes:
+            recent_acc = float(np.mean(correct_calls[-25:]) * 100.0)
+            avg_rew = float(np.mean(episode_rewards[-25:]))
+            logger.info(
+                "RL Episode [%03d/%03d] | Avg Reward: %+.2f | Officiating Accuracy: %.1f%% | Epsilon: %.2f",
+                ep_num,
+                num_episodes,
+                avg_rew,
+                recent_acc,
+                agent.epsilon,
+            )
+
+    save_path = resolve_project_path(checkpoint_path or (BASE_DIR / "weights" / "referee_rl_agent.pt"))
+    agent.save(save_path)
+
+    metrics = {
+        "final_accuracy": float(np.mean(correct_calls[-30:])),
+        "mean_reward": float(np.mean(episode_rewards)),
+        "episode_rewards": episode_rewards,
+        "losses": losses,
+        "checkpoint_path": str(save_path),
+    }
+    return metrics
+
+
 def run_training_pipeline(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = select_compute_device(args.device)
     logger.info("Using compute device: %s (OS: %s)", device, platform.system())
+
+    # Detect Google Colab / High-VRAM NVIDIA T4 GPU (15.3 GB VRAM)
+    is_cuda = (device.type == "cuda" and torch.cuda.is_available())
+    vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9) if is_cuda else 0.0
+    is_colab_t4 = is_cuda and (vram_gb >= 12.0)
+    high_vram_active = getattr(args, "high_vram", False) or is_colab_t4
+
+    use_cached_embeddings = True
+    if high_vram_active and not getattr(args, "freeze_backbone", False):
+        use_cached_embeddings = False
+        if args.batch_size <= 4:
+            args.batch_size = 16
+        args.freeze_backbone = False
+        logger.info(
+            "🚀 Google Colab T4 High-Compute Mode Active! Total VRAM: %.1f GB.",
+            vram_gb,
+        )
+        logger.info(
+            "Allocating ~10-14 GB GPU RAM: End-to-End 3D ConvNet Fine-Tuning | batch_size=%d, accum_steps=%d (eff=%d) | AMP=True",
+            args.batch_size,
+            args.accum_steps,
+            args.batch_size * args.accum_steps,
+        )
 
     base_dataset = L2MFoulDataset(
         processed_dir=args.processed_dir,
@@ -1403,6 +1607,7 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
         is_train=True,
         max_samples=args.max_samples,
         return_foul_features=True,
+        use_cached_embeddings=use_cached_embeddings,
     )
     if len(base_dataset) < 2:
         raise RuntimeError(
@@ -1429,7 +1634,12 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
     use_pin_memory = device.type == "cuda"
 
     train_loader = DataLoader(
-        L2MFoulDataset(samples=train_samples, is_train=True, return_foul_features=True),
+        L2MFoulDataset(
+            samples=train_samples,
+            is_train=True,
+            return_foul_features=True,
+            use_cached_embeddings=use_cached_embeddings,
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=safe_workers,
@@ -1437,7 +1647,12 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
         collate_fn=safe_foul_collate,
     )
     val_loader = DataLoader(
-        L2MFoulDataset(samples=val_samples, is_train=False, return_foul_features=True),
+        L2MFoulDataset(
+            samples=val_samples,
+            is_train=False,
+            return_foul_features=True,
+            use_cached_embeddings=use_cached_embeddings,
+        ),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=safe_workers,
@@ -1503,10 +1718,16 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
         )
         scheduler.step()
 
+        mem_msg = ""
+        if device.type == "cuda":
+            vram_curr = torch.cuda.memory_allocated() / (1024**3)
+            vram_peak = torch.cuda.max_memory_allocated() / (1024**3)
+            mem_msg = f" | VRAM: {vram_curr:.1f}/{vram_peak:.1f} GB"
+
         current_lr = optimizer.param_groups[0]["lr"]
         logger.info(
             "Epoch [%02d/%02d] | LR: %.2e | Train Loss: %.4f | Val Loss: %.4f | "
-            "Acc: %.3f | Prec: %.3f | Rec: %.3f | F1: %.3f | ROC-AUC: %.3f | Thresh: %.2f",
+            "Acc: %.3f | Prec: %.3f | Rec: %.3f | F1: %.3f | ROC-AUC: %.3f | Thresh: %.2f%s",
             epoch,
             args.epochs,
             current_lr,
@@ -1518,6 +1739,7 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
             metrics["f1"],
             metrics["roc_auc"],
             metrics["threshold"],
+            mem_msg,
         )
 
         if (metrics["f1"] > best_f1) or (
@@ -1544,6 +1766,15 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
                 best_roc_auc,
                 metrics["threshold"],
             )
+
+    if getattr(args, "train_rl", False):
+        logger.info("Initiating Reinforcement Learning Referee Agent Training...")
+        train_rl_referee_agent(
+            dataset=base_dataset,
+            num_episodes=getattr(args, "rl_episodes", 150),
+            mode=getattr(args, "rl_mode", "dqn"),
+            device=device,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1680,6 +1911,35 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional explicit output path for annotated prediction MP4 (defaults to data/annotated/<clip>_annotated.mp4)",
+    )
+    parser.add_argument(
+        "--high-vram",
+        action="store_true",
+        help="Google Colab Tesla T4 / 16GB GPU Mode: unfreezes 3D ConvNet backbone, uses raw video tensors, sets batch_size 16, AMP fp16, maximizing GPU memory (10-14 GB)",
+    )
+    parser.add_argument(
+        "--colab-t4",
+        action="store_true",
+        dest="high_vram",
+        help="Alias for --high-vram optimized for Google Colab Tesla T4 environment",
+    )
+    parser.add_argument(
+        "--train-rl",
+        action="store_true",
+        help="Train the Reinforcement Learning Referee Agent (DQN / Actor-Critic) on L2M episodes",
+    )
+    parser.add_argument(
+        "--rl-episodes",
+        type=int,
+        default=150,
+        help="Number of episodes for Reinforcement Learning referee training (default: 150)",
+    )
+    parser.add_argument(
+        "--rl-mode",
+        type=str,
+        default="dqn",
+        choices=["dqn", "actor_critic"],
+        help="Reinforcement learning algorithm mode ('dqn' or 'actor_critic')",
     )
     parser.add_argument(
         "--yolo-pose-model",

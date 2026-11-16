@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import logging
 import random
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 from torchvision.models.video import R2Plus1D_18_Weights, r2plus1d_18
@@ -85,8 +87,10 @@ def resolve_project_path(path_arg: Path | str) -> Path:
     """Resolve paths across Windows/macOS/Linux checking CWD, BASE_DIR, and weights/ directory."""
     norm_str = str(path_arg).replace("\\", "/")
     p = Path(norm_str)
-    if p.is_absolute() and p.exists():
+    if p.is_absolute():
         return p
+    if p.parts and p.parts[0] == BASE_DIR.name:
+        return (BASE_DIR.parent / p).resolve()
     for candidate in [
         Path.cwd() / p,
         BASE_DIR / p,
@@ -95,7 +99,7 @@ def resolve_project_path(path_arg: Path | str) -> Path:
         BASE_DIR.parent / "weights" / p.name,
         BASE_DIR.parent / p,
     ]:
-        if candidate.exists():
+        if candidate.exists() or candidate.parent.exists():
             return candidate
     return BASE_DIR / p
 
@@ -595,6 +599,505 @@ class FoulClassifier3D(nn.Module):
         pose_embedding = self.pose_network(active_pose)      # (B, 256)
         combined_features = torch.cat([video_embedding, pose_embedding], dim=-1)  # (B, 768)
         return self.classifier_head(combined_features)
+
+    def extract_features(
+        self,
+        video_frames: torch.Tensor,
+        pose_features: Optional[torch.Tensor] = None,
+        foul_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Extract the combined 768-D [512-D visual || 256-D pose] embedding."""
+        if video_frames.dim() == 2 and video_frames.size(-1) == self.video_feature_dim:
+            video_embedding = video_frames
+        elif getattr(self, "backbone_frozen", False):
+            with torch.no_grad():
+                video_embedding = self.video_backbone(video_frames)
+        else:
+            video_embedding = self.video_backbone(video_frames)
+
+        active_pose = pose_features if pose_features is not None else foul_features
+        if active_pose is None:
+            batch_feats = [
+                derive_motion_foul_features_from_rgb(video_frames[b].detach().cpu())
+                for b in range(video_frames.size(0))
+            ]
+            active_pose = torch.stack(batch_feats, dim=0).to(video_frames.device)
+        else:
+            active_pose = active_pose.to(video_frames.device)
+
+        pose_embedding = self.pose_network(active_pose)
+        return torch.cat([video_embedding, pose_embedding], dim=-1)
+
+
+# ==============================================================================
+# Reinforcement Learning (RL) Referee Officiating Subsystem
+# ==============================================================================
+RL_STATE_DIM = 281  # 256 (projected visual) + 12 (biomechanical contact) + 12 (velocity delta) + 1 (temporal clock)
+RL_NUM_ACTIONS = 2  # 0: PLAY_ON (swallow whistle), 1: WHISTLE_FOUL (blow whistle)
+ACTION_PLAY_ON = 0
+ACTION_WHISTLE = 1
+
+
+class NBARefereeEnv:
+    """
+    Sequential Basketball Officiating Gym-like Environment.
+    Models an NBA referee observing a contested basketball drive over T frames.
+
+    State at frame t (dim 281):
+      - Visual spatiotemporal state (256-D projection)
+      - Biomechanical contact vector (12-D Rule 12 metrics: cylinder, verticality, arm intrusion)
+      - Contact velocity / acceleration delta (12-D: b_t - b_{t-1})
+      - Temporal normalized clock (t / T)
+
+    Action space:
+      - 0: ACTION_PLAY_ON (swallow whistle, let legal physical contact continue)
+      - 1: ACTION_WHISTLE (blow whistle, stop play and assess foul)
+
+    Reward structure (grounded in official NBA L2M review decisions & Rule 12):
+      - Whistle on CC (Correct Call) / INC (Incorrect Non-Call): +2.5 reward (+ timing precision)
+      - Whistle on INC (League Overturn): +0.5 bonus (calling foul missed by real floor referees!)
+      - Play on CNC (Correct Non-Call) / IC (Incorrect Call): +2.0 reward (clean non-call)
+      - Play on IC (League Overturn): +0.5 bonus (avoiding phantom whistle blown by real refs!)
+      - Whistle on CNC / IC (Phantom Whistle): -3.0 penalty (penalizing clean defense)
+      - Play on CC / INC (Swallowed Whistle): -2.5 penalty (failing to protect shooter)
+      - Step shaping: +0.05 for legal verticality defense; -0.10 for hesitating on cylinder breach
+    """
+
+    def __init__(
+        self,
+        episodes: Optional[List[Dict[str, Any]]] = None,
+        visual_dim: int = 256,
+        pose_dim: int = POSE_FEATURES,
+    ) -> None:
+        self.episodes = episodes or []
+        self.visual_dim = visual_dim
+        self.pose_dim = pose_dim
+        self.current_idx = 0
+        self.current_t = 0
+        self.current_episode: Optional[Dict[str, Any]] = None
+
+    def set_episodes(self, episodes: List[Dict[str, Any]]) -> None:
+        self.episodes = episodes
+
+    def _get_state(self, t: int) -> np.ndarray:
+        assert self.current_episode is not None
+        ep = self.current_episode
+        T = ep["num_frames"]
+        v_feat = ep["visual_sequence"][min(t, T - 1)]  # (visual_dim,)
+        b_feat = ep["pose_features"][min(t, T - 1)]    # (12,)
+        if t > 0:
+            delta_b = b_feat - ep["pose_features"][t - 1]
+        else:
+            delta_b = np.zeros_like(b_feat)
+        clock = np.array([float(t) / max(1.0, float(T - 1))], dtype=np.float32)
+        return np.concatenate([v_feat, b_feat, delta_b, clock]).astype(np.float32)
+
+    def reset(self, episode_idx: Optional[int] = None) -> np.ndarray:
+        if not self.episodes:
+            raise RuntimeError("NBARefereeEnv has no episodes loaded.")
+        if episode_idx is not None:
+            self.current_idx = episode_idx % len(self.episodes)
+        else:
+            self.current_idx = random.randint(0, len(self.episodes) - 1)
+        self.current_episode = self.episodes[self.current_idx]
+        self.current_t = 0
+        return self._get_state(0)
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        assert self.current_episode is not None, "Call reset() before step()."
+        ep = self.current_episode
+        t = self.current_t
+        T = ep["num_frames"]
+        label = int(ep.get("label", 0))
+        decision = ep.get("review_decision", "CC" if label == 1 else "CNC")
+        peak_f = int(ep.get("peak_frame", T // 2))
+
+        pose_t = ep["pose_features"][min(t, T - 1)]
+        cylinder_pen = float(pose_t[1]) if len(pose_t) > 1 else 0.0
+        vert_angle = float(pose_t[3]) if len(pose_t) > 3 else 0.0
+
+        done = False
+        reward = 0.0
+        info: Dict[str, Any] = {
+            "play_id": ep.get("play_id", ""),
+            "frame": t,
+            "action": action,
+            "true_label": label,
+            "review_decision": decision,
+        }
+
+        if action == ACTION_WHISTLE:
+            done = True
+            info["whistle_blown"] = True
+            info["whistle_frame"] = t
+            if label == 1:
+                # Correct whistle call!
+                base = 2.5
+                timing_bonus = 1.0 * max(0.0, 1.0 - abs(t - peak_f) / 4.0)
+                overturn_bonus = 0.5 if decision == "INC" else 0.0
+                reward = base + timing_bonus + overturn_bonus
+                info["correct_call"] = True
+                info["call_grade"] = "CORRECT_WHISTLE"
+            else:
+                # Phantom whistle on legal defense
+                vert_penalty = -0.5 if vert_angle < 0.20 else 0.0
+                reward = -3.0 + vert_penalty
+                info["correct_call"] = False
+                info["call_grade"] = "PHANTOM_WHISTLE_ERROR"
+
+        else:  # ACTION_PLAY_ON
+            if t >= T - 1:
+                done = True
+                info["whistle_blown"] = False
+                if label == 0:
+                    # Clean play-on held through end of play
+                    base = 2.0
+                    overturn_bonus = 0.5 if decision == "IC" else 0.0
+                    reward = base + overturn_bonus
+                    info["correct_call"] = True
+                    info["call_grade"] = "CORRECT_NO_CALL"
+                else:
+                    # Swallowed whistle on illegal foul
+                    reward = -2.5
+                    info["correct_call"] = False
+                    info["call_grade"] = "MISSED_FOUL_ERROR"
+            else:
+                done = False
+                self.current_t += 1
+                # Biomechanical step reward shaping
+                if vert_angle < 0.25 and cylinder_pen < 0.35:
+                    reward = 0.05
+                elif cylinder_pen > 0.65:
+                    reward = -0.10
+                else:
+                    reward = 0.0
+
+        next_state = self._get_state(self.current_t) if not done else np.zeros((RL_STATE_DIM,), dtype=np.float32)
+        return next_state, reward, done, info
+
+
+class RefereeDQN(nn.Module):
+    """
+    Dueling Deep Q-Network for NBA Referee Decision Making.
+    Separates state value V(s) from action advantages A(s, a).
+    Q(s, a) = V(s) + (A(s, a) - mean(A(s, :)))
+    """
+
+    def __init__(self, state_dim: int = RL_STATE_DIM, num_actions: int = RL_NUM_ACTIONS) -> None:
+        super().__init__()
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.feature_net = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+        self.advantage_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, num_actions),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        feats = self.feature_net(state)
+        v = self.value_head(feats)
+        a = self.advantage_head(feats)
+        return v + (a - a.mean(dim=-1, keepdim=True))
+
+
+class RefereeActorCritic(nn.Module):
+    """
+    Actor-Critic Policy Gradient Network for NBA Referee Decision Making.
+    Actor: Outputs whistle policy pi(a | s).
+    Critic: Outputs expected officiating return V(s).
+    """
+
+    def __init__(self, state_dim: int = RL_STATE_DIM, num_actions: int = RL_NUM_ACTIONS) -> None:
+        super().__init__()
+        self.shared_net = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+        )
+        self.actor_head = nn.Sequential(
+            nn.Linear(128, num_actions),
+        )
+        self.critic_head = nn.Sequential(
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feats = self.shared_net(state)
+        logits = self.actor_head(feats)
+        probs = F.softmax(logits, dim=-1)
+        val = self.critic_head(feats)
+        return probs, val
+
+
+class RefereeRLAgent:
+    """
+    Unified Reinforcement Learning Referee Agent.
+    Supports Dueling DQN and Actor-Critic architectures,
+    experience replay, epsilon-decay exploration, batch GPU updates,
+    and continuous temporal trajectory evaluation.
+    """
+
+    def __init__(
+        self,
+        mode: str = "dqn",
+        state_dim: int = RL_STATE_DIM,
+        num_actions: int = RL_NUM_ACTIONS,
+        lr: float = 3e-4,
+        gamma: float = 0.95,
+        device: Optional[torch.device | str] = None,
+    ) -> None:
+        self.mode = mode.lower()
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.gamma = gamma
+
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        if self.mode == "actor_critic":
+            self.model = RefereeActorCritic(state_dim, num_actions).to(self.device)
+            self.target_model = None
+        else:
+            self.model = RefereeDQN(state_dim, num_actions).to(self.device)
+            self.target_model = RefereeDQN(state_dim, num_actions).to(self.device)
+            self.target_model.load_state_dict(self.model.state_dict())
+            self.target_model.eval()
+
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-3)
+        self.replay_buffer: deque = deque(maxlen=20000)
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+
+    def select_action(self, state: np.ndarray, evaluate: bool = False) -> int:
+        if not evaluate and random.random() < self.epsilon and self.mode == "dqn":
+            return random.randint(0, self.num_actions - 1)
+
+        st = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            if self.mode == "actor_critic":
+                probs, _ = self.model(st)
+                if evaluate:
+                    return int(torch.argmax(probs, dim=-1).item())
+                dist = torch.distributions.Categorical(probs)
+                return int(dist.sample().item())
+            else:
+                q_vals = self.model(st)
+                return int(torch.argmax(q_vals, dim=-1).item())
+
+    def store_transition(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        self.replay_buffer.append((state, action, reward, next_state, done))
+
+    def train_step(self, batch_size: int = 64) -> float:
+        if len(self.replay_buffer) < batch_size:
+            return 0.0
+
+        batch = random.sample(self.replay_buffer, batch_size)
+        states = torch.from_numpy(np.array([b[0] for b in batch], dtype=np.float32)).to(self.device)
+        actions = torch.tensor([b[1] for b in batch], dtype=torch.long, device=self.device)
+        rewards = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.from_numpy(np.array([b[3] for b in batch], dtype=np.float32)).to(self.device)
+        dones = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=self.device)
+
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        if self.mode == "dqn":
+            curr_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            with torch.no_grad():
+                next_q = self.target_model(next_states).max(dim=1).values
+                target_q = rewards + (1.0 - dones) * self.gamma * next_q
+
+            loss = F.smooth_l1_loss(curr_q, target_q)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+            return float(loss.item())
+
+        else:  # Actor-Critic
+            probs, vals = self.model(states)
+            _, next_vals = self.model(next_states)
+            vals = vals.squeeze(1)
+            next_vals = next_vals.squeeze(1)
+
+            with torch.no_grad():
+                target_vals = rewards + (1.0 - dones) * self.gamma * next_vals
+                advantages = target_vals - vals
+
+            log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
+            actor_loss = -(log_probs * advantages.detach()).mean()
+            critic_loss = F.mse_loss(vals, target_vals)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+
+            total_loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            return float(total_loss.item())
+
+    def update_target_network(self) -> None:
+        if self.target_model is not None:
+            self.target_model.load_state_dict(self.model.state_dict())
+
+    def evaluate_trajectory(
+        self,
+        visual_sequence: np.ndarray | torch.Tensor,
+        pose_features: np.ndarray | torch.Tensor,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate full play sequence sequentially from t=0 to T-1.
+        Returns whistle decision, whistle frame, live Q-values / whistle probabilities,
+        and Rule 12 telemetry.
+        """
+        if isinstance(visual_sequence, torch.Tensor):
+            visual_sequence = visual_sequence.detach().cpu().numpy()
+        if isinstance(pose_features, torch.Tensor):
+            pose_features = pose_features.detach().cpu().numpy()
+
+        T = len(pose_features)
+        # Harmonize visual sequence length to T
+        if visual_sequence.ndim == 1:
+            visual_sequence = np.tile(visual_sequence[:256], (T, 1))
+        elif len(visual_sequence) != T:
+            idxs = np.linspace(0, len(visual_sequence) - 1, T).round().astype(int)
+            visual_sequence = visual_sequence[idxs, :256]
+        else:
+            visual_sequence = visual_sequence[:, :256]
+
+        q_history: List[List[float]] = []
+        whistle_prob_history: List[float] = []
+        whistle_frame: Optional[int] = None
+
+        self.model.eval()
+        with torch.no_grad():
+            for t in range(T):
+                v_feat = visual_sequence[t]
+                b_feat = pose_features[t]
+                delta_b = b_feat - pose_features[t - 1] if t > 0 else np.zeros_like(b_feat)
+                clock = np.array([float(t) / max(1.0, float(T - 1))], dtype=np.float32)
+                st = np.concatenate([v_feat, b_feat, delta_b, clock]).astype(np.float32)
+                st_t = torch.from_numpy(st).float().unsqueeze(0).to(self.device)
+
+                if self.mode == "actor_critic":
+                    probs, _ = self.model(st_t)
+                    p_whistle = float(probs[0, ACTION_WHISTLE].item())
+                    whistle_prob_history.append(p_whistle)
+                    q_history.append([float(probs[0, 0].item()), p_whistle])
+                    if whistle_frame is None and p_whistle >= 0.50:
+                        whistle_frame = t
+                else:
+                    q_vals = self.model(st_t)[0].cpu().numpy()
+                    q_history.append([float(q_vals[0]), float(q_vals[1])])
+                    # Softmax temperature scaling for confidence
+                    exp_q = np.exp(q_vals - np.max(q_vals))
+                    probs = exp_q / exp_q.sum()
+                    whistle_prob_history.append(float(probs[1]))
+                    if whistle_frame is None and q_vals[ACTION_WHISTLE] > q_vals[ACTION_PLAY_ON]:
+                        whistle_frame = t
+
+        is_foul = (whistle_frame is not None)
+        confidence = float(whistle_prob_history[whistle_frame]) if is_foul else float(1.0 - max(whistle_prob_history))
+        return {
+            "decision": "FOUL_WHISTLED" if is_foul else "LEGAL_PLAY_ON",
+            "is_foul": is_foul,
+            "whistle_frame": whistle_frame,
+            "confidence": confidence,
+            "whistle_probs": whistle_prob_history,
+            "q_values": q_history,
+        }
+
+    def save(self, path: Path | str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "mode": self.mode,
+                "state_dim": self.state_dim,
+                "num_actions": self.num_actions,
+                "model_state_dict": self.model.state_dict(),
+                "epsilon": self.epsilon,
+            },
+            str(p),
+        )
+        logger.info("Saved Referee RL Agent checkpoint to %s", p)
+
+    def load(self, path: Path | str) -> None:
+        p = resolve_project_path(path)
+        ckpt = load_torch_file_safe(p, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        if self.target_model is not None:
+            self.target_model.load_state_dict(self.model.state_dict())
+        self.epsilon = float(ckpt.get("epsilon", 0.05))
+        logger.info("Loaded Referee RL Agent from %s", p)
+
+
+def create_referee_episodes_from_dataset(
+    dataset: L2MFoulDataset,
+    max_episodes: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Extract trajectories from `L2MFoulDataset` and format them into
+    episodes for `NBARefereeEnv` sequential RL training.
+    """
+    episodes: List[Dict[str, Any]] = []
+    n = len(dataset) if max_episodes <= 0 else min(len(dataset), max_episodes)
+    extractor = get_shared_embedding_extractor()
+
+    for idx in range(n):
+        path, label = dataset.samples[idx]
+        raw_video, pose_features, video_emb = dataset._load_video_and_features(path)
+        if video_emb is None:
+            video_emb = dataset._extract_and_cache_embedding(raw_video, path)
+
+        v_vec = video_emb.cpu().numpy()[:256]
+        p_mat = pose_features.cpu().numpy() if isinstance(pose_features, torch.Tensor) else np.array(pose_features)
+
+        # Estimate peak contact impact from cylinder penetration + arm contact
+        contact_scores = p_mat[:, 0] * 0.5 + p_mat[:, 1] * 0.5
+        peak_f = int(np.argmax(contact_scores)) if len(contact_scores) > 0 else FRAMES // 2
+
+        episodes.append(
+            {
+                "play_id": path.stem,
+                "num_frames": len(p_mat),
+                "visual_sequence": np.tile(v_vec, (len(p_mat), 1)),
+                "pose_features": p_mat,
+                "label": int(label),
+                "review_decision": "CC" if label == 1 else "CNC",
+                "peak_frame": peak_f,
+            }
+        )
+
+    return episodes
 
 
 if __name__ == "__main__":

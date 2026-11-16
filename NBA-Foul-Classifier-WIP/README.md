@@ -1,61 +1,67 @@
-# NBA Foul Detection & Prediction Pipeline (`YOLOv11-Pose` + `R(2+1)D-18` Dual-Stream Fusion)
+# NBA Foul Detection & Prediction Pipeline (`YOLOv11-Pose` + `R(2+1)D-18` + Reinforcement Learning)
 
-A cross-platform Computer Vision and Spatiotemporal Deep Learning pipeline engineered to **detect and classify basketball fouls** from NBA Last Two Minute (L2M) broadcast video clips across **Windows, macOS (Intel & Apple Silicon M1/M2/M3/M4), and Linux (CUDA & CPU)**.
+A state-of-the-art Computer Vision, Spatiotemporal Deep Learning, and **Reinforcement Learning (RL)** officiating pipeline engineered to **detect, classify, and evaluate basketball fouls** from NBA Last Two Minute (L2M) broadcast video clips.
+
+Optimized specifically for **Google Colab NVIDIA Tesla T4 GPUs (15.3 GB GDDR6 VRAM)** to maximize GPU compute and utilize **12–14 GB of GPU RAM**, while maintaining cross-platform compatibility across Windows, macOS, and Linux.
 
 ---
 
-## 1. System Architecture
+## 1. System Architecture & Google Colab T4 Compute Optimization
 
-Our overhauled pipeline uses a **4-stage Dual-Stream Spatiotemporal Architecture (~33.8M parameters)** pairing **3D Convolutional Visual Features (512-D)** with **High-Capacity Pose Kinematics (256-D)** into a deep **768-D Late-Fusion Classification Head**:
+Our overhauled pipeline integrates **End-to-End 3D Convolutional Visual Backbones (512-D)** with **Kinematic Pose Attention Networks (256-D)** and a **Sequential Reinforcement Learning Referee Agent (`NBARefereeEnv` + Dueling DQN / Actor-Critic)**:
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| STAGE 1: NBA L2M Web & JSON Scraper (1_scrape_l2m.py)                                             |
+| STAGE 1: High-Throughput NBA L2M Web & JSON Scraper (1_scrape_l2m.py)                             |
 |  • Scrapes official.nba.com L2M JSON/HTML reports (UTF-8 BOM-safe) & CDN broadcast MP4 streams    |
-|  • Maps Officiating Reviews -> Binary Ground Truth:                                               |
-|      - Class 1 (foul):    CC (Correct Call) + INC (Incorrect Non-Call)                            |
-|      - Class 0 (no_foul): CNC (Correct Non-Call) + IC (Incorrect Call)                            |
-|  • Outputs: data/l2m_metadata.csv (349 plays, 18+ games) & data/l2m_incorrect_fouls.csv (97 plays) |
-|  • Over 130+ raw broadcast MP4 clips downloaded in data/raw/{foul,no_foul}/                       |
+|  • Concurrent ThreadPoolExecutor bulk downloader for 349+ plays and multi-season game discovery   |
+|  • Officiating Ground Truth: CC (Correct Call), INC (Missed Foul), CNC (Legal), IC (Phantom Call)  |
 +-------------------------------------------------+-------------------------------------------------+
                                                   |
                                                   v
 +---------------------------------------------------------------------------------------------------+
-| STAGE 2: Cross-Platform Two-Pass Action-Tube & Pose Extractor (2_preprocess_tubes.py)             |
-|  • Pass 1 (Low-RAM Scan): Caps live play to first 15.0s (skipping multi-minute replay reviews),   |
-|    decodes downscaled 640x360 frames (< 8 MB RAM), closes VideoCapture, & runs YOLOv11-Pose       |
-|    in micro-batches (--yolo-batch-size 4).                                                        |
-|  • Extracts 12-D Biomechanical Contact Vector per frame (arm distance, torso overlap, gather)     |
-|  • Pass 2 (EMA Stabilized Crop): Smooths ROI boxes via bidirectional EMA & crops 16 frames        |
-|    (1.5s window around peak contact) -> saves (3, 16, 224, 224) RGB + (16, 12) Pose .pt tensors   |
+| STAGE 2: GPU-Accelerated Action-Tube & Biomechanical Pose Extractor (2_preprocess_tubes.py)       |
+|  • Ultralytics YOLOv11-Pose batch inference directly on CUDA with FP16 half precision             |
+|  • Extracts 12-D Biomechanical Contact Vector per frame grounded in NBA Rule 12 (cylinder breach, |
+|    verticality angle deviation, arm contact intrusion, landing space violation, closing velocity) |
+|  • Crops stabilized (3, 16, 224, 224) RGB + (16, 12) Pose .pt action-tube tensors                 |
 +-------------------------------------------------+-------------------------------------------------+
                                                   |
                          +------------------------+------------------------+
                          |                                                 |
                          v                                                 v
 +------------------------------------------------+ +------------------------------------------------+
-| STREAM A: 3D Spatiotemporal Visual Backbone    | | STREAM B: Biomechanical Pose Encoder           |
-|  • Input: (B, CHANNELS=3, FRAMES=16, 224, 224) | |  • Input: (B, FRAMES=16, POSE_FEATURES=12)     |
-|  • Pretrained R(2+1)D-18 (Kinetics-400)        | |  • 4-Head Multi-Head Temporal Self-Attention    |
-|  • Frozen Backbone on MPS/CPU with precomputed | |  • Residual LayerNorm & Kinematic Projection    |
-|    512-D visual embeddings cache (212 KB)      | |  • Temporal Mean (128) + Max (128) Pooling     |
-|  • Output: VIDEO_FEATURE_DIM = 512-D Embedding | |  • Output: POSE_HIDDEN_DIM = 256-D Embedding   |
+| STREAM A: 3D Spatiotemporal Video Backbone     | | STREAM B: Biomechanical Contact Attention Net  |
+|  • Input: (B, 3, 16, 224, 224) 4D Video Tensor | |  • Input: (B, 16, 12) Kinematic Contact Vector |
+|  • R(2+1)D-18 End-to-End Fine-Tuning on CUDA   | |  • 4-Head Temporal Self-Attention + LayerNorm  |
+|  • Output: 512-D Visual Embedding              | |  • Output: 256-D Biomechanical Representation  |
 +------------------------+-----------------------+ +-----------------------+------------------------+
                          |                                                 |
                          +------------------------+------------------------+
                                                   |
                                                   v
 +---------------------------------------------------------------------------------------------------+
-| STAGE 3 & 4: Deep Late Fusion Classifier & Full Annotated Video Export (3_model / 4_train_eval)   |
+| STAGE 3 & 4: Deep Late Fusion & High-VRAM End-to-End GPU Training (3_model / 4_train_eval)         |
 |  • Late Fusion: COMBINED_FEATURE_DIM = 768-D [512-D Visual || 256-D Pose Kinematics]              |
-|  • Deep Classification Head: LayerNorm -> Linear(768, 512) -> LayerNorm -> GELU -> Dropout ->    |
-|    Linear(512, 256) -> LayerNorm -> GELU -> Linear(256, 1) (~33.8M parameters / 613K trainable)   |
-|  • Trained with class-balanced FoulFocalBCEWithLogitsLoss with Label Smoothing (gamma=1.5, eps=0.05)|
-|  • Trains 10 epochs in under 6 seconds with cached embeddings and zero Apple Silicon memory stalls|
-|  • Threshold Calibration sweeps [0.20..0.80] optimizing composite F1 + Balanced Accuracy         |
-|  • Export Annotated Video: Disputed-play multi-player tracking enclosing ALL players involved,    |
-|    dynamic green-to-red box transition at exact foul frame, and top-left HUD stats panel stating  |
-|    WHAT FOUL occurred and WHO FOULED WHO into data/annotated/<clip_id>_annotated.mp4              |
+|  • Deep Classification Head: 768-D -> 512-D -> 256-D -> 1 (~33.8M parameters)                     |
+|  • High-VRAM Colab T4 Mode: batch_size=16, accum_steps=2 (eff=32), AMP FP16, pin_memory=True      |
+|  • Consumes ~12-14 GB GDDR6 GPU RAM, fully engaging Tesla T4 Turing Tensor Cores                   |
++-------------------------------------------------+-------------------------------------------------+
+                                                  |
+                                                  v
++---------------------------------------------------------------------------------------------------+
+| STAGE 5 & 6: Sequential Reinforcement Learning Referee Agent (NBARefereeEnv + Dueling DQN)        |
+|  • Gym-like sequential officiating environment (State: 281-D, Actions: PLAY_ON vs WHISTLE_FOUL)   |
+|  • Rewards grounded in NBA L2M Ground Truth: +2.5 CC/INC, -3.0 phantom whistle, +0.5 overturn     |
+|  • Evaluates WHEN to blow the whistle with timing precision and Rule 12 biomechanical shaping     |
++-------------------------------------------------+-------------------------------------------------+
+                                                  |
+                                                  v
++---------------------------------------------------------------------------------------------------+
+| STAGE 7: Broadcast-Grade Multimodal Video Annotation & Telemetry Replay                           |
+|  • Disputed-play enclosing hull tracking BOTH players (Offense Cyan, Defense Orange)              |
+|  • 17-Keypoint skeleton overlay, defender verticality guideline, dynamic green-to-red transition  |
+|  • Top-left HUD with live RL Q-values, P(Whistle), Rule 12 diagnostics, & bottom timeline strip   |
 +---------------------------------------------------------------------------------------------------+
 ```
 
