@@ -964,6 +964,13 @@ def preprocess_dataset(
         processed_dir,
         processed_metadata_csv,
     )
+    try:
+        del yolo_model, pose_model
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return processed_rows
 
 

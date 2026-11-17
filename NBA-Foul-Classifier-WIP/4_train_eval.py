@@ -19,6 +19,7 @@ import csv
 import importlib
 import logging
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import platform
 import random
 import shutil
@@ -88,14 +89,25 @@ def seed_everything(seed: int = 42) -> None:
 
 
 def select_compute_device(requested: Optional[str] = None) -> torch.device:
-    """Select the best available compute device ('cuda', 'mps', or 'cpu') cross-platform."""
+    """Select the best available compute device ('cuda', 'mps', or 'cpu') cross-platform with eager cuBLAS init."""
     if requested and requested.lower() != "auto":
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+        dev = torch.device(requested)
+    elif torch.cuda.is_available():
+        dev = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        dev = torch.device("mps")
+    else:
+        dev = torch.device("cpu")
+    
+    if dev.type == "cuda":
+        try:
+            _warmup = torch.empty((2, 2), device=dev)
+            _ = _warmup @ _warmup
+            del _warmup
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return dev
 
 
 def get_safe_num_workers(requested_workers: int = 0) -> int:
@@ -280,6 +292,9 @@ def train_one_epoch(
     total_samples = 0
     accum_steps = max(1, int(accum_steps))
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     for step, batch in enumerate(loader):
         if len(batch) == 3:
             videos, pose_feats, targets = batch
@@ -291,16 +306,57 @@ def train_one_epoch(
         if pose_feats is not None:
             pose_feats = pose_feats.to(device, non_blocking=(device.type == "cuda"))
         targets = targets.to(device, non_blocking=(device.type == "cuda")).unsqueeze(1)
+        batch_sz = videos.size(0)
+        raw_loss_val = 0.0
 
-        with get_autocast_context(device):
-            logits = model(videos, pose_feats)
-            raw_loss = criterion(logits, targets)
-            scaled_loss = raw_loss / accum_steps
+        try:
+            with get_autocast_context(device):
+                logits = model(videos, pose_feats)
+                raw_loss = criterion(logits, targets)
+                scaled_loss = raw_loss / accum_steps
 
-        if scaler is not None:
-            scaler.scale(scaled_loss).backward()
-        else:
-            scaled_loss.backward()
+            if scaler is not None:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            raw_loss_val = float(raw_loss.item())
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            err_str = str(exc).lower()
+            if "cublas" in err_str or "out of memory" in err_str:
+                logger.warning(
+                    "CUDA memory pressure / cuBLAS allocation failure on batch %d (%s). Recovering with micro-batching...",
+                    step,
+                    exc,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                # Dynamic micro-batching: split into chunks of 2 or 1
+                micro_sz = max(1, batch_sz // 2)
+                accum_loss = 0.0
+                for m_start in range(0, batch_sz, micro_sz):
+                    m_end = min(m_start + micro_sz, batch_sz)
+                    m_vid = videos[m_start:m_end]
+                    m_pose = pose_feats[m_start:m_end] if pose_feats is not None else None
+                    m_tgt = targets[m_start:m_end]
+                    m_weight = (m_end - m_start) / batch_sz
+
+                    with get_autocast_context(device):
+                        m_logits = model(m_vid, m_pose)
+                        m_loss = criterion(m_logits, m_tgt)
+                        m_scaled = (m_loss * m_weight) / accum_steps
+
+                    if scaler is not None:
+                        scaler.scale(m_scaled).backward()
+                    else:
+                        m_scaled.backward()
+                    accum_loss += float(m_loss.item()) * (m_end - m_start)
+                raw_loss_val = accum_loss / max(batch_sz, 1)
+            else:
+                raise exc
 
         is_update_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(loader))
         if is_update_step:
@@ -315,8 +371,7 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        batch_sz = videos.size(0)
-        running_loss += float(raw_loss.item()) * batch_sz
+        running_loss += raw_loss_val * batch_sz
         total_samples += batch_sz
 
     return running_loss / max(total_samples, 1)
@@ -1587,15 +1642,17 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
     use_cached_embeddings = True
     if high_vram_active and not getattr(args, "freeze_backbone", False):
         use_cached_embeddings = False
-        if args.batch_size <= 4:
-            args.batch_size = 16
+        if args.batch_size <= 2 or args.batch_size > 8:
+            args.batch_size = 4
+        if args.accum_steps <= 2:
+            args.accum_steps = 8
         args.freeze_backbone = False
         logger.info(
             "🚀 Google Colab T4 High-Compute Mode Active! Total VRAM: %.1f GB.",
             vram_gb,
         )
         logger.info(
-            "Allocating ~10-14 GB GPU RAM: End-to-End 3D ConvNet Fine-Tuning | batch_size=%d, accum_steps=%d (eff=%d) | AMP=True",
+            "Optimized High-VRAM: End-to-End 3D ConvNet Fine-Tuning | batch_size=%d, accum_steps=%d (eff=%d) | AMP=True",
             args.batch_size,
             args.accum_steps,
             args.batch_size * args.accum_steps,
