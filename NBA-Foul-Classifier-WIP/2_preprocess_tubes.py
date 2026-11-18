@@ -172,24 +172,27 @@ def detect_basketball_hsv(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
 ) -> Optional[np.ndarray]:
-    """Detect the orange basketball in a downscaled BGR frame via HSV color and circularity."""
+    """Detect the orange basketball in a downscaled BGR frame via HSV color and tight circularity."""
     if bgr_frame is None or bgr_frame.size == 0:
         return None
+    img_h, img_w = bgr_frame.shape[:2]
+    max_area = max(420.0, 0.0009 * float(img_w * img_h))
     hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([5, 110, 95]), np.array([22, 255, 255]))
+    mask = cv2.inRange(hsv, np.array([5, 120, 100]), np.array([22, 255, 255]))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best_pt: Optional[np.ndarray] = None
     best_score = 0.0
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 36.0 <= area <= 2600.0:
+        if 36.0 <= area <= max_area:
             perim = cv2.arcLength(cnt, True)
             if perim > 0:
                 circ = 4.0 * np.pi * area / (perim * perim)
-                if circ >= 0.42 and (circ * area) > best_score:
-                    best_score = float(circ * area)
+                if circ >= 0.62 and (circ * area) > best_score:
                     (cx, cy), _ = cv2.minEnclosingCircle(cnt)
-                    best_pt = np.array([cx * scale_x, cy * scale_y], dtype=np.float32)
+                    if 0.14 * img_h <= cy <= 0.84 * img_h:
+                        best_score = float(circ * area)
+                        best_pt = np.array([cx * scale_x, cy * scale_y], dtype=np.float32)
     return best_pt
 
 
@@ -302,6 +305,7 @@ def analyze_foul_interaction_frame(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
     bgr_frame: Optional[np.ndarray] = None,
+    ball_pt_override: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """
     Analyze player bounding boxes and 17-point human pose skeletons to:
@@ -345,17 +349,27 @@ def analyze_foul_interaction_frame(
             merged_kpts_list.append(p_kpts[b_idx])
 
     # Supplement with high-confidence det_res person boxes that pose_res missed due to collision occlusion
+    def _box_iom_local(b1: np.ndarray, b2: np.ndarray) -> float:
+        ix1 = max(float(b1[0]), float(b2[0]))
+        iy1 = max(float(b1[1]), float(b2[1]))
+        ix2 = min(float(b1[2]), float(b2[2]))
+        iy2 = min(float(b1[3]), float(b2[3]))
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        a1 = max(1.0, (float(b1[2]) - float(b1[0])) * (float(b1[3]) - float(b1[1])))
+        a2 = max(1.0, (float(b2[2]) - float(b2[0])) * (float(b2[3]) - float(b2[1])))
+        return inter / min(a1, a2)
+
     if det_res is not None and det_res.boxes is not None and len(det_res.boxes) > 0:
         d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
         d_xyxy[:, [0, 2]] *= scale_x
         d_xyxy[:, [1, 3]] *= scale_y
         d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
         d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
-        d_mask = (d_cls == COCO_PERSON_CLS) & (d_conf >= 0.32)
+        d_mask = (d_cls == COCO_PERSON_CLS) & (d_conf >= 0.25)
         d_boxes = d_xyxy[d_mask]
 
         for db in d_boxes:
-            if all(box_iou_single(db, mb) < 0.32 for mb in merged_boxes_list):
+            if all(box_iou_single(db, mb) < 0.35 and _box_iom_local(db, mb) < 0.55 for mb in merged_boxes_list):
                 merged_boxes_list.append(db)
                 merged_kpts_list.append(synthesize_box_keypoints(db))
 
@@ -366,13 +380,13 @@ def analyze_foul_interaction_frame(
     kpts_all: Optional[np.ndarray] = np.stack(merged_kpts_list, axis=0).astype(np.float32)
 
     # Reject close-up camera shots (e.g. referee/player face close-ups before inbound or during dead-ball replay)
-    # In wide broadcast court views, player bounding box heights are <= 0.44 * frame_h.
+    # Broadcast court foreground players can reach ~0.50 * frame_h, whereas true close-ups exceed 0.56 * frame_h.
     if len(player_boxes) > 0:
         all_bh = player_boxes[:, 3] - player_boxes[:, 1]
-        if float(np.max(all_bh)) > frame_h * 0.44:
+        if float(np.max(all_bh)) > frame_h * 0.56:
             return default_roi, 0.0, feats
 
-    # Filter court players: reject upper stands / ceiling and sideline referees while retaining active court floor.
+    # Filter court players: reject upper stands / ceiling, seated bottom photographers/spectators, and referees.
     if len(player_boxes) > 0:
         cy = 0.5 * (player_boxes[:, 1] + player_boxes[:, 3])
         cx = 0.5 * (player_boxes[:, 0] + player_boxes[:, 2])
@@ -387,20 +401,24 @@ def analyze_foul_interaction_frame(
             ],
             dtype=bool,
         )
+        # Seated courtside fans/photographers sit near y2 > 0.83*fh with small cropped height bh < 0.20*fh,
+        # whereas foreground NBA players standing near the lower sideline have bh >= 0.20*fh and y2 <= 0.94*fh.
+        foreground_perspective_ok = (player_boxes[:, 3] <= frame_h * 0.83) | (bh >= frame_h * 0.20)
         court_mask = (
             non_ref_mask
-            & (player_boxes[:, 3] >= frame_h * 0.44)
-            & (player_boxes[:, 3] <= frame_h * 0.89)
-            & (player_boxes[:, 1] >= frame_h * 0.22)
-            & (cy >= frame_h * 0.34)
-            & (cy <= frame_h * 0.80)
-            & (cx >= frame_w * 0.08)
-            & (cx <= frame_w * 0.92)
+            & foreground_perspective_ok
+            & (player_boxes[:, 3] >= frame_h * 0.42)
+            & (player_boxes[:, 3] <= frame_h * 0.94)
+            & (player_boxes[:, 1] >= frame_h * 0.20)
+            & (cy >= frame_h * 0.33)
+            & (cy <= frame_h * 0.84)
+            & (cx >= frame_w * 0.05)
+            & (cx <= frame_w * 0.95)
             & (bh >= frame_h * 0.10)
-            & (bh <= frame_h * 0.42)
+            & (bh <= frame_h * 0.52)
             & (bw >= frame_w * 0.02)
             & (bw <= frame_w * 0.30)
-            & ((bh / np.maximum(bw, 1.0)) >= 0.80)
+            & ((bh / np.maximum(bw, 1.0)) >= 0.78)
         )
         if int(np.sum(court_mask)) >= 2:
             player_boxes = player_boxes[court_mask]
@@ -418,22 +436,32 @@ def analyze_foul_interaction_frame(
         feats[11] = 0.2
         return b.astype(np.float32), 0.2, feats
 
-    ball_pt: Optional[np.ndarray] = None
-    if det_res is not None and det_res.boxes is not None and len(det_res.boxes) > 0:
+    ball_pt: Optional[np.ndarray] = ball_pt_override.copy() if ball_pt_override is not None else None
+    ball_is_confident = ball_pt_override is not None
+    if ball_pt is None and det_res is not None and det_res.boxes is not None and len(det_res.boxes) > 0:
         d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
         d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
         d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
-        b_mask = (d_cls == COCO_SPORTS_BALL_CLS) & (d_conf >= 0.15)
+        b_mask = (d_cls == COCO_SPORTS_BALL_CLS) & (d_conf >= 0.14)
         if np.any(b_mask):
             b_boxes = d_xyxy[b_mask]
             b_confs = d_conf[b_mask]
-            best_b = b_boxes[int(np.argmax(b_confs))]
-            ball_pt = np.array(
-                [(best_b[0] + best_b[2]) * 0.5 * scale_x, (best_b[1] + best_b[3]) * 0.5 * scale_y],
-                dtype=np.float32,
-            )
+            best_idx_b = int(np.argmax(b_confs))
+            best_b = b_boxes[best_idx_b]
+            bw_b = (best_b[2] - best_b[0]) * scale_x
+            bh_b = (best_b[3] - best_b[1]) * scale_y
+            if 0.008 * frame_h <= bw_b <= 0.065 * frame_h and 0.008 * frame_h <= bh_b <= 0.065 * frame_h:
+                ball_pt = np.array(
+                    [(best_b[0] + best_b[2]) * 0.5 * scale_x, (best_b[1] + best_b[3]) * 0.5 * scale_y],
+                    dtype=np.float32,
+                )
+                ball_is_confident = float(b_confs[best_idx_b]) >= 0.22
     if ball_pt is None and bgr_frame is not None:
-        ball_pt = detect_basketball_hsv(bgr_frame, scale_x=scale_x, scale_y=scale_y)
+        hsv_ball = detect_basketball_hsv(bgr_frame, scale_x=scale_x, scale_y=scale_y)
+        if hsv_ball is not None:
+            p_centers = np.column_stack([(player_boxes[:, 0] + player_boxes[:, 2]) * 0.5, (player_boxes[:, 1] + player_boxes[:, 3]) * 0.5])
+            if float(np.min(np.linalg.norm(p_centers - hsv_ball, axis=-1))) <= max(diag * 0.14, 240.0):
+                ball_pt = hsv_ball
 
     player_hsv = [
         extract_player_torso_hsv(bgr_frame, player_boxes[i], scale_x=scale_x, scale_y=scale_y)
@@ -447,9 +475,12 @@ def analyze_foul_interaction_frame(
         ]
     )
 
-    best_pair = (0, 1)
-    best_pair_score = -1.0
+    best_pair = (-1, -1)
+    best_pair_score = -1e9
     best_pair_metrics = (diag, diag, diag, 0.0)
+    fallback_pair = (-1, -1)
+    fallback_score = -1e9
+    fallback_metrics = (diag, diag, diag, 0.0)
 
     for i in range(n_players):
         for j in range(i + 1, n_players):
@@ -478,31 +509,61 @@ def analyze_foul_interaction_frame(
 
             norm_arm_upper = max(0.0, 1.0 - arm_to_upper_dist / max(diag * 0.18, 1.0))
             norm_torso = max(0.0, 1.0 - torso_dist / max(diag * 0.25, 1.0))
-            ball_prox = 0.0
-            if ball_pt is not None:
-                pair_mid = 0.5 * (centers[i] + centers[j])
-                ball_prox = max(0.0, 1.0 - float(np.linalg.norm(pair_mid - ball_pt)) / max(diag * 0.25, 1.0))
 
-            # Team jersey color separation bonus (opposing teams vs teammates)
+            color_diff = 0.0
             team_contrast_bonus = 0.0
             if bgr_frame is not None:
                 hi, si, vi = player_hsv[i]
                 hj, sj, vj = player_hsv[j]
                 dh = min(abs(hi - hj), 180.0 - abs(hi - hj))
                 color_diff = abs(vi - vj) + 0.75 * abs(si - sj) + 1.1 * dh
-                team_contrast_bonus = 0.22 if color_diff >= 30.0 else -0.18
+                team_contrast_bonus = 0.24 if color_diff >= 30.0 else -0.22
 
-            pair_score = (
-                0.42 * norm_arm_upper
-                + 0.23 * norm_torso
-                + 0.20 * min(1.0, iou * 3.0)
-                + 0.15 * ball_prox
+            if _box_iom_local(player_boxes[i], player_boxes[j]) >= 0.65 and color_diff < 28.0:
+                continue
+
+            ball_prox = 0.0
+            off_ball_penalty = 0.0
+            if ball_pt is not None:
+                pair_mid = 0.5 * (centers[i] + centers[j])
+                dist_ball = float(np.linalg.norm(pair_mid - ball_pt))
+                ball_prox = max(0.0, 1.0 - dist_ball / max(diag * 0.22, 1.0))
+                if ball_is_confident and dist_ball > max(diag * 0.24, 380.0):
+                    off_ball_penalty = -0.25
+
+            raw_pair_score = (
+                0.38 * norm_arm_upper
+                + 0.22 * norm_torso
+                + 0.22 * min(1.0, iou * 3.0)
+                + 0.36 * ball_prox
                 + team_contrast_bonus
+                + off_ball_penalty
             )
-            if pair_score > best_pair_score:
-                best_pair_score = pair_score
+            if raw_pair_score > fallback_score:
+                fallback_score = raw_pair_score
+                fallback_pair = (i, j)
+                fallback_metrics = (arm_to_arm_dist, arm_to_upper_dist, torso_dist, iou)
+
+            # Geometric scale + vertical alignment guards for strict primary selection
+            bhi = float(player_boxes[i, 3] - player_boxes[i, 1])
+            bhj = float(player_boxes[j, 3] - player_boxes[j, 1])
+            if min(bhi, bhj) / max(bhi, bhj, 1.0) < 0.55:
+                continue
+            if abs(float(player_boxes[i, 3]) - float(player_boxes[j, 3])) > frame_h * 0.26:
+                continue
+            if abs(float(centers[i, 0]) - float(centers[j, 0])) > max(frame_w * 0.20, 1.45 * max(bhi, bhj)):
+                continue
+
+            if raw_pair_score > best_pair_score:
+                best_pair_score = raw_pair_score
                 best_pair = (i, j)
                 best_pair_metrics = (arm_to_arm_dist, arm_to_upper_dist, torso_dist, iou)
+
+    if best_pair[0] < 0:
+        if fallback_pair[0] < 0:
+            return default_roi, 0.0, feats
+        best_pair = fallback_pair
+        best_pair_metrics = fallback_metrics
 
     idx_a, idx_b = best_pair
     box_a, box_b = player_boxes[idx_a], player_boxes[idx_b]
@@ -690,6 +751,814 @@ def get_cached_det_model() -> Optional[object]:
             except Exception:
                 _CACHED_DET_MODEL = None
     return _CACHED_DET_MODEL
+
+
+def box_iom_single(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """Intersection-over-Minimum-Area (IoM) to detect duplicate boxes on the same person."""
+    ix1 = max(float(box_a[0]), float(box_b[0]))
+    iy1 = max(float(box_a[1]), float(box_b[1]))
+    ix2 = min(float(box_a[2]), float(box_b[2]))
+    iy2 = min(float(box_a[3]), float(box_b[3]))
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    a1 = max(1.0, (float(box_a[2]) - float(box_a[0])) * (float(box_a[3]) - float(box_a[1])))
+    a2 = max(1.0, (float(box_b[2]) - float(box_b[0])) * (float(box_b[3]) - float(box_b[1])))
+    return inter / min(a1, a2)
+
+
+def is_court_player_box(box: np.ndarray, frame_w: int, frame_h: int) -> bool:
+    """Filter active court players while rejecting upper stands and bottom-edge seated spectators."""
+    x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+    bh = y2 - y1
+    bw = x2 - x1
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    if not (0.42 * frame_h <= y2 <= 0.94 * frame_h):
+        return False
+    if y1 < 0.20 * frame_h:
+        return False
+    if y2 > 0.83 * frame_h and bh < 0.20 * frame_h:
+        return False
+    if not (0.33 * frame_h <= cy <= 0.84 * frame_h):
+        return False
+    if not (0.05 * frame_w <= cx <= 0.95 * frame_w):
+        return False
+    if not (0.10 * frame_h <= bh <= 0.52 * frame_h):
+        return False
+    if not (0.02 * frame_w <= bw <= 0.30 * frame_w):
+        return False
+    if bh / max(bw, 1.0) < 0.78:
+        return False
+    return True
+
+
+def detect_nba_rim_hsv(bgr_frame: np.ndarray, frame_w: int, frame_h: int) -> Optional[Tuple[int, int]]:
+    """Detect the orange basketball rim in the upper broadcast court zone."""
+    if bgr_frame is None or bgr_frame.size == 0:
+        return None
+    img_h, img_w = bgr_frame.shape[:2]
+    y0, y1 = int(0.13 * img_h), int(0.46 * img_h)
+    roi = bgr_frame[y0:y1, :]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([2, 125, 105]), np.array([20, 255, 255]))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_rim: Optional[Tuple[int, int]] = None
+    best_area = 0.0
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = float(cv2.contourArea(c))
+        rx_norm = (x + 0.5 * w) / max(img_w, 1)
+        if rx_norm >= 0.38 and rx_norm <= 0.62:
+            continue
+        if (0.008 * img_w <= w <= 0.055 * img_w) and (0.004 * img_h <= h <= 0.042 * img_h):
+            if (w / max(h, 1.0)) >= 1.35 and area >= max(20.0, 0.00004 * img_w * img_h) and area > best_area:
+                best_area = area
+                best_rim = (
+                    int(round((x + 0.5 * w) * (frame_w / max(img_w, 1)))),
+                    int(round((y0 + y + 0.5 * h) * (frame_h / max(img_h, 1)))),
+                )
+    return best_rim
+
+
+def compute_camera_cuts_and_pan(
+    bgr_frames: List[np.ndarray],
+    frame_w: int,
+    frame_h: int,
+    player_max_h_ratios: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Detect broadcast camera cuts, close-ups, and camera pan velocity `(pan_dx, pan_dy)`.
+    Requires both HSV histogram jump and template-match drop to classify a true camera cut,
+    preventing replay wipes or graphic banners from falsely splitting continuous live action.
+    """
+    n = len(bgr_frames)
+    hist_diffs = [0.0] * n
+    tm_scores = [1.0] * n
+    pan_dx = [0.0] * n
+    pan_dy = [0.0] * n
+    is_hard_cut = [False] * n
+    is_wide_court = [True] * n
+
+    prev_hist = None
+    prev_gray = None
+    sx_full = frame_w / 320.0
+    sy_full = frame_h / 180.0
+
+    for t, fr in enumerate(bgr_frames):
+        if fr is None or fr.size == 0:
+            is_wide_court[t] = False
+            continue
+        sm = cv2.resize(fr, (320, 180), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(sm, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+        if prev_hist is not None:
+            hist_diffs[t] = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+        prev_hist = hist
+
+        gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            crop = prev_gray[35:145, 55:265]
+            res = cv2.matchTemplate(gray[25:155, :], crop, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            tm_scores[t] = float(max_val)
+            pan_dx[t] = (55.0 - float(max_loc[0])) * sx_full
+            pan_dy[t] = (10.0 - float(max_loc[1])) * sy_full
+        prev_gray = gray
+
+        hard_cut = (hist_diffs[t] > 0.34 and tm_scores[t] < 0.48) or (hist_diffs[t] > 0.48 and tm_scores[t] < 0.62)
+        is_hard_cut[t] = hard_cut
+        is_closeup = (player_max_h_ratios is not None) and (t < len(player_max_h_ratios)) and (player_max_h_ratios[t] > 0.56)
+        if is_closeup:
+            is_wide_court[t] = False
+
+    # Suppress isolated 1-frame transition/close-up islands when close-up ratio indicates non-wide segment
+    if n >= 3:
+        # Mark contiguous segments split by hard cuts; reject segments whose median max_h_ratio > 0.50
+        seg_start = 0
+        for t in range(1, n + 1):
+            if t == n or is_hard_cut[t]:
+                seg_idxs = list(range(seg_start, t))
+                if player_max_h_ratios is not None and seg_idxs:
+                    seg_med_h = float(np.median([player_max_h_ratios[idx] for idx in seg_idxs]))
+                    if seg_med_h > 0.50:
+                        for idx in seg_idxs:
+                            is_wide_court[idx] = False
+                seg_start = t
+
+    if n > 0 and not any(is_wide_court):
+        # Fallback: keep lowest max-height frames if no segment passed
+        if player_max_h_ratios:
+            min_idx = int(np.argmin(player_max_h_ratios))
+            is_wide_court[min_idx] = True
+        else:
+            is_wide_court = [True] * n
+
+    return {
+        "hist_diffs": hist_diffs,
+        "tm_scores": tm_scores,
+        "pan_dx": pan_dx,
+        "pan_dy": pan_dy,
+        "is_hard_cut": is_hard_cut,
+        "is_wide_court": is_wide_court,
+    }
+
+
+def extract_verified_ball_point(
+    det_res: Any,
+    scale_x: float,
+    scale_y: float,
+    frame_w: int,
+    frame_h: int,
+    bgr_frame: Optional[np.ndarray] = None,
+    rim_pt: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[float, float, float]]:
+    """Extract highest-confidence orange-verified basketball detection in full-resolution coordinates."""
+    if det_res is None or det_res.boxes is None or len(det_res.boxes) == 0:
+        return None
+    d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
+    d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
+    d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
+
+    img_h, img_w = bgr_frame.shape[:2] if bgr_frame is not None else (frame_h, frame_w)
+    inv_sx = float(img_w) / max(float(frame_w), 1.0)
+    inv_sy = float(img_h) / max(float(frame_h), 1.0)
+
+    best_ball: Optional[Tuple[float, float, float]] = None
+    best_rank = -1.0
+    for box, cls_id, conf in zip(d_xyxy, d_cls, d_conf):
+        if cls_id != COCO_SPORTS_BALL_CLS or float(conf) < 0.16:
+            continue
+        bx1, by1, bx2, by2 = float(box[0]) * scale_x, float(box[1]) * scale_y, float(box[2]) * scale_x, float(box[3]) * scale_y
+        bw = bx2 - bx1
+        bh = by2 - by1
+        if not (0.008 * frame_h <= bw <= 0.062 * frame_h and 0.008 * frame_h <= bh <= 0.062 * frame_h):
+            continue
+        if max(bw, bh) / max(min(bw, bh), 1.0) > 1.65:
+            continue
+        cx, cy = 0.5 * (bx1 + bx2), 0.5 * (by1 + by2)
+        if not (0.06 * frame_h <= cy <= 0.85 * frame_h):
+            continue
+        if float(conf) < 0.28 and cy > 0.81 * frame_h:
+            continue
+
+        # Reject low-confidence rim false positives
+        if rim_pt is not None and float(conf) < 0.30:
+            if np.hypot(cx - float(rim_pt[0]), cy - float(rim_pt[1])) < 32.0:
+                continue
+
+        orange_frac = 0.25
+        if bgr_frame is not None and bgr_frame.size > 0:
+            ix1 = max(0, int(bx1 * inv_sx))
+            iy1 = max(0, int(by1 * inv_sy))
+            ix2 = min(img_w, max(ix1 + 1, int(bx2 * inv_sx)))
+            iy2 = min(img_h, max(iy1 + 1, int(by2 * inv_sy)))
+            patch = bgr_frame[iy1:iy2, ix1:ix2]
+            if patch.size > 0:
+                phsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                orange_frac = float(np.mean((phsv[:, :, 0] >= 3) & (phsv[:, :, 0] <= 24) & (phsv[:, :, 1] >= 65)))
+
+        if orange_frac < 0.025:
+            continue
+        if float(conf) < 0.28 and orange_frac < 0.24:
+            continue
+        rank = float(conf) + 0.22 * orange_frac
+        if rank > best_rank:
+            best_rank = rank
+            best_ball = (cx, cy, float(conf))
+    return best_ball
+
+
+def interpolate_court_ball_track(
+    raw_balls: List[Optional[Tuple[float, float, float]]],
+    wide_mask: List[bool],
+    sampled_frame_idxs: List[int],
+    fps: float,
+    diag: float,
+    pan_dx: Optional[List[float]] = None,
+) -> List[Optional[np.ndarray]]:
+    """
+    Prune teleporting false ball detections and smoothly linearly interpolate basketball coordinates
+    across short occlusion gaps (<= 1.35s) inside continuous wide-court segments.
+    """
+    n = len(raw_balls)
+    cleaned: List[Optional[Tuple[float, float, float]]] = [
+        (raw_balls[t] if (t < len(wide_mask) and wide_mask[t]) else None) for t in range(n)
+    ]
+
+    # Prune stationary screen-locked overlays / sideline props that stay fixed despite large camera panning
+    valid_idxs = [t for t, b in enumerate(cleaned) if b is not None]
+    if pan_dx is not None and len(valid_idxs) >= 2:
+        cum_pan_arr = np.cumsum(np.abs(np.array(pan_dx, dtype=np.float32)))
+        for t in list(valid_idxs):
+            bt = cleaned[t]
+            if bt is None or bt[2] >= 0.45:
+                continue
+            for t2 in valid_idxs:
+                if t2 <= t:
+                    continue
+                b2 = cleaned[t2]
+                if b2 is None:
+                    continue
+                dt_pair = abs(sampled_frame_idxs[t2] - sampled_frame_idxs[t]) / max(fps, 1.0)
+                cam_scroll = float(abs(cum_pan_arr[t2] - cum_pan_arr[t]))
+                screen_disp = float(np.hypot(bt[0] - b2[0], bt[1] - b2[1]))
+                if dt_pair >= 1.5 and cam_scroll >= 140.0 and screen_disp <= 52.0:
+                    cleaned[t] = None
+                    if b2[2] < 0.45:
+                        cleaned[t2] = None
+                    break
+
+    # Prune isolated low-conf spikes that teleport wildly without neighbor support
+    valid_idxs = [t for t, b in enumerate(cleaned) if b is not None]
+    for k_pos, t in enumerate(valid_idxs):
+        bt = cleaned[t]
+        assert bt is not None
+        if bt[2] >= 0.30:
+            continue
+        near_neighbor = False
+        for k_other in (k_pos - 1, k_pos + 1):
+            if 0 <= k_other < len(valid_idxs):
+                to = valid_idxs[k_other]
+                bo = cleaned[to]
+                if bo is not None:
+                    dt = abs(sampled_frame_idxs[to] - sampled_frame_idxs[t]) / max(fps, 1.0)
+                    dist = float(np.hypot(bt[0] - bo[0], bt[1] - bo[1]))
+                    if dt <= 1.2 and dist <= max(460.0, dt * 950.0):
+                        near_neighbor = True
+                        break
+        if not near_neighbor and len(valid_idxs) >= 2:
+            cleaned[t] = None
+
+    track: List[Optional[np.ndarray]] = [
+        (np.array([b[0], b[1]], dtype=np.float32) if b is not None else None) for b in cleaned
+    ]
+    anchor_ts = [t for t, pt in enumerate(track) if pt is not None]
+    for idx in range(len(anchor_ts) - 1):
+        t0, t1 = anchor_ts[idx], anchor_ts[idx + 1]
+        if t1 - t0 <= 1:
+            continue
+        if not all(wide_mask[k] for k in range(t0, t1 + 1)):
+            continue
+        dt = abs(sampled_frame_idxs[t1] - sampled_frame_idxs[t0]) / max(fps, 1.0)
+        if dt > 1.35:
+            continue
+        p0, p1 = track[t0], track[t1]
+        assert p0 is not None and p1 is not None
+        cum_pan = sum(abs(pan_dx[k]) for k in range(t0 + 1, t1 + 1)) if pan_dx is not None else 0.0
+        max_jump = max(0.24 * diag, dt * 1150.0 + cum_pan)
+        if float(np.linalg.norm(p1 - p0)) > max_jump:
+            continue
+        denom = max(float(sampled_frame_idxs[t1] - sampled_frame_idxs[t0]), 1.0)
+        for k in range(t0 + 1, t1):
+            alpha = float(sampled_frame_idxs[k] - sampled_frame_idxs[t0]) / denom
+            track[k] = (1.0 - alpha) * p0 + alpha * p1
+    return track
+
+
+def collect_court_players_for_frame(
+    pose_res: Any,
+    det_res: Any,
+    frame_w: int,
+    frame_h: int,
+    scale_x: float,
+    scale_y: float,
+    bgr_frame: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Collect IoM-deduplicated court player dictionaries (box, kpts, hsv, elev, conf)
+    shared across preprocessing and inference tracking.
+    """
+    merged: List[Tuple[np.ndarray, Optional[np.ndarray], float]] = []
+    if pose_res is not None and pose_res.boxes is not None and len(pose_res.boxes) > 0:
+        p_xyxy = pose_res.boxes.xyxy.cpu().numpy().astype(np.float32)
+        p_xyxy[:, [0, 2]] *= scale_x
+        p_xyxy[:, [1, 3]] *= scale_y
+        p_conf = (
+            pose_res.boxes.conf.cpu().numpy().astype(np.float32)
+            if pose_res.boxes.conf is not None
+            else np.ones(len(p_xyxy), dtype=np.float32) * 0.5
+        )
+        p_kpts = None
+        if pose_res.keypoints is not None and pose_res.keypoints.xy is not None:
+            p_kpts = pose_res.keypoints.xy.cpu().numpy().astype(np.float32).copy()
+            p_kpts[:, :, 0] *= scale_x
+            p_kpts[:, :, 1] *= scale_y
+        for idx in range(len(p_xyxy)):
+            if p_conf[idx] < 0.10:
+                continue
+            kp = p_kpts[idx] if (p_kpts is not None and idx < len(p_kpts)) else None
+            merged.append((p_xyxy[idx], kp, float(p_conf[idx])))
+
+    if det_res is not None and det_res.boxes is not None and len(det_res.boxes) > 0:
+        d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
+        d_xyxy[:, [0, 2]] *= scale_x
+        d_xyxy[:, [1, 3]] *= scale_y
+        d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
+        d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
+        for db, dc, cf in zip(d_xyxy, d_cls, d_conf):
+            if dc != COCO_PERSON_CLS or float(cf) < 0.22:
+                continue
+            if all(box_iou_single(db, mb) < 0.35 and box_iom_single(db, mb) < 0.55 for mb, _, _ in merged):
+                merged.append((db, synthesize_box_keypoints(db), float(cf)))
+
+    players: List[Dict[str, Any]] = []
+    for box, kp, conf in merged:
+        if not is_court_player_box(box, frame_w, frame_h):
+            continue
+        if bgr_frame is not None and is_referee_or_sideline_official(
+            bgr_frame, box, frame_w, frame_h, scale_x=scale_x, scale_y=scale_y
+        ):
+            continue
+        hsv = (
+            extract_player_torso_hsv(bgr_frame, box, scale_x=scale_x, scale_y=scale_y)
+            if bgr_frame is not None
+            else (0.0, 0.0, 128.0)
+        )
+        bh = max(1.0, float(box[3] - box[1]))
+        elev = 0.0
+        if kp is not None and len(kp) >= 11:
+            sh = kp[[5, 6]][kp[[5, 6], 1] > 0]
+            wr = kp[[9, 10]][kp[[9, 10], 1] > 0]
+            if len(sh) > 0 and len(wr) > 0:
+                elev = max(0.0, (float(np.mean(sh[:, 1])) - float(np.min(wr[:, 1]))) / max(0.5 * bh, 1.0))
+        players.append(
+            {
+                "box": box,
+                "kpts": kp,
+                "conf": conf,
+                "hsv": hsv,
+                "elev": float(elev),
+                "center": np.array([0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3])], dtype=np.float32),
+            }
+        )
+    return players
+
+
+def jersey_hsv_diff(hsv_a: Tuple[float, float, float], hsv_b: Tuple[float, float, float]) -> float:
+    """Compute perceptual HSV separation between two player torso crops."""
+    dh = min(abs(hsv_a[0] - hsv_b[0]), 180.0 - abs(hsv_a[0] - hsv_b[0]))
+    return abs(hsv_a[2] - hsv_b[2]) + 0.75 * abs(hsv_a[1] - hsv_b[1]) + 1.1 * dh
+
+
+def select_on_ball_opposing_pair(
+    players: List[Dict[str, Any]],
+    ball_pt: Optional[np.ndarray],
+    rim_pt: Optional[Tuple[int, int]],
+    prev_center: Optional[np.ndarray],
+    frame_w: int,
+    frame_h: int,
+    diag: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Select the active opposing-team foul/contest pair anchored strongly to the basketball trajectory,
+    rim direction, physical contact proximity, elevated contest arms, and temporal coherence.
+    """
+    if len(players) < 2:
+        return None
+    rim_arr = np.array([float(rim_pt[0]), float(rim_pt[1])], dtype=np.float32) if rim_pt is not None else None
+    best: Optional[Dict[str, Any]] = None
+    best_rank = -1e9
+
+    for i in range(len(players)):
+        bi = players[i]["box"]
+        ci = players[i]["center"]
+        bhi = float(bi[3] - bi[1])
+        for j in range(i + 1, len(players)):
+            bj = players[j]["box"]
+            cj = players[j]["center"]
+            bhj = float(bj[3] - bj[1])
+
+            if min(bhi, bhj) / max(bhi, bhj, 1.0) < 0.50:
+                continue
+            if abs(float(bi[3]) - float(bj[3])) > frame_h * 0.30:
+                continue
+            if abs(float(ci[0]) - float(cj[0])) > max(frame_w * 0.17, 1.25 * max(bhi, bhj)):
+                continue
+
+            cdiff = jersey_hsv_diff(players[i]["hsv"], players[j]["hsv"])
+            iom = box_iom_single(bi, bj)
+            if iom >= 0.65 and cdiff < 28.0:
+                continue
+
+            cdist = float(np.linalg.norm(ci - cj))
+            max_bh = max(bhi, bhj)
+            if cdist > max(0.18 * diag, 1.40 * max_bh):
+                continue
+
+            iou = box_iou_single(bi, bj)
+            mid = 0.5 * (ci + cj)
+            elev = max(players[i]["elev"], players[j]["elev"])
+            close_prox = max(0.0, 1.0 - cdist / max(1.40 * max_bh, 1.0))
+
+            arm_reach = 0.0
+            ki, kj = players[i].get("kpts"), players[j].get("kpts")
+            if ki is not None and kj is not None:
+                ai = valid_points(ki, ARM_CONTACT_KPTS)
+                aj = valid_points(kj, ARM_CONTACT_KPTS)
+                ui = valid_points(ki, UPPER_BODY_KPTS)
+                uj = valid_points(kj, UPPER_BODY_KPTS)
+                d_arm = min(
+                    min_point_set_distance(ai, uj, cdist),
+                    min_point_set_distance(aj, ui, cdist),
+                )
+                arm_reach = max(0.0, 1.0 - d_arm / max(0.28 * max_bh, 1.0))
+
+            ball_prox = 0.0
+            dball = 9999.0
+            is_on_ball = False
+            if ball_pt is not None:
+                dball = min(
+                    float(np.linalg.norm(mid - ball_pt)),
+                    float(np.linalg.norm(ci - ball_pt)) + 25.0,
+                    float(np.linalg.norm(cj - ball_pt)) + 25.0,
+                )
+                ball_prox = max(0.0, 1.0 - dball / max(diag * 0.16, 1.0))
+                is_on_ball = dball <= max(diag * 0.13, 255.0)
+
+            rim_bonus = 0.0
+            if rim_arr is not None:
+                drim = float(np.linalg.norm(mid - rim_arr))
+                rim_bonus = 0.14 * max(0.0, 1.0 - drim / max(diag * 0.38, 1.0))
+
+            smooth_bonus = 0.0
+            if prev_center is not None:
+                dprev = float(np.linalg.norm(mid - prev_center))
+                smooth_bonus = 0.16 * float(np.exp(-dprev / max(0.16 * diag, 1.0)))
+
+            team_score = 0.32 if cdiff >= 28.0 else -0.35
+            off_ball_pen = -0.65 if (ball_pt is not None and dball > max(diag * 0.18, 340.0)) else 0.0
+
+            rank = (
+                0.48 * ball_prox
+                + 0.10 * min(1.0, iou * 3.0)
+                + 0.24 * arm_reach
+                + 0.34 * min(1.2, elev * 1.4)
+                + 0.16 * close_prox
+                + team_score
+                + rim_bonus
+                + smooth_bonus
+                + off_ball_pen
+            )
+            if rank > best_rank:
+                best_rank = rank
+                ux1 = max(0.0, min(float(bi[0]), float(bj[0])))
+                uy1 = max(0.0, min(float(bi[1]), float(bj[1])))
+                ux2 = min(float(frame_w), max(float(bi[2]), float(bj[2])))
+                uy2 = min(float(frame_h), max(float(bi[3]), float(bj[3])))
+                best = {
+                    "roi": np.array([ux1, uy1, ux2, uy2], dtype=np.float32),
+                    "off_box": bi,
+                    "def_box": bj,
+                    "off_hsv": players[i]["hsv"],
+                    "def_hsv": players[j]["hsv"],
+                    "mid": mid,
+                    "iou": float(iou),
+                    "arm_reach": float(arm_reach),
+                    "elev": float(elev),
+                    "cdiff": float(cdiff),
+                    "dball": float(dball),
+                    "is_on_ball": bool(is_on_ball),
+                    "rank": float(rank),
+                }
+    return best
+
+
+def score_foul_climax_sequence(
+    frame_players: List[List[Dict[str, Any]]],
+    cam_info: Dict[str, Any],
+    rims: List[Optional[Tuple[int, int]]],
+    raw_balls: List[Optional[Tuple[float, float, float]]],
+    sampled_indices: List[int],
+    frame_w: int,
+    frame_h: int,
+    fps: float,
+    base_contact_scores: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Shared spatiotemporal foul-climax scoring used by both preprocessing and dense AI Referee localization.
+    Fuses local high-confidence basketball possession, arm/wrist contact & shooting elevation,
+    transition deceleration, hoop proximity, and camera-cut climax structure.
+    """
+    n = len(frame_players)
+    diag = float(np.hypot(frame_w, frame_h))
+    wide_mask: List[bool] = cam_info["is_wide_court"]
+    pan_dx: List[float] = cam_info["pan_dx"]
+    hard_cuts: List[bool] = cam_info["is_hard_cut"]
+
+    ball_track = interpolate_court_ball_track(
+        raw_balls=raw_balls,
+        wide_mask=wide_mask,
+        sampled_frame_idxs=sampled_indices,
+        fps=fps,
+        diag=diag,
+        pan_dx=pan_dx,
+    )
+
+    seg_bounds: Dict[int, Tuple[int, int, bool]] = {}
+    t0 = 0
+    while t0 < n:
+        if not wide_mask[t0]:
+            t0 += 1
+            continue
+        t1 = t0
+        while t1 + 1 < n and wide_mask[t1 + 1] and not hard_cuts[t1 + 1]:
+            t1 += 1
+        ended_by_cut = (t1 + 1 < n) and (not wide_mask[t1 + 1] or hard_cuts[t1 + 1])
+        for k_s in range(t0, t1 + 1):
+            seg_bounds[k_s] = (t0, t1, ended_by_cut)
+        t0 = t1 + 1
+
+    ball_indices = [t for t, b in enumerate(ball_track) if b is not None]
+    high_conf_ball_indices = [t for t, rb in enumerate(raw_balls) if rb is not None and rb[2] >= 0.28]
+    has_high_conf_ball = len(high_conf_ball_indices) > 0
+
+    pan_rates: List[float] = [0.0] * n
+    for idx_p in range(1, n):
+        if not hard_cuts[idx_p]:
+            df_p = max(1, sampled_indices[idx_p] - sampled_indices[idx_p - 1])
+            pan_rates[idx_p] = abs(pan_dx[idx_p]) / float(df_p)
+
+    avg_step_f = max(1.0, float(np.median(np.diff(sampled_indices))) if n >= 2 else 6.0)
+    lookback_steps = max(3, int(round(3.2 * max(fps, 1.0) / avg_step_f)))
+    total_dur_sec = float(sampled_indices[-1] - sampled_indices[0]) / max(fps, 1.0) if n >= 2 else 0.0
+
+    pair_results: List[Optional[Dict[str, Any]]] = [None] * n
+    scores = np.zeros(n, dtype=np.float32)
+    prev_center: Optional[np.ndarray] = None
+    prev_dist: Optional[float] = None
+
+    for idx in range(n):
+        if not wide_mask[idx]:
+            prev_center = None
+            prev_dist = None
+            continue
+
+        best = select_on_ball_opposing_pair(
+            players=frame_players[idx],
+            ball_pt=ball_track[idx],
+            rim_pt=rims[idx],
+            prev_center=prev_center,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            diag=diag,
+        )
+        pair_results[idx] = best
+        if best is None:
+            prev_dist = None
+            continue
+
+        prev_center = best["mid"]
+        pan_rate = pan_rates[idx]
+        recent_fast_pan = max(pan_rates[max(0, idx - lookback_steps) : idx + 1], default=0.0)
+        arm_reach = float(best.get("arm_reach", 0.0))
+        has_action = (best["elev"] >= 0.08) or (arm_reach >= 0.15) or (best["iou"] >= 0.05)
+
+        base_c = float(base_contact_scores[idx]) if (base_contact_scores is not None and idx < len(base_contact_scores)) else 0.0
+        comp = 0.56 * max(0.0, float(best["rank"])) + 0.28 * base_c
+
+        if best["cdiff"] >= 26.0 and (ball_track[idx] is None or best["is_on_ball"]):
+            comp += 0.48 * min(1.3, best["elev"] * 1.45)
+            comp += 0.26 * arm_reach
+            comp += 0.16 * min(1.0, best["iou"] * 2.8)
+
+        cur_dist = float(np.linalg.norm(best["off_box"][:2] - best["def_box"][:2]))
+        if prev_dist is not None and (best["is_on_ball"] or has_action):
+            closing = max(0.0, (prev_dist - cur_dist) / max(0.03 * diag, 1.0))
+            comp += 0.16 * min(1.0, closing)
+        prev_dist = cur_dist
+
+        # Local high-confidence basketball possession check within ±2.3s in the same wide segment
+        s_lo, s_hi, ended_by_cut = seg_bounds.get(idx, (0, n - 1, False))
+        seg_hc_balls = [tb for tb in high_conf_ball_indices if s_lo <= tb <= s_hi]
+        seg_all_balls = [tb for tb in ball_indices if s_lo <= tb <= s_hi]
+
+        local_hc = 0.0
+        for tb in seg_hc_balls:
+            dt_signed = (sampled_indices[idx] - sampled_indices[tb]) / max(fps, 1.0)
+            dt_b = abs(dt_signed)
+            if dt_b <= 2.3:
+                rb = raw_balls[tb]
+                assert rb is not None
+                tau = 1.45 if dt_signed >= 0.0 else 1.05
+                w_conf = min(1.0, float(rb[2]) / 0.52) * float(np.exp(-((dt_b / tau) ** 2)))
+                if w_conf > local_hc:
+                    local_hc = w_conf
+
+        eff_conf = 0.0
+        if ball_track[idx] is not None and best["is_on_ball"]:
+            if raw_balls[idx] is not None:
+                eff_conf = float(raw_balls[idx][2])
+            else:
+                near_c = [
+                    float(raw_balls[tb][2])
+                    for tb in range(s_lo, s_hi + 1)
+                    if raw_balls[tb] is not None
+                    and abs(sampled_indices[tb] - sampled_indices[idx]) <= 1.2 * max(fps, 1.0)
+                ]
+                eff_conf = max([local_hc * 0.55] + near_c)
+            if eff_conf >= 0.28:
+                comp += 0.26 + 0.38 * min(1.0, eff_conf / 0.55)
+            else:
+                comp += 0.14 * min(1.0, eff_conf / 0.28)
+        elif local_hc > 0.0:
+            active_mult = 0.44 if (best["elev"] >= 0.16 or arm_reach >= 0.28 or best["iou"] >= 0.08) else 0.32
+            comp += active_mult * local_hc
+        elif seg_all_balls:
+            dt_any = min(abs(sampled_indices[tb] - sampled_indices[idx]) for tb in seg_all_balls) / max(fps, 1.0)
+            if dt_any <= 1.2 and has_action:
+                comp += float(0.14 * np.exp(-((dt_any / 0.90) ** 2)))
+            elif has_high_conf_ball:
+                comp *= 0.58
+        elif has_high_conf_ball:
+            comp *= 0.52
+
+        if has_high_conf_ball and local_hc < 0.10 and eff_conf < 0.28:
+            comp *= 0.62
+
+        if not has_action and eff_conf < 0.28:
+            comp *= 0.70
+
+        if s_lo > 0 and (float(sampled_indices[idx] - sampled_indices[s_lo]) / max(fps, 1.0)) < 0.45:
+            comp *= 0.45
+
+        if pan_rate > 20.0 and best["elev"] < 0.24:
+            comp *= 0.55
+        elif pan_rate <= 16.0:
+            if has_action or eff_conf >= 0.28:
+                comp += 0.08
+            if recent_fast_pan >= 18.0 and (best["elev"] >= 0.16 or best["iou"] >= 0.08 or arm_reach >= 0.25 or local_hc >= 0.35 or best["is_on_ball"]):
+                comp += 0.34
+
+        if ended_by_cut:
+            dt_to_cut = float(sampled_indices[s_hi] - sampled_indices[idx]) / max(fps, 1.0)
+            if 0.35 <= dt_to_cut <= 2.8:
+                comp += float(0.24 * np.exp(-((dt_to_cut - 1.35) / 1.15) ** 2))
+            elif dt_to_cut < 0.20:
+                comp *= 0.72
+        elif s_hi >= n - 2 and 6.0 <= total_dur_sec <= 26.0 and (has_action or local_hc >= 0.20 or recent_fast_pan >= 18.0):
+            dt_to_end = float(sampled_indices[s_hi] - sampled_indices[idx]) / max(fps, 1.0)
+            if 0.60 <= dt_to_end <= 3.8:
+                comp += float(0.16 * np.exp(-((dt_to_end - 2.20) / 1.30) ** 2))
+
+        if rims[idx] is not None and (has_action or best["is_on_ball"]):
+            if float(np.hypot(best["mid"][0] - rims[idx][0], best["mid"][1] - rims[idx][1])) < 0.22 * diag:
+                comp += 0.14
+
+        scores[idx] = max(0.0, comp)
+
+    return {
+        "scores": scores,
+        "pair_results": pair_results,
+        "ball_track": ball_track,
+        "raw_balls": raw_balls,
+        "seg_bounds": seg_bounds,
+        "wide_mask": wide_mask,
+        "pan_dx": pan_dx,
+        "rims": rims,
+        "cam_info": cam_info,
+    }
+
+
+def refine_sequence_rois_and_scores(
+    pose_results: List[Any],
+    det_results: List[Any],
+    small_bgr_frames: List[np.ndarray],
+    scanned_rois: List[np.ndarray],
+    scanned_scores: List[float],
+    sampled_indices: List[int],
+    frame_w: int,
+    frame_h: int,
+    scale_x: float,
+    scale_y: float,
+    fps: float,
+) -> Tuple[List[np.ndarray], List[float], Dict[str, Any]]:
+    """
+    Upgrade per-frame scanned ROIs and scores using sequence-level scene-cut rejection,
+    camera-pan deceleration, verified/interpolated basketball trajectory, hoop rims, and
+    temporally-consistent on-ball opposing-jersey pairs.
+    """
+    n = len(small_bgr_frames)
+    diag = float(np.hypot(frame_w, frame_h))
+    if n == 0:
+        return scanned_rois, scanned_scores, {}
+
+    max_h_ratios: List[float] = []
+    rims: List[Optional[Tuple[int, int]]] = []
+    for idx in range(n):
+        mh = 0.0
+        for res in (pose_results[idx] if idx < len(pose_results) else None, det_results[idx] if idx < len(det_results) else None):
+            if res is not None and res.boxes is not None and len(res.boxes) > 0:
+                xy = res.boxes.xyxy.cpu().numpy()
+                mh = max(mh, float(np.max((xy[:, 3] - xy[:, 1]) * scale_y)) / max(float(frame_h), 1.0))
+        max_h_ratios.append(mh)
+        rims.append(detect_nba_rim_hsv(small_bgr_frames[idx], frame_w, frame_h))
+
+    cam_info = compute_camera_cuts_and_pan(small_bgr_frames, frame_w, frame_h, player_max_h_ratios=max_h_ratios)
+    wide_mask: List[bool] = cam_info["is_wide_court"]
+    raw_balls = [
+        extract_verified_ball_point(
+            det_results[idx] if idx < len(det_results) else None,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            bgr_frame=small_bgr_frames[idx],
+            rim_pt=rims[idx],
+        )
+        for idx in range(n)
+    ]
+    frame_players = [
+        (
+            collect_court_players_for_frame(
+                pose_res=pose_results[idx] if idx < len(pose_results) else None,
+                det_res=det_results[idx] if idx < len(det_results) else None,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                bgr_frame=small_bgr_frames[idx],
+            )
+            if wide_mask[idx]
+            else []
+        )
+        for idx in range(n)
+    ]
+
+    seq = score_foul_climax_sequence(
+        frame_players=frame_players,
+        cam_info=cam_info,
+        rims=rims,
+        raw_balls=raw_balls,
+        sampled_indices=sampled_indices,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        fps=fps,
+        base_contact_scores=scanned_scores,
+    )
+
+    refined_rois: List[np.ndarray] = [r.copy() for r in scanned_rois]
+    # Preserve classifier-aligned temporal scores on wide court frames while rejecting close-up cuts
+    refined_scores: List[float] = [
+        float(sc if (idx < len(wide_mask) and wide_mask[idx]) else 0.0)
+        for idx, sc in enumerate(scanned_scores)
+    ]
+    ball_track = seq["ball_track"]
+    for idx, best in enumerate(seq["pair_results"]):
+        if not wide_mask[idx] or best is None:
+            continue
+        cur_roi = refined_rois[idx]
+        cur_mid = np.array([0.5 * (cur_roi[0] + cur_roi[2]), 0.5 * (cur_roi[1] + cur_roi[3])], dtype=np.float32)
+        cur_h = float(cur_roi[3] - cur_roi[1])
+        replace_roi = (cur_h > frame_h * 0.48) or best["is_on_ball"] or (float(best["rank"]) > 0.45)
+        if not replace_roi and ball_track[idx] is not None:
+            if float(np.linalg.norm(cur_mid - ball_track[idx])) > max(diag * 0.16, 280.0):
+                replace_roi = True
+        if replace_roi:
+            refined_rois[idx] = best["roi"]
+
+    return refined_rois, refined_scores, seq
 
 
 def _decode_clip_scan_frames(
@@ -912,8 +1781,8 @@ def extract_action_tube(
         max_live_play_sec=max_live_play_sec,
         max_scan_samples=max_scan_samples,
         num_frames=num_frames,
-        scan_w=960,
-        scan_h=540,
+        scan_w=1280,
+        scan_h=720,
     )
     if scan_info is None:
         raise RuntimeError(f"Unable to open or read video frames in {video_path}")
@@ -923,10 +1792,14 @@ def extract_action_tube(
     frame_h = int(scan_info["frame_h"])  # type: ignore[arg-type]
     scale_x = float(scan_info["scale_x"])  # type: ignore[arg-type]
     scale_y = float(scan_info["scale_y"])  # type: ignore[arg-type]
+    fps = float(scan_info["fps"])  # type: ignore[arg-type]
+    scanned_frames: List[int] = scan_info["scanned_frames"]  # type: ignore[assignment]
 
     scanned_rois: List[np.ndarray] = []
     scanned_scores: List[float] = []
     scanned_feats: List[np.ndarray] = []
+    all_pose_results: List[Any] = []
+    all_det_results: List[Any] = []
 
     yolo_device = select_yolo_device(device)
     batch_sz = max(1, int(yolo_batch_size))
@@ -943,8 +1816,8 @@ def extract_action_tube(
             det_results = (
                 active_det.predict(
                     batch_frames,
-                    conf=0.10,
-                    imgsz=768,
+                    conf=0.12,
+                    imgsz=1280,
                     classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
                     verbose=False,
                     device=yolo_device,
@@ -953,6 +1826,8 @@ def extract_action_tube(
                 else [None] * len(batch_frames)
             )
             for b_offset, (pose_res, det_res) in enumerate(zip(pose_results, det_results)):
+                all_pose_results.append(pose_res)
+                all_det_results.append(det_res)
                 roi, score, feat_vec = analyze_foul_interaction_frame(
                     pose_res=pose_res,
                     det_res=det_res,
@@ -965,6 +1840,20 @@ def extract_action_tube(
                 scanned_rois.append(roi)
                 scanned_scores.append(score)
                 scanned_feats.append(feat_vec)
+
+    scanned_rois, scanned_scores, seq_dbg = refine_sequence_rois_and_scores(
+        pose_results=all_pose_results,
+        det_results=all_det_results,
+        small_bgr_frames=small_bgr_frames,
+        scanned_rois=scanned_rois,
+        scanned_scores=scanned_scores,
+        sampled_indices=scanned_frames,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        fps=fps,
+    )
 
     scan_info["small_bgr_frames"] = []
     return _finalize_clip_action_tube(
@@ -1264,8 +2153,8 @@ def preprocess_dataset(
                         d_res = (
                             active_det.predict(
                                 b_frames,
-                                conf=0.10,
-                                imgsz=768,
+                                conf=0.06,
+                                imgsz=960,
                                 classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
                                 verbose=False,
                                 device=yolo_dev,
@@ -1287,6 +2176,8 @@ def preprocess_dataset(
                 frame_h = int(scan_info["frame_h"])
                 scale_x = float(scan_info["scale_x"])
                 scale_y = float(scan_info["scale_y"])
+                clip_fps = float(scan_info["fps"])
+                clip_scanned_frames: List[int] = scan_info["scanned_frames"]  # type: ignore[assignment]
                 frames_list: List[np.ndarray] = scan_info["small_bgr_frames"]  # type: ignore[assignment]
 
                 scanned_rois: List[np.ndarray] = []
@@ -1305,6 +2196,20 @@ def preprocess_dataset(
                     scanned_rois.append(roi)
                     scanned_scores.append(score)
                     scanned_feats.append(feat_vec)
+
+                scanned_rois, scanned_scores, _ = refine_sequence_rois_and_scores(
+                    pose_results=mega_pose_res[start_f:end_f],
+                    det_results=mega_det_res[start_f:end_f],
+                    small_bgr_frames=frames_list,
+                    scanned_rois=scanned_rois,
+                    scanned_scores=scanned_scores,
+                    sampled_indices=clip_scanned_frames,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    fps=clip_fps,
+                )
 
                 scan_info["small_bgr_frames"] = []
                 tube_tensor, crop_boxes, sampled_indices, fps, foul_features = _finalize_clip_action_tube(

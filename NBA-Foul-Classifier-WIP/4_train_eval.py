@@ -659,162 +659,318 @@ def track_foul_players_in_foul_window(
     all_keys = sorted(window_frames.keys())
     yolo_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else ("mps" if device == "mps" else "cpu")
     active_det = preprocess_mod.get_cached_det_model()
+    diag = float(np.hypot(frame_w, frame_h))
 
-    frame_dets: Dict[int, List[Dict[str, Any]]] = {}
+    ordered_imgs = [window_frames[k] for k in all_keys]
+    all_pose_res: List[Any] = []
+    all_det_res: List[Any] = []
     with torch.inference_mode():
         for b_idx in range(0, len(all_keys), 16):
-            b_keys = all_keys[b_idx : b_idx + 16]
-            b_imgs = [window_frames[k] for k in b_keys]
+            b_imgs = ordered_imgs[b_idx : b_idx + 16]
             preds = pose_model.predict(b_imgs, conf=0.10, imgsz=640, verbose=False, device=yolo_dev)
             det_preds = (
-                active_det.predict(b_imgs, conf=0.12, imgsz=640, classes=[0], verbose=False, device=yolo_dev)
+                active_det.predict(
+                    b_imgs,
+                    conf=0.12,
+                    imgsz=768,
+                    classes=[0, preprocess_mod.COCO_SPORTS_BALL_CLS],
+                    verbose=False,
+                    device=yolo_dev,
+                )
                 if (active_det is not None and active_det is not pose_model)
                 else [None] * len(b_imgs)
             )
-            for k, frame_img, res, d_res in zip(b_keys, b_imgs, preds, det_preds):
-                cands = []
-                raw_bxs_list = []
-                raw_cfs_list = []
-                raw_kpts_list = []
+            all_pose_res.extend(preds)
+            all_det_res.extend(det_preds)
 
-                if res.boxes is not None and len(res.boxes) > 0:
-                    bxs = res.boxes.xyxy.cpu().numpy()
-                    cfs = res.boxes.conf.cpu().numpy()
-                    cls = res.boxes.cls.cpu().numpy().astype(int)
-                    kpts = res.keypoints.xy.cpu().numpy() if res.keypoints is not None else None
-                    for i, (b, c, cl) in enumerate(zip(bxs, cfs, cls)):
-                        if cl == 0:
-                            raw_bxs_list.append(b.astype(np.float32))
-                            raw_cfs_list.append(float(c))
-                            kp = kpts[i] if (kpts is not None and i < len(kpts)) else preprocess_mod.synthesize_box_keypoints(b)
-                            raw_kpts_list.append(kp)
+    # Detect broadcast cuts/close-ups inside the window so boxes stop cleanly before dead-ball close-ups
+    max_h_ratios: List[float] = []
+    for p_res, d_res in zip(all_pose_res, all_det_res):
+        mh = 0.0
+        for r in (p_res, d_res):
+            if r is not None and r.boxes is not None and len(r.boxes) > 0:
+                xy = r.boxes.xyxy.cpu().numpy()
+                mh = max(mh, float(np.max(xy[:, 3] - xy[:, 1])) / max(float(frame_h), 1.0))
+        max_h_ratios.append(mh)
 
-                if d_res is not None and d_res.boxes is not None and len(d_res.boxes) > 0:
-                    dbxs = d_res.boxes.xyxy.cpu().numpy()
-                    dcfs = d_res.boxes.conf.cpu().numpy()
-                    dcls = d_res.boxes.cls.cpu().numpy().astype(int)
-                    for db, dc, dcl in zip(dbxs, dcfs, dcls):
-                        if dcl == 0 and all(preprocess_mod.box_iou_single(db, eb) < 0.42 for eb in raw_bxs_list):
-                            raw_bxs_list.append(db.astype(np.float32))
-                            raw_cfs_list.append(float(dc))
-                            raw_kpts_list.append(preprocess_mod.synthesize_box_keypoints(db))
+    cam_info = preprocess_mod.compute_camera_cuts_and_pan(
+        ordered_imgs, frame_w=frame_w, frame_h=frame_h, player_max_h_ratios=max_h_ratios
+    )
+    wide_mask: List[bool] = cam_info["is_wide_court"]
+    pan_dx: List[float] = cam_info["pan_dx"]
+    pan_dy: List[float] = cam_info["pan_dy"]
 
-                for b, c, kp in zip(raw_bxs_list, raw_cfs_list, raw_kpts_list):
-                    bh = b[3] - b[1]
-                    bw = b[2] - b[0]
-                    cx = 0.5 * (b[0] + b[2])
-                    cy = 0.5 * (b[1] + b[3])
-                    if (
-                        b[1] >= frame_h * 0.22
-                        and b[3] >= frame_h * 0.46
-                        and b[3] <= frame_h * 0.94
-                        and bh >= frame_h * 0.09
-                        and bh <= frame_h * 0.48
-                        and (bh / max(bw, 1.0)) >= 0.75
-                        and not preprocess_mod.is_referee_or_sideline_official(frame_img, b, frame_w, frame_h)
-                    ):
-                        elev = 0.0
-                        vert_angle = 15.0
-                        if kp is not None and len(kp) >= 17:
-                            sh = kp[[5, 6]]
-                            wr = kp[[9, 10]]
-                            valid_sh = sh[sh[:, 1] > 0]
-                            valid_wr = wr[wr[:, 1] > 0]
-                            if len(valid_sh) > 0 and len(valid_wr) > 0:
-                                elev = float(max(0.0, (np.mean(valid_sh[:, 1]) - np.mean(valid_wr[:, 1])) / max(bh, 1.0)))
-                                dx = float(np.mean(valid_wr[:, 0]) - np.mean(valid_sh[:, 0]))
-                                dy = float(np.mean(valid_wr[:, 1]) - np.mean(valid_sh[:, 1]))
-                                vert_angle = float(np.degrees(np.arctan2(abs(dx), max(abs(dy), 1.0))))
-                        cands.append({
-                            "box": b.astype(np.float32),
-                            "conf": float(c),
-                            "kpts": kp,
-                            "cx": cx,
-                            "cy": cy,
-                            "bw": bw,
-                            "bh": bh,
-                            "elev": elev,
-                            "vert_angle": vert_angle,
-                        })
-                frame_dets[k] = cands
+    rims = [preprocess_mod.detect_nba_rim_hsv(img, frame_w, frame_h) for img in ordered_imgs]
+    raw_balls = [
+        preprocess_mod.extract_verified_ball_point(
+            all_det_res[idx], scale_x=1.0, scale_y=1.0, frame_w=frame_w, frame_h=frame_h, bgr_frame=ordered_imgs[idx], rim_pt=rims[idx]
+        )
+        for idx in range(len(all_keys))
+    ]
+    ball_track = preprocess_mod.interpolate_court_ball_track(
+        raw_balls=raw_balls,
+        wide_mask=wide_mask,
+        sampled_frame_idxs=all_keys,
+        fps=30.0,
+        diag=diag,
+        pan_dx=pan_dx,
+    )
+
+    frame_dets: Dict[int, List[Dict[str, Any]]] = {}
+    key_to_idx = {k: i for i, k in enumerate(all_keys)}
+    for idx_k, k in enumerate(all_keys):
+        if not wide_mask[idx_k]:
+            frame_dets[k] = []
+            continue
+        players = preprocess_mod.collect_court_players_for_frame(
+            pose_res=all_pose_res[idx_k],
+            det_res=all_det_res[idx_k],
+            frame_w=frame_w,
+            frame_h=frame_h,
+            scale_x=1.0,
+            scale_y=1.0,
+            bgr_frame=ordered_imgs[idx_k],
+        )
+        cands: List[Dict[str, Any]] = []
+        for p in players:
+            b = p["box"]
+            kp = p["kpts"]
+            bh = float(b[3] - b[1])
+            bw = float(b[2] - b[0])
+            vert_angle = 15.0
+            if kp is not None and len(kp) >= 17:
+                sh = kp[[5, 6]]
+                wr = kp[[9, 10]]
+                v_sh = sh[sh[:, 1] > 0]
+                v_wr = wr[wr[:, 1] > 0]
+                if len(v_sh) > 0 and len(v_wr) > 0:
+                    dx_a = float(np.mean(v_wr[:, 0]) - np.mean(v_sh[:, 0]))
+                    dy_a = float(np.mean(v_wr[:, 1]) - np.mean(v_sh[:, 1]))
+                    vert_angle = float(np.degrees(np.arctan2(abs(dx_a), max(abs(dy_a), 1.0))))
+            cands.append(
+                {
+                    "box": b.astype(np.float32),
+                    "conf": float(p["conf"]),
+                    "kpts": kp,
+                    "cx": float(p["center"][0]),
+                    "cy": float(p["center"][1]),
+                    "bw": bw,
+                    "bh": bh,
+                    "elev": float(p["elev"]),
+                    "hsv": p["hsv"],
+                    "vert_angle": vert_angle,
+                }
+            )
+        frame_dets[k] = cands
+
+    # Determine contiguous wide-court segment containing the foul_frame
+    anchor_wide_keys = [k for k in all_keys if wide_mask[key_to_idx[k]] and len(frame_dets.get(k, [])) >= 1]
+    if not anchor_wide_keys:
+        return {}
+    f_anchor = min(anchor_wide_keys, key=lambda k: abs(k - foul_frame))
+    a_pos = key_to_idx[f_anchor]
+    seg_lo, seg_hi = a_pos, a_pos
+    while seg_lo > 0 and wide_mask[seg_lo - 1] and not cam_info["is_hard_cut"][seg_lo]:
+        seg_lo -= 1
+    while seg_hi + 1 < len(all_keys) and wide_mask[seg_hi + 1] and not cam_info["is_hard_cut"][seg_hi + 1]:
+        seg_hi += 1
+    valid_min_f, valid_max_f = all_keys[seg_lo], all_keys[seg_hi]
 
     roi_cx = 0.5 * (anchor_roi[0] + anchor_roi[2]) if anchor_roi is not None else frame_w * 0.5
-    roi_cy = 0.5 * (anchor_roi[1] + anchor_roi[3]) if anchor_roi is not None else frame_h * 0.7
+    roi_cy = 0.5 * (anchor_roi[1] + anchor_roi[3]) if anchor_roi is not None else frame_h * 0.65
+    anchor_pt = np.array([roi_cx, roi_cy], dtype=np.float32)
 
-    valid_f_candidates = [k for k in all_keys if len(frame_dets.get(k, [])) > 0]
-    if not valid_f_candidates:
-        return {}
-    f_anchor = min(valid_f_candidates, key=lambda k: abs(k - foul_frame))
+    # Select best valid opposing-jersey pair at f_anchor anchored to ball & anchor_roi
     anchor_cands = frame_dets.get(f_anchor, [])
+    anchor_ball = ball_track[a_pos]
+    anchor_rim = rims[a_pos]
+    b_off: Optional[np.ndarray] = None
+    b_def: Optional[np.ndarray] = None
+    hsv_off: Tuple[float, float, float] = (0.0, 0.0, 180.0)
+    hsv_def: Tuple[float, float, float] = (0.0, 0.0, 60.0)
 
     if len(anchor_cands) >= 2:
-        anchor_cands.sort(key=lambda c: np.hypot(c["cx"] - roi_cx, c["cy"] - roi_cy))
-        p1 = anchor_cands[0]
-        p2 = min(anchor_cands[1:], key=lambda c: np.hypot(c["cx"] - p1["cx"], c["cy"] - p1["cy"]))
-        if p1["elev"] >= p2["elev"]:
-            b_off = p1["box"].copy()
-            b_def = p2["box"].copy()
-        else:
-            b_off = p2["box"].copy()
-            b_def = p1["box"].copy()
-    elif len(anchor_cands) == 1:
-        primary = anchor_cands[0]
-        p_box = primary["box"].copy()
-        b_off = p_box.copy()
-        b_def = p_box.copy()
-    else:
-        def_b = (
-            np.array(anchor_roi, dtype=np.float32)
-            if anchor_roi is not None
-            else np.array([frame_w * 0.35, frame_h * 0.40, frame_w * 0.65, frame_h * 0.85], dtype=np.float32)
-        )
-        b_off = def_b.copy()
-        b_def = def_b.copy()
+        best_pair_score = -1e9
+        best_ij: Optional[Tuple[int, int]] = None
+        for i in range(len(anchor_cands)):
+            ci = anchor_cands[i]
+            bi = ci["box"]
+            for j in range(i + 1, len(anchor_cands)):
+                cj = anchor_cands[j]
+                bj = cj["box"]
+                if min(ci["bh"], cj["bh"]) / max(ci["bh"], cj["bh"], 1.0) < 0.55:
+                    continue
+                if abs(float(bi[3]) - float(bj[3])) > frame_h * 0.26:
+                    continue
+                if abs(ci["cx"] - cj["cx"]) > max(frame_w * 0.18, 1.25 * max(ci["bh"], cj["bh"])):
+                    continue
+                cdiff = preprocess_mod.jersey_hsv_diff(ci["hsv"], cj["hsv"])
+                if preprocess_mod.box_iom_single(bi, bj) >= 0.65 and cdiff < 28.0:
+                    continue
+                mid_x, mid_y = 0.5 * (ci["cx"] + cj["cx"]), 0.5 * (ci["cy"] + cj["cy"])
+                d_roi = float(np.hypot(mid_x - roi_cx, mid_y - roi_cy))
+                d_pair = float(np.hypot(ci["cx"] - cj["cx"], ci["cy"] - cj["cy"]))
+                if d_pair > max(0.18 * diag, 1.40 * max(ci["bh"], cj["bh"])):
+                    continue
+                d_ball = (
+                    float(np.hypot(mid_x - float(anchor_ball[0]), mid_y - float(anchor_ball[1])))
+                    if anchor_ball is not None
+                    else d_roi
+                )
+                iou = preprocess_mod.box_iou_single(bi, bj)
+                elev_max = max(ci["elev"], cj["elev"])
+                pair_sc = (
+                    1.2 * max(0.0, 1.0 - d_roi / max(diag * 0.25, 1.0))
+                    + 1.4 * max(0.0, 1.0 - d_ball / max(diag * 0.24, 1.0))
+                    + (0.55 if cdiff >= 28.0 else -0.55)
+                    + 0.45 * min(1.0, iou * 3.0)
+                    + 0.35 * min(1.0, elev_max * 1.4)
+                    - 0.35 * (d_pair / max(1.4 * max(ci["bh"], cj["bh"]), 1.0))
+                )
+                if anchor_rim is not None:
+                    pair_sc += 0.15 * max(0.0, 1.0 - float(np.hypot(mid_x - anchor_rim[0], mid_y - anchor_rim[1])) / max(diag * 0.4, 1.0))
+                if pair_sc > best_pair_score:
+                    best_pair_score = pair_sc
+                    best_ij = (i, j)
 
-    def match_candidate(prev_box: np.ndarray, cands: List[Dict[str, Any]]) -> Tuple[np.ndarray, float]:
-        if not cands:
-            return prev_box.copy(), 22.0
+        if best_ij is not None:
+            pi, pj = anchor_cands[best_ij[0]], anchor_cands[best_ij[1]]
+            if pi["elev"] >= pj["elev"]:
+                p_off, p_def = pi, pj
+            else:
+                p_off, p_def = pj, pi
+            b_off, b_def = p_off["box"].copy(), p_def["box"].copy()
+            hsv_off, hsv_def = p_off["hsv"], p_def["hsv"]
+
+    if b_off is None or b_def is None:
+        if len(anchor_cands) >= 1:
+            anchor_cands.sort(key=lambda c: float(np.linalg.norm(np.array([c["cx"], c["cy"]], dtype=np.float32) - anchor_pt)))
+            p1 = anchor_cands[0]
+            b_off = p1["box"].copy()
+            b_def = p1["box"].copy()
+            hsv_off = p1["hsv"]
+            hsv_def = p1["hsv"]
+        else:
+            def_b = (
+                np.array(anchor_roi, dtype=np.float32)
+                if anchor_roi is not None
+                else np.array([frame_w * 0.35, frame_h * 0.40, frame_w * 0.65, frame_h * 0.85], dtype=np.float32)
+            )
+            b_off, b_def = def_b.copy(), def_b.copy()
+
+    def _cand_match_score(
+        prev_box: np.ndarray,
+        target_hsv: Tuple[float, float, float],
+        cand: Dict[str, Any],
+        step_pan_x: float = 0.0,
+        step_pan_y: float = 0.0,
+    ) -> float:
         px1, py1, px2, py2 = prev_box
-        p_area = max(1.0, (px2 - px1) * (py2 - py1))
-        pcx, pcy = 0.5 * (px1 + px2), 0.5 * (py1 + py2)
-        best_c = None
-        best_score = -1e9
-        for c in cands:
-            bx1, by1, bx2, by2 = c["box"]
-            ix1, iy1 = max(px1, bx1), max(py1, by1)
-            ix2, iy2 = min(px2, bx2), min(py2, by2)
-            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-            c_area = max(1.0, (bx2 - bx1) * (by2 - by1))
-            iou = inter / max(1.0, p_area + c_area - inter)
-            dist = np.hypot(c["cx"] - pcx, c["cy"] - pcy)
-            score = iou * 3.0 - (dist / max(py2 - py1, 1.0)) * 1.2
-            if score > best_score:
-                best_score = score
-                best_c = c
-        if best_c is not None and best_score > -1.5:
-            return best_c["box"].copy(), best_c.get("vert_angle", 22.0)
-        return prev_box.copy(), 22.0
+        pbh = max(1.0, float(py2 - py1))
+        # Compensate expected position by background camera pan!
+        pred_cx = 0.5 * (px1 + px2) - step_pan_x
+        pred_cy = 0.5 * (py1 + py2) - step_pan_y
+        pred_box = np.array(
+            [pred_cx - 0.5 * (px2 - px1), pred_cy - 0.5 * (py2 - py1), pred_cx + 0.5 * (px2 - px1), pred_cy + 0.5 * (py2 - py1)],
+            dtype=np.float32,
+        )
+        iou = preprocess_mod.box_iou_single(pred_box, cand["box"])
+        dist = float(np.hypot(cand["cx"] - pred_cx, cand["cy"] - pred_cy))
+        if dist > max(0.14 * diag, 0.85 * pbh):
+            return -1e6
+        if min(pbh, cand["bh"]) / max(pbh, cand["bh"], 1.0) < 0.60:
+            return -1e6
+        cdiff_self = preprocess_mod.jersey_hsv_diff(target_hsv, cand["hsv"])
+        hsv_pen = -0.75 * min(1.5, cdiff_self / 75.0)
+        return iou * 3.0 - (dist / pbh) * 1.1 + hsv_pen
+
+    def _step_joint_pair(
+        prev_off: np.ndarray,
+        prev_def: np.ndarray,
+        cands: List[Dict[str, Any]],
+        step_pan_x: float,
+        step_pan_y: float,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        if not cands:
+            shift = np.array([-step_pan_x, -step_pan_y, -step_pan_x, -step_pan_y], dtype=np.float32)
+            return (prev_off + shift).astype(np.float32), (prev_def + shift).astype(np.float32), 22.0
+
+        o_scores = [_cand_match_score(prev_off, hsv_off, c, step_pan_x, step_pan_y) for c in cands]
+        d_scores = [_cand_match_score(prev_def, hsv_def, c, step_pan_x, step_pan_y) for c in cands]
+
+        best_joint = -1e5
+        best_o_idx: Optional[int] = None
+        best_d_idx: Optional[int] = None
+        for i in range(len(cands)):
+            if o_scores[i] < -1.4:
+                continue
+            for j in range(len(cands)):
+                if i == j or d_scores[j] < -1.4:
+                    continue
+                bi, bj = cands[i]["box"], cands[j]["box"]
+                if preprocess_mod.box_iom_single(bi, bj) >= 0.68 and preprocess_mod.jersey_hsv_diff(cands[i]["hsv"], cands[j]["hsv"]) < 28.0:
+                    continue
+                union_h = max(float(bi[3]), float(bj[3])) - min(float(bi[1]), float(bj[1]))
+                if union_h > frame_h * 0.48:
+                    continue
+                p_dist = float(np.hypot(cands[i]["cx"] - cands[j]["cx"], cands[i]["cy"] - cands[j]["cy"]))
+                if p_dist > max(0.22 * diag, 1.45 * max(cands[i]["bh"], cands[j]["bh"])):
+                    continue
+                tot = o_scores[i] + d_scores[j]
+                if tot > best_joint:
+                    best_joint = tot
+                    best_o_idx, best_d_idx = i, j
+
+        if best_o_idx is not None and best_d_idx is not None:
+            return cands[best_o_idx]["box"].copy(), cands[best_d_idx]["box"].copy(), cands[best_d_idx].get("vert_angle", 22.0)
+
+        # Fallback: update whichever player is reliably matched without letting both collapse onto one person
+        bo = max(range(len(cands)), key=lambda i: o_scores[i])
+        bd = max(range(len(cands)), key=lambda j: d_scores[j])
+        shift = np.array([-step_pan_x, -step_pan_y, -step_pan_x, -step_pan_y], dtype=np.float32)
+        new_off = cands[bo]["box"].copy() if o_scores[bo] > -1.3 else (prev_off + shift).astype(np.float32)
+        if d_scores[bd] > -1.3 and (o_scores[bo] <= -1.3 or bd != bo):
+            new_def = cands[bd]["box"].copy()
+            va = cands[bd].get("vert_angle", 22.0)
+        else:
+            # Find second distinct candidate or pan-shift previous defender
+            alt_d = [j for j in range(len(cands)) if j != bo and d_scores[j] > -1.3]
+            if alt_d:
+                j_best = max(alt_d, key=lambda j: d_scores[j])
+                new_def = cands[j_best]["box"].copy()
+                va = cands[j_best].get("vert_angle", 22.0)
+            else:
+                new_def = (prev_def + shift).astype(np.float32)
+                va = 22.0
+        new_off[0::2] = np.clip(new_off[0::2], 0.0, float(frame_w))
+        new_off[1::2] = np.clip(new_off[1::2], 0.0, float(frame_h))
+        new_def[0::2] = np.clip(new_def[0::2], 0.0, float(frame_w))
+        new_def[1::2] = np.clip(new_def[1::2], 0.0, float(frame_h))
+        return new_off, new_def, va
 
     off_tracks: Dict[int, np.ndarray] = {f_anchor: b_off.copy()}
     def_tracks: Dict[int, np.ndarray] = {f_anchor: b_def.copy()}
     vert_tracks: Dict[int, float] = {f_anchor: 25.0}
 
-    # Forward tracking
+    # Forward tracking strictly within live wide-court segment [f_anchor .. valid_max_f]
     cur_off, cur_def = b_off.copy(), b_def.copy()
-    for f in range(f_anchor + 1, foul_window_end + 1):
-        cands = frame_dets.get(f, [])
-        cur_off, _ = match_candidate(cur_off, cands)
-        cur_def, va = match_candidate(cur_def, cands)
+    for f in range(f_anchor + 1, min(foul_window_end, valid_max_f) + 1):
+        idx_k = key_to_idx.get(f)
+        if idx_k is None or not wide_mask[idx_k]:
+            break
+        cur_off, cur_def, va = _step_joint_pair(cur_off, cur_def, frame_dets.get(f, []), pan_dx[idx_k], pan_dy[idx_k])
         off_tracks[f] = cur_off.copy()
         def_tracks[f] = cur_def.copy()
         vert_tracks[f] = va
 
-    # Backward tracking
+    # Backward tracking strictly within live wide-court segment [valid_min_f .. f_anchor]
     cur_off, cur_def = b_off.copy(), b_def.copy()
-    for f in range(f_anchor - 1, foul_window_start - 1, -1):
-        cands = frame_dets.get(f, [])
-        cur_off, _ = match_candidate(cur_off, cands)
-        cur_def, va = match_candidate(cur_def, cands)
+    for f in range(f_anchor - 1, max(foul_window_start, valid_min_f) - 1, -1):
+        idx_k = key_to_idx.get(f)
+        if idx_k is None or not wide_mask[idx_k]:
+            break
+        prev_idx = key_to_idx.get(f + 1, idx_k)
+        cur_off, cur_def, va = _step_joint_pair(cur_off, cur_def, frame_dets.get(f, []), -pan_dx[prev_idx], -pan_dy[prev_idx])
         off_tracks[f] = cur_off.copy()
         def_tracks[f] = cur_def.copy()
         vert_tracks[f] = va
@@ -826,7 +982,7 @@ def track_foul_players_in_foul_window(
     def_smooth = smooth_boxes_ema(def_arr, alpha=0.35)
 
     result: Dict[int, Dict[str, Any]] = {}
-    pad_x, pad_y = 20.0, 18.0
+    pad_x, pad_y = 18.0, 14.0
     for idx_f, f in enumerate(sorted_fs):
         ob = off_smooth[idx_f]
         db = def_smooth[idx_f]
@@ -836,8 +992,8 @@ def track_foul_players_in_foul_window(
         uy2 = int(round(min(float(frame_h), max(ob[3], db[3]) + pad_y)))
 
         # Compute exact spatial contact point (WHERE the foul occurred) between offender and shooter
-        ocx, ocy = 0.5 * (ob[0] + ob[2]), 0.36 * ob[1] + 0.64 * ob[3]
-        dcx, dcy = 0.5 * (db[0] + db[2]), 0.36 * db[1] + 0.64 * db[3]
+        ocx, ocy = 0.5 * (ob[0] + ob[2]), 0.40 * ob[1] + 0.60 * ob[3]
+        dcx, dcy = 0.5 * (db[0] + db[2]), 0.40 * db[1] + 0.60 * db[3]
         ix = int(round(np.clip(0.5 * (ocx + dcx), ux1 + 8, ux2 - 8)))
         iy = int(round(np.clip(0.5 * (ocy + dcy), uy1 + 8, uy2 - 8)))
 
@@ -1428,6 +1584,167 @@ def annotate_test_directory(
     return {r["stem"]: float(r["foul_prob"]) for r in reports}
 
 
+def refine_foul_apex_and_window(
+    video_path: Path,
+    pose_model: object,
+    anchor_hint_f: int,
+    anchor_hint_box: Optional[Union[Tuple[int, int, int, int], List[int], np.ndarray]],
+    fps: float,
+    total_video_frames: int,
+    frame_w: int,
+    frame_h: int,
+    device: str = "cpu",
+) -> Tuple[int, Optional[Tuple[int, int, int, int]], int, int]:
+    """
+    Scan the live play cleanly in low-memory full-resolution chunks to pinpoint the exact
+    WHEN (`foul_frame`) and WHERE (`anchor_roi`, `[foul_window_start, foul_window_end]`)
+    across any NBA footage duration, rejecting camera cuts, close-ups, and pre-contest fast breaks.
+    """
+    default_start = max(0, anchor_hint_f - int(round(fps * 0.85)))
+    default_end = min(max(0, total_video_frames - 1), anchor_hint_f + int(round(fps * 1.35)))
+    default_box = tuple(int(v) for v in anchor_hint_box) if anchor_hint_box is not None else None
+    if total_video_frames <= 0:
+        return anchor_hint_f, default_box, default_start, default_end
+
+    scan_lo = 15 if total_video_frames > 60 else 0
+    scan_hi = min(total_video_frames - 1, int(round(fps * 60.0)))
+    stride = 3 if (scan_hi - scan_lo) <= 900 else max(4, int(round(float(max(1, scan_hi - scan_lo)) / 240.0)))
+
+    yolo_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else ("mps" if device == "mps" else "cpu")
+    active_det = preprocess_mod.get_cached_det_model()
+    diag = float(np.hypot(frame_w, frame_h))
+
+    thumb_frames: List[np.ndarray] = []
+    sampled_idxs: List[int] = []
+    mh_ratios: List[float] = []
+    rims: List[Optional[Tuple[int, int]]] = []
+    raw_balls: List[Optional[Tuple[float, float, float]]] = []
+    frame_players: List[List[Dict[str, Any]]] = []
+
+    def _process_fullres_chunk(orig_chunk: List[np.ndarray], idx_chunk: List[int]) -> None:
+        if not orig_chunk:
+            return
+        with torch.inference_mode():
+            p_res = pose_model.predict(orig_chunk, conf=0.10, imgsz=640, verbose=False, device=yolo_dev)
+            d_res = (
+                active_det.predict(
+                    orig_chunk,
+                    conf=0.12,
+                    imgsz=1280,
+                    classes=[0, preprocess_mod.COCO_SPORTS_BALL_CLS],
+                    verbose=False,
+                    device=yolo_dev,
+                )
+                if (active_det is not None and active_det is not pose_model)
+                else [None] * len(orig_chunk)
+            )
+        for frm_o, fidx_o, pr, dr in zip(orig_chunk, idx_chunk, p_res, d_res):
+            mh = 0.0
+            for r in (pr, dr):
+                if r is not None and r.boxes is not None and len(r.boxes) > 0:
+                    xy = r.boxes.xyxy.cpu().numpy()
+                    mh = max(mh, float(np.max(xy[:, 3] - xy[:, 1])) / max(float(frame_h), 1.0))
+            rim = preprocess_mod.detect_nba_rim_hsv(frm_o, frame_w, frame_h)
+            rb = preprocess_mod.extract_verified_ball_point(
+                dr, scale_x=1.0, scale_y=1.0, frame_w=frame_w, frame_h=frame_h, bgr_frame=frm_o, rim_pt=rim
+            )
+            pls = preprocess_mod.collect_court_players_for_frame(
+                pose_res=pr,
+                det_res=dr,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                scale_x=1.0,
+                scale_y=1.0,
+                bgr_frame=frm_o,
+            )
+            thumb_frames.append(cv2.resize(frm_o, (320, 180), interpolation=cv2.INTER_AREA))
+            sampled_idxs.append(fidx_o)
+            mh_ratios.append(mh)
+            rims.append(rim)
+            raw_balls.append(rb)
+            frame_players.append(pls)
+
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, scan_lo)
+    chunk_imgs: List[np.ndarray] = []
+    chunk_fidxs: List[int] = []
+    cur_f = scan_lo
+    while cur_f <= scan_hi:
+        if (cur_f - scan_lo) % stride == 0:
+            ret, frm = cap.read()
+            if not ret:
+                break
+            chunk_imgs.append(frm)
+            chunk_fidxs.append(cur_f)
+            if len(chunk_imgs) >= 16:
+                _process_fullres_chunk(chunk_imgs, chunk_fidxs)
+                chunk_imgs.clear()
+                chunk_fidxs.clear()
+        else:
+            if not cap.grab():
+                break
+        cur_f += 1
+    cap.release()
+    if chunk_imgs:
+        _process_fullres_chunk(chunk_imgs, chunk_fidxs)
+        chunk_imgs.clear()
+        chunk_fidxs.clear()
+
+    n_samples = len(thumb_frames)
+    if n_samples < 3:
+        return anchor_hint_f, default_box, default_start, default_end
+
+    cam_info = preprocess_mod.compute_camera_cuts_and_pan(
+        thumb_frames, frame_w=frame_w, frame_h=frame_h, player_max_h_ratios=mh_ratios
+    )
+    seq = preprocess_mod.score_foul_climax_sequence(
+        frame_players=frame_players,
+        cam_info=cam_info,
+        rims=rims,
+        raw_balls=raw_balls,
+        sampled_indices=sampled_idxs,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        fps=fps,
+    )
+    wide_mask: List[bool] = seq["wide_mask"]
+    seg_bounds: Dict[int, Tuple[int, int, bool]] = seq["seg_bounds"]
+    pair_results: List[Optional[Dict[str, Any]]] = seq["pair_results"]
+    raw_scores = np.asarray(seq["scores"], dtype=np.float32)
+
+    if raw_scores.size == 0 or float(np.max(raw_scores)) <= 0.0:
+        return anchor_hint_f, default_box, default_start, default_end
+
+    smooth_scores = np.convolve(raw_scores, np.array([0.25, 0.50, 0.25], dtype=np.float32), mode="same")
+    for t in range(n_samples):
+        if not wide_mask[t] or pair_results[t] is None:
+            smooth_scores[t] = -1.0
+
+    best_idx = int(np.argmax(smooth_scores))
+    if smooth_scores[best_idx] <= 0.0 or pair_results[best_idx] is None:
+        return anchor_hint_f, default_box, default_start, default_end
+
+    refined_frame = int(sampled_idxs[best_idx])
+    roi_arr = pair_results[best_idx]["roi"]  # type: ignore[index]
+    refined_box = (
+        int(round(roi_arr[0])),
+        int(round(roi_arr[1])),
+        int(round(roi_arr[2])),
+        int(round(roi_arr[3])),
+    )
+
+    s_lo, s_hi, _ = seg_bounds.get(best_idx, (0, n_samples - 1, False))
+    seg_lo_frame = int(sampled_idxs[s_lo]) if s_lo > 0 else 0
+    seg_hi_frame = int(sampled_idxs[s_hi]) if s_hi < n_samples - 1 else (total_video_frames - 1)
+    win_start = max(seg_lo_frame, refined_frame - int(round(fps * 0.85)))
+    win_end = min(seg_hi_frame, refined_frame + int(round(fps * 1.35)))
+    if win_end <= win_start:
+        win_start = max(0, refined_frame - int(round(fps * 0.6)))
+        win_end = min(max(0, total_video_frames - 1), refined_frame + int(round(fps * 0.6)))
+
+    return refined_frame, refined_box, win_start, win_end
+
+
 @torch.no_grad()
 def predict_single_clip(
     video_path: Optional[Union[Path, str, argparse.Namespace]] = None,
@@ -1492,6 +1809,7 @@ def predict_single_clip(
         det_model=None,
         pose_model=pose_model,
         device=str(device),
+        max_scan_samples=16,
     )
 
     model = FoulClassifier3D(pretrained=False, freeze_backbone=True).to(device)
@@ -1582,17 +1900,28 @@ def predict_single_clip(
     when_str = "N/A (No Foul)"
 
     if is_foul:
-        window_pre = int(round(fps * 0.85))   # ~0.85s before contact apex
-        window_post = int(round(fps * 1.35))  # ~1.35s after contact apex
-        foul_window_start = max(0, foul_frame - window_pre)
-        foul_window_end = min(max(0, total_video_frames - 1), foul_frame + window_post)
+        foul_frame, refined_anchor_box, foul_window_start, foul_window_end = refine_foul_apex_and_window(
+            video_path=resolved_video,
+            pose_model=pose_model,
+            anchor_hint_f=anchor_hint_f,
+            anchor_hint_box=anchor_hint_box,
+            fps=fps,
+            total_video_frames=total_video_frames,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            device=str(device),
+        )
+        foul_time_sec = float(foul_frame) / max(fps, 1.0)
+        mins = int(foul_time_sec // 60)
+        secs = foul_time_sec - mins * 60
+        track_anchor_box = refined_anchor_box if refined_anchor_box is not None else anchor_hint_box
         foul_window_boxes = track_foul_players_in_foul_window(
             video_path=resolved_video,
             pose_model=pose_model,
             foul_frame=foul_frame,
             foul_window_start=foul_window_start,
             foul_window_end=foul_window_end,
-            anchor_roi=anchor_hint_box,
+            anchor_roi=track_anchor_box,
             metadata=None,
             device=str(device),
             frame_w=frame_w,
