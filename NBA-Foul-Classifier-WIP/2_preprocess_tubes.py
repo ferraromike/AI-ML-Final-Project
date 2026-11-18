@@ -786,7 +786,6 @@ def extract_action_tube(
     scanned_feats: List[np.ndarray] = []
 
     yolo_device = select_yolo_device(device)
-    use_half = (yolo_device == "cuda")
     batch_sz = max(1, int(yolo_batch_size))
     with torch.inference_mode():
         for b_start in range(0, len(small_bgr_frames), batch_sz):
@@ -795,7 +794,6 @@ def extract_action_tube(
                 batch_frames,
                 conf=0.10,
                 imgsz=yolo_imgsz,
-                half=use_half,
                 verbose=False,
                 device=yolo_device,
             )
@@ -804,7 +802,6 @@ def extract_action_tube(
                     batch_frames,
                     conf=0.10,
                     imgsz=yolo_imgsz,
-                    half=use_half,
                     classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
                     verbose=False,
                     device=yolo_device,
