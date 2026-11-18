@@ -1572,109 +1572,57 @@ def predict_single_clip(
             cur_contact = 0.15
             vert_deg = 8.0
 
-        # Dynamic state & color switching:
+        # Dynamic state & broadcast replay bug styling:
         if not is_foul:
-            cur_status_text = "LEGAL PLAY (NO FOUL) | IN CYLINDER"
+            cur_status_text = "● LEGAL DEFENSE | PLAY ON"
             cur_status_color = (0, 220, 0)      # Bright Green
-            rl_verdict = "PLAY ON"
-            q_play = +1.00
-            q_foul = -1.00
-            p_whistle = 0.0
-            rl_color = (0, 220, 0)
         else:
             if frame_idx < foul_window_start:
-                cur_status_text = f"APPROACHING DISPUTED PLAY | P(FOUL) = {foul_prob * 100:.1f}%"
-                cur_status_color = (0, 200, 255)  # Cyan
-                rl_verdict = "MONITORING"
-                q_play = 0.70
-                q_foul = -0.30
-                p_whistle = foul_prob * 0.20
-                rl_color = (0, 200, 255)
+                cur_status_text = f"● REVIEWING PLAY | {call_type.upper()}"
+                cur_status_color = (0, 205, 255)  # Amber / Cyan
             elif frame_idx <= foul_window_end:
-                cur_status_text = f"*** FOUL DETECTED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***"
-                cur_status_color = (40, 60, 255)    # Bright Red
-                rl_verdict = "WHISTLE BLOWN"
-                q_play = -0.80
-                q_foul = +0.95
-                p_whistle = max(0.85, foul_prob)
-                rl_color = (40, 60, 255)
+                cur_status_text = f"● FOUL DETECTED | {call_type.upper()} ({foul_time_sec:.2f}s)"
+                cur_status_color = (40, 60, 255)  # Bright Red
             else:
-                cur_status_text = f"FOUL CALLED (WHISTLE BLOWN) | {def_num_str} {committing}"
-                cur_status_color = (40, 60, 255)    # Red
-                rl_verdict = "WHISTLE CONFIRMED"
-                q_play = -1.00
-                q_foul = +1.00
-                p_whistle = 0.95
-                rl_color = (40, 60, 255)
+                cur_status_text = f"● WHISTLE CONFIRMED | {call_type.upper()}"
+                cur_status_color = (40, 60, 255)  # Bright Red
 
-        cyl_val = float(np.clip(cur_contact * 1.4, 0.0, 1.0))
-        arm_val = float(np.clip(cur_contact * 1.2, 0.0, 1.0))
+        if committing != "Unknown" or disadvantaged != "Unknown":
+            matchup_text = f"DEF: {committing} ({def_num_str}, {def_team_str})  vs  OFF: {disadvantaged} ({off_num_str}, {off_team_str})"
+        else:
+            matchup_text = f"CALL: {call_type}  |  CONFIDENCE: {foul_prob * 100:.1f}%"
 
-        # 4. Top-left HUD stats panel with binary classification, RL telemetry & Rule 12 metrics
-        hud_w = 980
-        hud_h = 195
+        # 4. Top-left Sleek Broadcast Replay HUD (Compact 2-line badge)
+        (tw1, _), _ = cv2.getTextSize(cur_status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+        (tw2, _), _ = cv2.getTextSize(matchup_text, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+        hud_w = max(460, max(tw1, tw2) + 38)
+        hud_h = 62
+
         overlay = frame.copy()
-        cv2.rectangle(overlay, (16, 16), (16 + hud_w, 16 + hud_h), (16, 16, 16), -1)
-        cv2.addWeighted(overlay, 0.84, frame, 0.16, 0, frame)
-        cv2.rectangle(frame, (16, 16), (16 + hud_w, 16 + hud_h), cur_status_color, 2)
+        cv2.rectangle(overlay, (18, 18), (18 + hud_w, 18 + hud_h), (18, 18, 18), -1)
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        # Left status accent stripe
+        cv2.rectangle(frame, (18, 18), (24, 18 + hud_h), cur_status_color, -1)
+        # Subtle crisp border
+        cv2.rectangle(frame, (18, 18), (18 + hud_w, 18 + hud_h), (50, 50, 50), 1)
 
         cv2.putText(
             frame,
-            f"STATUS: {cur_status_text}",
-            (28, 44),
+            cur_status_text,
+            (36, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
+            0.58,
             cur_status_color,
             2,
             cv2.LINE_AA,
         )
         cv2.putText(
             frame,
-            f"WHAT FOUL: {call_type} | OFF: {disadvantaged} ({off_num_str}, {off_team_str}) vs DEF: {committing} ({def_num_str}, {def_team_str})",
-            (28, 72),
+            matchup_text,
+            (36, 65),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"RL REFEREE CALL: {rl_verdict} | Q(FOUL): {q_foul:+.2f} | Q(PLAY_ON): {q_play:+.2f} | P(WHISTLE): {p_whistle * 100:.1f}%",
-            (28, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            rl_color,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"L2M LEAGUE REVIEW: {review_decision} | P(CLASSIFIER): {foul_prob * 100:.1f}% (Thresh: {threshold * 100:.0f}%) | FRAME: {frame_idx + 1}/{total_video_frames}",
-            (28, 128),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (215, 215, 215),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"RULE 12 DIAGNOSTICS: Cylinder Breach: {cyl_val:.2f} | Arm Contact: {arm_val:.2f} | Vert Angle: {vert_deg:.1f}deg | Contact: {cur_contact * 100:.1f}%",
-            (28, 154),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
-            (170, 215, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"DISPUTED PLAY ENCLOSING BOUNDING BOX [ALL PLAYERS] | CONTACT INTENSITY: {cur_contact * 100:.1f}%",
-            (28, 178),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
-            (160, 160, 160),
+            0.44,
+            (235, 235, 235),
             1,
             cv2.LINE_AA,
         )
