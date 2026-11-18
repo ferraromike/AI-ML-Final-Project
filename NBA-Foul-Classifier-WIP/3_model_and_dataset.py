@@ -207,6 +207,7 @@ def get_shared_embedding_extractor() -> nn.Module:
     """
     Singleton Kinetics-400 R(2+1)D-18 visual feature extractor for fast, zero-stall
     512-D embedding generation and runtime shape harmonization.
+    Moves to CUDA automatically when a GPU is available.
     """
     global _SHARED_EMBEDDING_EXTRACTOR
     if _SHARED_EMBEDDING_EXTRACTOR is None:
@@ -215,6 +216,8 @@ def get_shared_embedding_extractor() -> nn.Module:
         except Exception:
             extractor = r2plus1d_18(weights=None)
         extractor.fc = nn.Identity()
+        if torch.cuda.is_available():
+            extractor = extractor.to("cuda")
         extractor.eval()
         _SHARED_EMBEDDING_EXTRACTOR = extractor
     return _SHARED_EMBEDDING_EXTRACTOR
@@ -411,8 +414,9 @@ class L2MFoulDataset(Dataset):
         norm_video = ((norm_video - mean) / std).unsqueeze(0)
 
         extractor = get_shared_embedding_extractor()
+        ext_dev = next(extractor.parameters()).device
         with torch.no_grad():
-            emb = extractor(norm_video).squeeze(0).cpu().float()
+            emb = extractor(norm_video.to(ext_dev)).squeeze(0).cpu().float()
 
         self._emb_cache[path.stem] = emb
         if path.suffix == ".pt" and path.exists():
