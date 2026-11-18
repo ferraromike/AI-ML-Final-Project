@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
@@ -107,6 +108,14 @@ def select_compute_device(requested: Optional[str] = None) -> torch.device:
             torch.cuda.empty_cache()
         except Exception:
             pass
+    elif dev.type == "mps":
+        try:
+            _w = torch.zeros((1, 4, 8), device=dev)
+            _mha = nn.MultiheadAttention(8, 2, batch_first=True).to(dev)
+            _ = _mha(_w, _w, _w)
+            del _w, _mha
+        except BaseException:
+            dev = torch.device("cpu")
     return dev
 
 
@@ -206,17 +215,17 @@ def calibrate_foul_threshold(
         "threshold": 0.50,
     }
 
-    for thresh in np.linspace(0.20, 0.80, 61):
+    for thresh in np.linspace(0.50, 0.65, 16):
         y_pred_arr = (y_prob_arr >= thresh).astype(int)
         f1 = float(f1_score(y_true_arr, y_pred_arr, zero_division=0))
         acc = float(accuracy_score(y_true_arr, y_pred_arr))
         prec = float(precision_score(y_true_arr, y_pred_arr, zero_division=0))
         rec = float(recall_score(y_true_arr, y_pred_arr, zero_division=0))
-        # Optimize composite objective: balances F1 recall/precision with total accuracy
-        comp_score = 0.65 * f1 + 0.35 * acc
+        # Optimize composite objective: balances F1 recall/precision with total accuracy and precision discipline
+        comp_score = 0.50 * f1 + 0.35 * acc + 0.15 * prec
         if comp_score > best_comp_score:
             best_comp_score = comp_score
-            best_thresh = float(thresh)
+            best_thresh = float(round(thresh, 2))
             best_metrics = {
                 "accuracy": acc,
                 "precision": prec,
@@ -311,8 +320,23 @@ def train_one_epoch(
 
         try:
             with get_autocast_context(device):
-                logits = model(videos, pose_feats)
-                raw_loss = criterion(logits, targets)
+                if hasattr(model, "foul_type_head") and hasattr(model, "extract_features") and pose_feats is not None:
+                    combined = model.extract_features(videos, pose_feats)
+                    logits = model.classifier_head(combined)
+                    type_logits = model.foul_type_head(combined)
+                    # Biomechanical shooting-act target: on-ball proximity (dims 6,7) + airborne apex (dim 11) + landing space (dim 2)
+                    on_ball = torch.clamp(pose_feats[:, :, 6:8].max(dim=-1).values.mean(dim=1, keepdim=True) * 4.0, 0.0, 1.0)
+                    shoot_score = (
+                        0.40 * on_ball
+                        + 0.35 * pose_feats[:, :, 11].mean(dim=1, keepdim=True)
+                        + 0.25 * pose_feats[:, :, 2].mean(dim=1, keepdim=True)
+                    )
+                    shoot_targets = (shoot_score >= 0.34).float()
+                    aux_loss = F.binary_cross_entropy_with_logits(type_logits, shoot_targets)
+                    raw_loss = criterion(logits, targets) + 0.20 * aux_loss
+                else:
+                    logits = model(videos, pose_feats)
+                    raw_loss = criterion(logits, targets)
                 scaled_loss = raw_loss / accum_steps
 
             if scaler is not None:
@@ -435,21 +459,49 @@ def create_cross_platform_video_writer(
     raise RuntimeError(f"Could not initialize VideoWriter for {output_path} on {platform.system()}")
 
 
+def describe_court_location(ix: int, iy: int, frame_w: int, frame_h: int) -> str:
+    """Map pixel coordinates `(ix, iy)` to a descriptive basketball court zone."""
+    nx = float(ix) / max(float(frame_w), 1.0)
+    ny = float(iy) / max(float(frame_h), 1.0)
+    if nx < 0.34:
+        side = "Left Paint / Rim Area" if ny < 0.68 else "Left Corner / Baseline"
+    elif nx > 0.66:
+        side = "Right Paint / Rim Area" if ny < 0.68 else "Right Corner / Baseline"
+    else:
+        side = "Top of Key / Perimeter" if ny < 0.58 else "Mid-Court / Wing"
+    return f"{side} (x={ix}, y={iy})"
+
+
 def lookup_disputed_play_metadata(
     video_path: Union[Path, str],
     base_dir: Path = BASE_DIR,
 ) -> Dict[str, Any]:
     """
     Query L2M metadata records across available CSVs (processed_metadata.csv,
-    l2m_metadata.csv, l2m_incorrect_fouls.csv) to retrieve disputed play attributes:
-    - player_committing (defender who committed or contested the foul)
-    - player_disadvantaged (offensive shooter/driver)
-    - call_type (e.g. Shooting Foul, Personal Foul, Loose Ball Foul)
-    - review_decision (e.g. INC, CC, CNC)
-    - label (1 for foul, 0 for legal play)
+    l2m_metadata.csv, l2m_incorrect_fouls.csv) and cached AI Referee decisions.
+    For arbitrary raw game footage not in the L2M catalog, returns `found_in_l2m=False`
+    and `label=None`, ensuring the AI Referee relies 100% on model inference.
     """
+    import json
+
     p = Path(video_path)
     stem = p.stem.replace("_annotated", "").replace(".pt", "").replace(".mp4", "")
+
+    # Check if AI Referee decision cache exists in data/annotated/referee_decisions.json
+    cached_dec: Dict[str, Any] = {}
+    for dec_json in [
+        base_dir / "data" / "annotated" / "referee_decisions.json",
+        base_dir.parent / "data" / "annotated" / "referee_decisions.json",
+    ]:
+        if dec_json.exists():
+            try:
+                with open(dec_json, "r", encoding="utf-8") as jf:
+                    all_decs = json.load(jf)
+                    if isinstance(all_decs, dict) and stem in all_decs:
+                        cached_dec = all_decs[stem]
+                        break
+            except Exception:
+                pass
 
     candidate_csvs = [
         base_dir / "data" / "processed" / "processed_metadata.csv",
@@ -469,26 +521,40 @@ def lookup_disputed_play_metadata(
                 for row in reader:
                     row_pid = row.get("play_id", "").strip()
                     row_vpath = row.get("video_path", "").strip()
-                    if row_pid == stem or stem in row_pid or (row_vpath and stem in row_vpath):
-                        return {
+                    if row_pid == stem or (row_pid and stem == row_pid) or (row_vpath and Path(row_vpath).stem == stem):
+                        raw_lbl = row.get("label")
+                        if raw_lbl in (None, ""):
+                            dec_str = row.get("review_decision", "").strip().upper()
+                            lbl_val = 1 if dec_str in ("CC", "INC") else (0 if dec_str in ("CNC", "IC") else None)
+                        else:
+                            lbl_val = int(raw_lbl)
+                        res_meta = {
                             "play_id": row_pid or stem,
+                            "found_in_l2m": True,
                             "player_committing": row.get("player_committing", "").strip() or "Defender",
-                            "player_disadvantaged": row.get("player_disadvantaged", "").strip() or "Offensive Player",
-                            "call_type": row.get("call_type", "").strip() or "Shooting Foul",
+                            "player_disadvantaged": row.get("player_disadvantaged", "").strip() or "Ball Handler",
+                            "call_type": row.get("call_type", "").strip() or None,
                             "review_decision": row.get("review_decision", "").strip() or "L2M Review",
-                            "label": int(row.get("label", 1) if row.get("label") not in (None, "") else 1),
+                            "label": lbl_val,
                         }
+                        if cached_dec:
+                            res_meta["ai_decision"] = cached_dec
+                        return res_meta
         except Exception as exc:
             logger.debug("Error scanning CSV %s: %s", csv_file, exc)
 
-    return {
+    res_unknown: Dict[str, Any] = {
         "play_id": stem,
+        "found_in_l2m": False,
         "player_committing": "Defender",
-        "player_disadvantaged": "Offensive Player",
-        "call_type": "Shooting Foul",
-        "review_decision": "L2M Review",
-        "label": 1,
+        "player_disadvantaged": "Ball Handler / Shooter",
+        "call_type": cached_dec.get("what_foul") if cached_dec else None,
+        "review_decision": "Raw Game Footage",
+        "label": None,
     }
+    if cached_dec:
+        res_unknown["ai_decision"] = cached_dec
+    return res_unknown
 
 
 NBA_PLAYER_JERSEY_REGISTRY: Dict[str, Dict[str, str]] = {
@@ -592,6 +658,7 @@ def track_foul_players_in_foul_window(
 
     all_keys = sorted(window_frames.keys())
     yolo_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else ("mps" if device == "mps" else "cpu")
+    active_det = preprocess_mod.get_cached_det_model()
 
     frame_dets: Dict[int, List[Dict[str, Any]]] = {}
     with torch.inference_mode():
@@ -599,49 +666,76 @@ def track_foul_players_in_foul_window(
             b_keys = all_keys[b_idx : b_idx + 16]
             b_imgs = [window_frames[k] for k in b_keys]
             preds = pose_model.predict(b_imgs, conf=0.10, imgsz=640, verbose=False, device=yolo_dev)
-            for k, res in zip(b_keys, preds):
+            det_preds = (
+                active_det.predict(b_imgs, conf=0.12, imgsz=640, classes=[0], verbose=False, device=yolo_dev)
+                if (active_det is not None and active_det is not pose_model)
+                else [None] * len(b_imgs)
+            )
+            for k, frame_img, res, d_res in zip(b_keys, b_imgs, preds, det_preds):
                 cands = []
+                raw_bxs_list = []
+                raw_cfs_list = []
+                raw_kpts_list = []
+
                 if res.boxes is not None and len(res.boxes) > 0:
                     bxs = res.boxes.xyxy.cpu().numpy()
                     cfs = res.boxes.conf.cpu().numpy()
                     cls = res.boxes.cls.cpu().numpy().astype(int)
                     kpts = res.keypoints.xy.cpu().numpy() if res.keypoints is not None else None
                     for i, (b, c, cl) in enumerate(zip(bxs, cfs, cls)):
-                        if cl == 0:  # person
-                            bh = b[3] - b[1]
-                            bw = b[2] - b[0]
-                            cx = 0.5 * (b[0] + b[2])
-                            cy = 0.5 * (b[1] + b[3])
-                            if (
-                                b[1] >= frame_h * 0.12
-                                and b[3] <= frame_h * 0.98
-                                and bh >= frame_h * 0.08
-                                and (bh / max(bw, 1.0)) >= 0.70
-                            ):
-                                kp = kpts[i] if (kpts is not None and i < len(kpts)) else np.empty((0, 2))
-                                elev = 0.0
-                                vert_angle = 15.0
-                                if kp is not None and len(kp) >= 17:
-                                    sh = kp[[5, 6]]
-                                    wr = kp[[9, 10]]
-                                    valid_sh = sh[sh[:, 1] > 0]
-                                    valid_wr = wr[wr[:, 1] > 0]
-                                    if len(valid_sh) > 0 and len(valid_wr) > 0:
-                                        elev = float(max(0.0, (np.mean(valid_sh[:, 1]) - np.mean(valid_wr[:, 1])) / max(bh, 1.0)))
-                                        dx = float(np.mean(valid_wr[:, 0]) - np.mean(valid_sh[:, 0]))
-                                        dy = float(np.mean(valid_wr[:, 1]) - np.mean(valid_sh[:, 1]))
-                                        vert_angle = float(np.degrees(np.arctan2(abs(dx), max(abs(dy), 1.0))))
-                                cands.append({
-                                    "box": b.astype(np.float32),
-                                    "conf": float(c),
-                                    "kpts": kp,
-                                    "cx": cx,
-                                    "cy": cy,
-                                    "bw": bw,
-                                    "bh": bh,
-                                    "elev": elev,
-                                    "vert_angle": vert_angle,
-                                })
+                        if cl == 0:
+                            raw_bxs_list.append(b.astype(np.float32))
+                            raw_cfs_list.append(float(c))
+                            kp = kpts[i] if (kpts is not None and i < len(kpts)) else preprocess_mod.synthesize_box_keypoints(b)
+                            raw_kpts_list.append(kp)
+
+                if d_res is not None and d_res.boxes is not None and len(d_res.boxes) > 0:
+                    dbxs = d_res.boxes.xyxy.cpu().numpy()
+                    dcfs = d_res.boxes.conf.cpu().numpy()
+                    dcls = d_res.boxes.cls.cpu().numpy().astype(int)
+                    for db, dc, dcl in zip(dbxs, dcfs, dcls):
+                        if dcl == 0 and all(preprocess_mod.box_iou_single(db, eb) < 0.42 for eb in raw_bxs_list):
+                            raw_bxs_list.append(db.astype(np.float32))
+                            raw_cfs_list.append(float(dc))
+                            raw_kpts_list.append(preprocess_mod.synthesize_box_keypoints(db))
+
+                for b, c, kp in zip(raw_bxs_list, raw_cfs_list, raw_kpts_list):
+                    bh = b[3] - b[1]
+                    bw = b[2] - b[0]
+                    cx = 0.5 * (b[0] + b[2])
+                    cy = 0.5 * (b[1] + b[3])
+                    if (
+                        b[1] >= frame_h * 0.22
+                        and b[3] >= frame_h * 0.46
+                        and b[3] <= frame_h * 0.94
+                        and bh >= frame_h * 0.09
+                        and bh <= frame_h * 0.48
+                        and (bh / max(bw, 1.0)) >= 0.75
+                        and not preprocess_mod.is_referee_or_sideline_official(frame_img, b, frame_w, frame_h)
+                    ):
+                        elev = 0.0
+                        vert_angle = 15.0
+                        if kp is not None and len(kp) >= 17:
+                            sh = kp[[5, 6]]
+                            wr = kp[[9, 10]]
+                            valid_sh = sh[sh[:, 1] > 0]
+                            valid_wr = wr[wr[:, 1] > 0]
+                            if len(valid_sh) > 0 and len(valid_wr) > 0:
+                                elev = float(max(0.0, (np.mean(valid_sh[:, 1]) - np.mean(valid_wr[:, 1])) / max(bh, 1.0)))
+                                dx = float(np.mean(valid_wr[:, 0]) - np.mean(valid_sh[:, 0]))
+                                dy = float(np.mean(valid_wr[:, 1]) - np.mean(valid_sh[:, 1]))
+                                vert_angle = float(np.degrees(np.arctan2(abs(dx), max(abs(dy), 1.0))))
+                        cands.append({
+                            "box": b.astype(np.float32),
+                            "conf": float(c),
+                            "kpts": kp,
+                            "cx": cx,
+                            "cy": cy,
+                            "bw": bw,
+                            "bh": bh,
+                            "elev": elev,
+                            "vert_angle": vert_angle,
+                        })
                 frame_dets[k] = cands
 
     roi_cx = 0.5 * (anchor_roi[0] + anchor_roi[2]) if anchor_roi is not None else frame_w * 0.5
@@ -741,10 +835,17 @@ def track_foul_players_in_foul_window(
         ux2 = int(round(min(float(frame_w), max(ob[2], db[2]) + pad_x)))
         uy2 = int(round(min(float(frame_h), max(ob[3], db[3]) + pad_y)))
 
+        # Compute exact spatial contact point (WHERE the foul occurred) between offender and shooter
+        ocx, ocy = 0.5 * (ob[0] + ob[2]), 0.36 * ob[1] + 0.64 * ob[3]
+        dcx, dcy = 0.5 * (db[0] + db[2]), 0.36 * db[1] + 0.64 * db[3]
+        ix = int(round(np.clip(0.5 * (ocx + dcx), ux1 + 8, ux2 - 8)))
+        iy = int(round(np.clip(0.5 * (ocy + dcy), uy1 + 8, uy2 - 8)))
+
         result[f] = {
             "off_box": (int(round(ob[0])), int(round(ob[1])), int(round(ob[2])), int(round(ob[3]))),
             "def_box": (int(round(db[0])), int(round(db[1])), int(round(db[2])), int(round(db[3]))),
             "union_box": (ux1, uy1, ux2, uy2),
+            "impact_point": (ix, iy),
             "vert_deg": vert_tracks.get(f, 25.0),
             "contact": 0.85,
         }
@@ -1230,6 +1331,80 @@ def track_boxes_full_video(
     return all_players_boxes, scores
 
 
+def discover_video_files_in_folder(folder_path: Union[Path, str]) -> List[Path]:
+    """
+    Discover all raw game footage files (.mp4, .mov, .avi, .mkv, .webm, .m4v) in a folder.
+    Ignores hidden files and already-annotated `*_annotated.mp4` files.
+    """
+    t_dir = resolve_project_path(folder_path)
+    if not t_dir.exists():
+        t_dir.mkdir(parents=True, exist_ok=True)
+        return []
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+    return sorted(
+        [
+            p
+            for p in t_dir.iterdir()
+            if p.is_file()
+            and not p.name.startswith(".")
+            and p.suffix.lower() in video_exts
+            and not p.stem.endswith("_annotated")
+        ]
+    )
+
+
+def run_ai_referee_on_folder(
+    folder_path: Union[Path, str] = BASE_DIR / "data" / "test",
+    checkpoint_path: Optional[Union[Path, str]] = None,
+    annotated_dir: Optional[Union[Path, str]] = None,
+    yolo_weights: str = "yolo11n.pt",
+    pose_weights: Optional[str] = "yolo11n-pose.pt",
+    **kwargs,
+) -> List[Dict[str, Any]]:
+    """
+    Run the AI Referee on all raw game footage placed in `folder_path` (defaults to `data/test/`).
+    For each video file:
+      - Runs spatiotemporal + biomechanical foul detection & foul-type classification.
+      - If a foul occurs, annotates the video showing WHAT foul it is, WHERE it occurred, and WHEN it occurred.
+      - If no foul occurs, leaves the video completely untouched (nothing happens).
+      - Exports annotated videos to `data/annotated/<clip_stem>_annotated.mp4` and saves `referee_decisions.json`.
+    Returns a list of structured AI Referee report dictionaries.
+    """
+    import json
+
+    t_dir = resolve_project_path(folder_path)
+    test_videos = discover_video_files_in_folder(t_dir)
+    if not test_videos:
+        logger.warning("No raw game video files found in %s. Drop .mp4/.mov/.avi clips into %s to test.", t_dir, t_dir)
+        return []
+
+    out_dir = resolve_project_path(annotated_dir) if annotated_dir else BASE_DIR / "data" / "annotated"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("🏀 AI Referee scanning %d video file(s) in %s: %s", len(test_videos), t_dir, [v.name for v in test_videos])
+    reports: List[Dict[str, Any]] = []
+
+    for idx, v_path in enumerate(test_videos, start=1):
+        logger.info("=== [%d/%d] AI Referee evaluating clip: %s ===", idx, len(test_videos), v_path.name)
+        try:
+            rep = predict_single_clip(
+                video_path=v_path,
+                checkpoint_path=checkpoint_path,
+                output_mp4_path=out_dir / f"{v_path.stem}_annotated.mp4",
+                yolo_weights=yolo_weights,
+                pose_weights=pose_weights,
+                return_details=True,
+                **kwargs,
+            )
+            if isinstance(rep, dict):
+                reports.append(rep)
+        except Exception as exc:
+            logger.error("Failed to evaluate %s: %s", v_path.name, exc, exc_info=True)
+
+    logger.info("Finished AI Referee folder evaluation: %d/%d clips annotated -> %s", len(reports), len(test_videos), out_dir)
+    return reports
+
+
 def annotate_test_directory(
     test_dir: Union[Path, str] = BASE_DIR / "data" / "test",
     checkpoint_path: Optional[Union[Path, str]] = None,
@@ -1240,45 +1415,17 @@ def annotate_test_directory(
 ) -> Dict[str, float]:
     """
     Batch-process and annotate all video clips in the test directory (`data/test/`).
-    Users can drop any video file (.mp4, .mov, .avi, etc.) into `data/test/` and run
-    `--annotate-test` to generate continuously tracked, HUD-annotated videos in `data/annotated/`.
+    Returns mapping of `{clip_stem: foul_prob}` for backward compatibility.
     """
-    t_dir = resolve_project_path(test_dir)
-    if not t_dir.exists():
-        t_dir.mkdir(parents=True, exist_ok=True)
-        logger.warning("Test directory %s does not exist; created empty folder.", t_dir)
-        return {}
-
-    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-    test_videos = sorted([p for p in t_dir.iterdir() if p.is_file() and p.suffix.lower() in video_exts])
-
-    if not test_videos:
-        logger.warning("No video files found in test directory %s. Add .mp4 files to test.", t_dir)
-        return {}
-
-    out_dir = resolve_project_path(annotated_dir) if annotated_dir else BASE_DIR / "data" / "annotated"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Found %d clip(s) in test directory %s: %s", len(test_videos), t_dir, [v.name for v in test_videos])
-    results: Dict[str, float] = {}
-
-    for idx, v_path in enumerate(test_videos, start=1):
-        logger.info("=== [%d/%d] Annotating test clip: %s ===", idx, len(test_videos), v_path.name)
-        try:
-            prob = predict_single_clip(
-                video_path=v_path,
-                checkpoint_path=checkpoint_path,
-                output_mp4_path=out_dir / f"{v_path.stem}_annotated.mp4",
-                yolo_weights=yolo_weights,
-                pose_weights=pose_weights,
-                **kwargs,
-            )
-            results[v_path.stem] = prob
-        except Exception as exc:
-            logger.error("Failed to annotate %s: %s", v_path.name, exc, exc_info=True)
-
-    logger.info("Finished test directory annotation: %d/%d clips processed -> %s", len(results), len(test_videos), out_dir)
-    return results
+    reports = run_ai_referee_on_folder(
+        folder_path=test_dir,
+        checkpoint_path=checkpoint_path,
+        annotated_dir=annotated_dir,
+        yolo_weights=yolo_weights,
+        pose_weights=pose_weights,
+        **kwargs,
+    )
+    return {r["stem"]: float(r["foul_prob"]) for r in reports}
 
 
 @torch.no_grad()
@@ -1288,13 +1435,18 @@ def predict_single_clip(
     output_mp4_path: Optional[Union[Path, str]] = None,
     yolo_weights: str = "yolo11n.pt",
     pose_weights: Optional[str] = "yolo11n-pose.pt",
+    return_details: bool = False,
     **kwargs,
-) -> float:
+) -> Union[float, Dict[str, Any]]:
     """
-    Run end-to-end foul prediction on a video clip and export an annotated MP4 video
-    into `data/annotated/` with classification bounding boxes present across 100% of frames
-    tracking the correct focal player and contesting defender.
+    Run end-to-end AI Referee evaluation on a raw game video clip:
+      - Determines if a foul occurred (`is_foul`) and what foul it is (`what_foul`, `foul_subtype`, `foul_mechanic`).
+      - Pinpoints WHEN it occurred (`foul_frame`, `foul_time_sec`) and WHERE it occurred (`impact_point`, `union_box`, `court_zone`).
+      - If a foul occurs, highlights WHERE it occurred, WHAT foul it is, and WHEN it occurred on the annotated video.
+      - If NO foul occurs, nothing happens on the video (100% clean, unaltered video playback).
     """
+    import json
+
     if isinstance(video_path, argparse.Namespace):
         ns = video_path
         actual_video = Path(ns.predict)
@@ -1313,20 +1465,22 @@ def predict_single_clip(
     resolved_ckpt = resolve_project_path(actual_ckpt)
 
     if resolved_video.is_dir():
-        logger.info("Input path is a directory: running batch test annotation on %s", resolved_video)
-        batch_res = annotate_test_directory(
-            test_dir=resolved_video,
+        logger.info("Input path is a directory: running batch AI Referee annotation on %s", resolved_video)
+        batch_reports = run_ai_referee_on_folder(
+            folder_path=resolved_video,
             checkpoint_path=resolved_ckpt,
             annotated_dir=actual_out,
             yolo_weights=yolo_weights,
             pose_weights=pose_candidate,
         )
-        return float(np.mean(list(batch_res.values()))) if batch_res else 0.0
+        if return_details:
+            return {"reports": batch_reports}
+        return float(np.mean([r["foul_prob"] for r in batch_reports])) if batch_reports else 0.0
 
     if not resolved_video.exists():
         raise FileNotFoundError(f"Input video not found: {resolved_video}")
     if YOLO is None:
-        raise ImportError("Ultralytics YOLO is required for MP4 clip inference (`pip install ultralytics`).")
+        raise ImportError("Ultralytics YOLO is required for video clip inference (`pip install ultralytics`).")
 
     device = select_compute_device()
     pose_path = resolve_project_path(str(pose_candidate))
@@ -1351,8 +1505,8 @@ def predict_single_clip(
             if k in model_sd and v.shape == model_sd[k].shape
         }
         model.load_state_dict(compatible_sd, strict=False)
-        if isinstance(ckpt, dict) and "optimal_threshold" in ckpt and len(compatible_sd) == len(model_sd):
-            threshold = float(ckpt["optimal_threshold"])
+        if isinstance(ckpt, dict) and "optimal_threshold" in ckpt:
+            threshold = float(np.clip(float(ckpt["optimal_threshold"]), 0.48, 0.50))
         logger.info(
             "Loaded checkpoint: %s (matched %d/%d layers, threshold=%.2f)",
             resolved_ckpt,
@@ -1368,35 +1522,29 @@ def predict_single_clip(
     input_batch = augmentor(tube_tensor).unsqueeze(0).to(device)
     feats_batch = foul_features.unsqueeze(0).to(device)
 
+    # Strictly autonomous AI Referee inference: do not read or use CSV metadata labels/players
+    committing = "Defender"
+    disadvantaged = "Ball-Handler / Shooter"
+    l2m_call_type = None
+    review_decision = "AI Referee Automated Call"
+    meta_label = None
+    found_in_l2m = False
+
     with get_autocast_context(device):
-        logit = model(input_batch, feats_batch)
-        foul_prob = float(torch.sigmoid(logit).item())
+        ref_dec = model.predict_referee_decision(
+            video_frames=input_batch,
+            pose_features=feats_batch,
+            threshold=threshold,
+            call_type_hint=None,
+        )
 
-    play_meta = lookup_disputed_play_metadata(resolved_video, base_dir=BASE_DIR)
-    committing = play_meta["player_committing"]
-    disadvantaged = play_meta["player_disadvantaged"]
-    call_type = play_meta["call_type"]
-    review_decision = play_meta["review_decision"]
-    meta_label = play_meta["label"]
+    foul_prob = float(ref_dec["foul_prob"])
+    is_foul = bool(ref_dec["is_foul"])
 
-    is_foul = foul_prob >= threshold
-    if (not resolved_ckpt.exists()) and meta_label == 1:
-        is_foul = True
-
-    verdict = "FOUL DETECTED" if is_foul else "LEGAL DEFENSE"
-    peak_contact_intensity = float(foul_features[:, 11].max().item())
-
-    logger.info(
-        "Prediction for %s -> %s (P(foul) = %.2f%%, threshold = %.0f%%, peak_contact = %.2f) | %s on %s [%s]",
-        resolved_video.name,
-        verdict,
-        foul_prob * 100.0,
-        threshold * 100.0,
-        peak_contact_intensity,
-        committing,
-        disadvantaged,
-        call_type,
-    )
+    what_foul = ref_dec["what_foul"] if is_foul else "No Foul"
+    foul_subtype = ref_dec["foul_subtype"] if is_foul else "No Foul (Legal Play)"
+    foul_mechanic = ref_dec["foul_mechanic"]
+    apex_tube_idx = int(ref_dec.get("apex_frame_offset", len(sampled_indices) // 2))
 
     # Annotated video folder placement: always default to data/annotated/
     if actual_out is None:
@@ -1407,23 +1555,6 @@ def predict_single_clip(
         final_output_path = resolve_project_path(actual_out)
         final_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Derive anchor hints from the action tube ROI and contact apex
-    peak_tube_idx = (
-        int(torch.argmax(foul_features[:, 11]).item())
-        if (foul_features is not None and foul_features.numel() > 0)
-        else (len(sampled_indices) // 2)
-    )
-    anchor_hint_f = int(sampled_indices[min(peak_tube_idx, len(sampled_indices) - 1)]) if sampled_indices else None
-    anchor_hint_box = crop_boxes[min(peak_tube_idx, len(crop_boxes) - 1)] if crop_boxes else None
-
-    # Look up player profiles for jersey numbers, teams, and last names
-    off_p = lookup_player_profile(disadvantaged)
-    def_p = lookup_player_profile(committing)
-    off_num_str = f"#{off_p['number']}" if off_p.get("number") else ""
-    off_team_str = off_p.get("team") or "OFF"
-    def_num_str = f"#{def_p['number']}" if def_p.get("number") else ""
-    def_team_str = def_p.get("team") or "DEF"
-
     # Load video dimensions & frame count
     cap_info = cv2.VideoCapture(str(resolved_video))
     total_video_frames = int(cap_info.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1431,22 +1562,30 @@ def predict_single_clip(
     frame_h = int(cap_info.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     cap_info.release()
 
-    # Derive anchor hints and pinpoint foul apex frame
-    foul_frame = anchor_hint_f if anchor_hint_f is not None else (total_video_frames // 2)
-    foul_time_sec = float(foul_frame) / max(fps, 1.0)
+    anchor_hint_f = int(sampled_indices[min(apex_tube_idx, len(sampled_indices) - 1)]) if sampled_indices else (total_video_frames // 2)
+    anchor_hint_box = crop_boxes[min(apex_tube_idx, len(crop_boxes) - 1)] if crop_boxes else None
 
-    # REWORKED TRACKING LOGIC:
-    # Bounding boxes ONLY appear when there is a foul, specifically during the localized foul event window!
+    foul_frame = anchor_hint_f
+    foul_time_sec = float(foul_frame) / max(fps, 1.0)
+    mins = int(foul_time_sec // 60)
+    secs = foul_time_sec - mins * 60
+
+    off_num_str = ""
+    off_team_str = "OFF"
+    def_num_str = ""
+    def_team_str = "DEF"
+
     foul_window_boxes: Dict[int, Dict[str, Any]] = {}
+    where_point: Optional[Tuple[int, int]] = None
+    where_box: Optional[Tuple[int, int, int, int]] = None
+    where_zone = "N/A (No Foul)"
+    when_str = "N/A (No Foul)"
+
     if is_foul:
-        window_pre = int(round(fps * 0.70))   # ~21 frames before contact apex
-        window_post = int(round(fps * 0.85))  # ~25 frames after contact apex
+        window_pre = int(round(fps * 0.85))   # ~0.85s before contact apex
+        window_post = int(round(fps * 1.35))  # ~1.35s after contact apex
         foul_window_start = max(0, foul_frame - window_pre)
-        foul_window_end = min(total_video_frames - 1, foul_frame + window_post)
-        logger.info(
-            "🏀 Foul detected! Localizing player tracking exclusively to foul impact window [%d, %d] (apex: %d, %.2fs)...",
-            foul_window_start, foul_window_end, foul_frame, foul_time_sec,
-        )
+        foul_window_end = min(max(0, total_video_frames - 1), foul_frame + window_post)
         foul_window_boxes = track_foul_players_in_foul_window(
             video_path=resolved_video,
             pose_model=pose_model,
@@ -1454,244 +1593,262 @@ def predict_single_clip(
             foul_window_start=foul_window_start,
             foul_window_end=foul_window_end,
             anchor_roi=anchor_hint_box,
-            metadata=play_meta,
+            metadata=None,
             device=str(device),
             frame_w=frame_w,
             frame_h=frame_h,
         )
+        # Extract exact spatial location at foul apex frame
+        apex_key = min(foul_window_boxes.keys(), key=lambda k: abs(k - foul_frame)) if foul_window_boxes else None
+        if apex_key is not None:
+            apex_data = foul_window_boxes[apex_key]
+            where_box = apex_data["union_box"]
+            where_point = apex_data["impact_point"]
+        elif anchor_hint_box is not None:
+            bx1, by1, bx2, by2 = anchor_hint_box
+            where_box = (int(bx1), int(by1), int(bx2), int(by2))
+            where_point = (int((bx1 + bx2) // 2), int((by1 + by2) // 2))
+        else:
+            where_box = (int(frame_w * 0.35), int(frame_h * 0.35), int(frame_w * 0.65), int(frame_h * 0.80))
+            where_point = (frame_w // 2, int(frame_h * 0.55))
+
+        where_zone = describe_court_location(where_point[0], where_point[1], frame_w, frame_h)
+        when_str = f"{mins:02d}:{secs:05.2f} ({foul_time_sec:.2f}s | Frame {foul_frame})"
+        logger.info(
+            "🚨 AI REFEREE WHISTLE on %s -> WHAT: %s | WHEN: %s | WHERE: %s | P(foul)=%.1f%%",
+            resolved_video.name,
+            foul_subtype,
+            when_str,
+            where_zone,
+            foul_prob * 100.0,
+        )
     else:
         foul_window_start = 999999
         foul_window_end = -1
-        logger.info("🏀 Clean legal defense detected (No Foul). Video replay will render cleanly without player bounding boxes.")
+        logger.info(
+            "✅ AI REFEREE CALL on %s -> NO FOUL (P(foul)=%.1f%% < %.1f%%). Nothing happens on video (clean output).",
+            resolved_video.name,
+            foul_prob * 100.0,
+            threshold * 100.0,
+        )
 
-    # Load trained Referee RL Agent if available for sequential decision evaluation
-    rl_agent = None
-    rl_agent_path = resolve_project_path("weights/referee_rl_agent.pt")
-    if not rl_agent_path.exists():
-        rl_agent_path = resolve_project_path("referee_rl_agent.pt")
-    if rl_agent_path.exists() and hasattr(model_mod, "RefereeRLAgent"):
+    # Render annotated video:
+    # Rule: "the annotated video should show what foul it is and highlight where it occured along with when.
+    #        if no foul happens nothing should happen"
+    if not is_foul and resolved_video.suffix.lower() == ".mp4":
+        # Fast path when no foul happens on an MP4: copy untouched video directly so literally nothing happens!
+        if resolved_video.resolve() != final_output_path.resolve():
+            shutil.copy2(resolved_video, final_output_path)
+        frame_idx = total_video_frames
+    else:
+        cap = cv2.VideoCapture(str(resolved_video))
+        writer = create_cross_platform_video_writer(final_output_path, fps, frame_w, frame_h)
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # If no foul happens (or outside the foul window), NOTHING happens on the video frame!
+            draw_foul_highlight = (
+                is_foul
+                and (foul_window_start <= frame_idx <= foul_window_end)
+                and (frame_idx in foul_window_boxes)
+            )
+
+            if draw_foul_highlight:
+                fdata = foul_window_boxes[frame_idx]
+                fx1, fy1, fx2, fy2 = fdata["off_box"]
+                dx1, dy1, dx2, dy2 = fdata["def_box"]
+                ux1, uy1, ux2, uy2 = fdata["union_box"]
+                ix, iy = fdata.get("impact_point", ((ux1 + ux2) // 2, (uy1 + uy2) // 2))
+                cur_zone = describe_court_location(ix, iy, frame_w, frame_h)
+
+                # 1. Highlight WHERE the foul occurred: translucent red zone tint + bold red boundary
+                zone_overlay = frame.copy()
+                cv2.rectangle(zone_overlay, (ux1, uy1), (ux2, uy2), (15, 15, 195), -1)
+                cv2.addWeighted(zone_overlay, 0.16, frame, 0.84, 0, frame)
+                cv2.rectangle(frame, (ux1, uy1), (ux2, uy2), (0, 0, 235), 4)
+
+                # 2. Fouled Player (Offense) & Committing Player (Defense) boxes
+                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 215, 0), 2)
+                off_label = (
+                    f"Fouled: {disadvantaged} ({off_num_str} {off_team_str})".strip()
+                    if found_in_l2m
+                    else "Fouled Player (Offense)"
+                )
+                (otw, oth), _ = cv2.getTextSize(off_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                cv2.rectangle(frame, (fx1, max(0, fy1 - oth - 6)), (min(frame_w - 2, fx1 + otw + 8), fy1), (255, 215, 0), -1)
+                cv2.putText(frame, off_label, (fx1 + 4, max(12, fy1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (15, 15, 15), 1, cv2.LINE_AA)
+
+                cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 145, 255), 2)
+                def_label = (
+                    f"Foul By: {committing} ({def_num_str} {def_team_str})".strip()
+                    if found_in_l2m
+                    else "Committing Player (Defense)"
+                )
+                (dtw, dth), _ = cv2.getTextSize(def_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                cv2.rectangle(frame, (dx1, max(0, dy1 - dth - 6)), (min(frame_w - 2, dx1 + dtw + 8), dy1), (0, 145, 255), -1)
+                cv2.putText(frame, def_label, (dx1 + 4, max(12, dy1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (15, 15, 15), 1, cv2.LINE_AA)
+
+                # 3. Exact Contact Impact Reticle (WHERE the foul contact occurred)
+                fcx, fcy = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                dcx, dcy = (dx1 + dx2) // 2, (dy1 + dy2) // 2
+                cv2.line(frame, (fcx, fcy), (dcx, dcy), (0, 60, 255), 2, cv2.LINE_AA)
+                cv2.circle(frame, (ix, iy), 24, (0, 0, 255), 3, cv2.LINE_AA)
+                cv2.circle(frame, (ix, iy), 11, (0, 230, 255), 2, cv2.LINE_AA)
+                cv2.circle(frame, (ix, iy), 4, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.line(frame, (ix - 32, iy), (ix + 32, iy), (0, 230, 255), 2, cv2.LINE_AA)
+                cv2.line(frame, (ix, iy - 32), (ix, iy + 32), (0, 230, 255), 2, cv2.LINE_AA)
+
+                pt_tag = f"FOUL CONTACT ({ix}, {iy})"
+                (ptw, pth), _ = cv2.getTextSize(pt_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                pt_x = min(frame_w - ptw - 12, max(6, ix + 18))
+                pt_y = min(frame_h - 45, max(35, iy - 12))
+                cv2.rectangle(frame, (pt_x - 4, pt_y - pth - 4), (pt_x + ptw + 6, pt_y + 4), (0, 0, 210), -1)
+                cv2.putText(frame, pt_tag, (pt_x, pt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+                # 4. Call Tag directly above the Foul Zone showing WHAT FOUL & WHEN
+                tag_y = max(56, uy1 - 12)
+                what_tag = f"FOUL: {foul_subtype.upper()}"
+                when_where_tag = f"WHEN: {foul_time_sec:.2f}s (Frame {foul_frame}) | WHERE: {cur_zone}"
+                (tw1, th1), _ = cv2.getTextSize(what_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
+                (tw2, th2), _ = cv2.getTextSize(when_where_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+                box_w = max(tw1, tw2) + 18
+                box_x1 = max(8, min(ux1, frame_w - box_w - 8))
+                cv2.rectangle(frame, (box_x1, tag_y - th1 - th2 - 18), (box_x1 + box_w, tag_y + 4), (15, 15, 215), -1)
+                cv2.rectangle(frame, (box_x1, tag_y - th1 - th2 - 18), (box_x1 + box_w, tag_y + 4), (255, 255, 255), 1)
+                cv2.putText(
+                    frame,
+                    what_tag,
+                    (box_x1 + 8, tag_y - th2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    when_where_tag,
+                    (box_x1 + 8, tag_y - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.46,
+                    (180, 245, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                # 5. Top-left AI Referee Whistle Call Banner (only displayed during foul call!)
+                line1 = f"AI REFEREE WHISTLE  |  {what_foul.upper()}"
+                line2 = f"WHAT : {foul_subtype}  ({foul_mechanic})"
+                line3 = f"WHEN : {foul_time_sec:.2f}s (Frame {foul_frame})   |   WHERE: {cur_zone}"
+                (lw1, _), _ = cv2.getTextSize(line1, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+                (lw2, _), _ = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                (lw3, _), _ = cv2.getTextSize(line3, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                hud_w = max(520, max(lw1, lw2, lw3) + 40)
+                hud_h = 86
+
+                hud_overlay = frame.copy()
+                cv2.rectangle(hud_overlay, (18, 18), (18 + hud_w, 18 + hud_h), (16, 16, 20), -1)
+                cv2.addWeighted(hud_overlay, 0.88, frame, 0.12, 0, frame)
+                cv2.rectangle(frame, (18, 18), (26, 18 + hud_h), (0, 0, 240), -1)
+                cv2.rectangle(frame, (18, 18), (18 + hud_w, 18 + hud_h), (0, 0, 240), 2)
+
+                cv2.putText(frame, line1, (36, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (60, 80, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, line2, (36, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
+                cv2.putText(frame, line3, (36, 89), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 230, 255), 1, cv2.LINE_AA)
+
+                # 6. Bottom Timeline Marker highlighting WHEN the foul occurred
+                bar_x1, bar_x2 = 30, frame_w - 30
+                bar_y1, bar_y2 = frame_h - 26, frame_h - 12
+                bar_w = bar_x2 - bar_x1
+                cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (25, 25, 25), -1)
+                w_start_x = max(bar_x1, bar_x1 + int(bar_w * (float(foul_window_start) / float(max(1, total_video_frames)))))
+                w_end_x = min(bar_x2, bar_x1 + int(bar_w * (float(foul_window_end) / float(max(1, total_video_frames)))))
+                split_x = max(bar_x1, min(bar_x2, bar_x1 + int(bar_w * (float(foul_frame) / float(max(1, total_video_frames))))))
+                cv2.rectangle(frame, (w_start_x, bar_y1), (w_end_x, bar_y2), (0, 0, 235), -1)
+                cv2.line(frame, (split_x, bar_y1 - 6), (split_x, bar_y2 + 2), (255, 255, 255), 2)
+                w_label = f"FOUL @ {foul_time_sec:.2f}s (Frame {foul_frame})"
+                cv2.putText(frame, w_label, (max(bar_x1, split_x - 75), bar_y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (60, 80, 255), 1, cv2.LINE_AA)
+                curr_x = max(bar_x1, min(bar_x2, bar_x1 + int(bar_w * (float(frame_idx) / float(max(1, total_video_frames - 1))))))
+                cv2.circle(frame, (curr_x, (bar_y1 + bar_y2) // 2), 6, (0, 235, 255), -1, cv2.LINE_AA)
+
+            writer.write(frame)
+            frame_idx += 1
+
+        cap.release()
+        writer.release()
+
+        # Optional faststart remux with ffmpeg so QuickTime/macOS and HTML5 browsers can play cleanly
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin and final_output_path.exists():
+            tmp_h264 = final_output_path.with_name(f"{final_output_path.stem}_h264.mp4")
+            remux_cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(final_output_path),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-loglevel",
+                "error",
+                str(tmp_h264),
+            ]
+            res = subprocess.run(remux_cmd, check=False)
+            if res.returncode == 0 and tmp_h264.exists() and tmp_h264.stat().st_size > 1000:
+                tmp_h264.replace(final_output_path)
+
+    decision_report: Dict[str, Any] = {
+        "clip": resolved_video.name,
+        "stem": resolved_video.stem,
+        "is_foul": is_foul,
+        "foul_prob": round(foul_prob, 4),
+        "neural_prob": round(float(ref_dec.get("neural_prob", foul_prob)), 4),
+        "threshold": round(threshold, 4),
+        "verdict": "FOUL WHISTLED" if is_foul else "NO FOUL (CLEAN PLAY)",
+        "what_foul": what_foul,
+        "foul_subtype": foul_subtype,
+        "foul_mechanic": foul_mechanic,
+        "when_frame": foul_frame if is_foul else None,
+        "when_time_sec": round(foul_time_sec, 2) if is_foul else None,
+        "when_str": when_str,
+        "where_zone": where_zone,
+        "where_point": list(where_point) if where_point is not None else None,
+        "where_box": list(where_box) if where_box is not None else None,
+        "player_committing": committing,
+        "player_disadvantaged": disadvantaged,
+        "found_in_l2m": found_in_l2m,
+        "ground_truth_label": meta_label,
+        "output_mp4": str(final_output_path),
+    }
+
+    # Persist decision report to data/annotated/referee_decisions.json for notebook & UI inspection
+    decisions_json_path = final_output_path.parent / "referee_decisions.json"
+    all_decisions: Dict[str, Any] = {}
+    if decisions_json_path.exists():
         try:
-            rl_agent = model_mod.RefereeRLAgent(device=device)
-            rl_agent.load(rl_agent_path)
-            logger.info("Loaded Referee RL Agent from %s", rl_agent_path)
-        except Exception as exc:
-            logger.debug("Could not load RL agent (%s); using baseline referee rules.", exc)
-
-    rl_traj = None
-    if rl_agent is not None and foul_features is not None:
-        try:
-            tube_feats = model.extract_features(input_batch, feats_batch).squeeze(0)
-            rl_traj = rl_agent.evaluate_trajectory(tube_feats, foul_features)
-            logger.info("Evaluated RL trajectory: decision=%s, confidence=%.2f", rl_traj["decision"], rl_traj["confidence"])
-        except Exception as exc:
-            logger.debug("RL trajectory eval fallback: %s", exc)
-
-    cap = cv2.VideoCapture(str(resolved_video))
-    writer = create_cross_platform_video_writer(final_output_path, fps, frame_w, frame_h)
-
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Bounding boxes ONLY appear when there is a foul, inside the foul impact window!
-        draw_foul_boxes = (
-            is_foul
-            and (foul_window_start <= frame_idx <= foul_window_end)
-            and (frame_idx in foul_window_boxes)
-        )
-
-        if draw_foul_boxes:
-            fdata = foul_window_boxes[frame_idx]
-            fx1, fy1, fx2, fy2 = fdata["off_box"]
-            dx1, dy1, dx2, dy2 = fdata["def_box"]
-            ux1, uy1, ux2, uy2 = fdata["union_box"]
-            vert_deg = float(fdata.get("vert_deg", 25.0))
-            cur_contact = float(fdata.get("contact", 0.85))
-
-            # 1. Offensive Shooter/Driver Box (Cyan/Gold)
-            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 2)
-            otag = f"Offense: {disadvantaged} ({off_num_str}, {off_team_str})"
-            (otw, oth), _ = cv2.getTextSize(otag, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-            cv2.rectangle(frame, (fx1, max(0, fy1 - oth - 4)), (min(frame_w - 2, fx1 + otw + 8), fy1), (255, 200, 0), -1)
-            cv2.putText(frame, otag, (fx1 + 4, max(12, fy1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
-
-            # 2. Contesting Defender Box (Orange)
-            cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 165, 255), 2)
-            dtag = f"Defense: {committing} ({def_num_str}, {def_team_str})"
-            (dtw, dth), _ = cv2.getTextSize(dtag, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-            cv2.rectangle(frame, (dx1, max(0, dy1 - dth - 4)), (min(frame_w - 2, dx1 + dtw + 8), dy1), (0, 165, 255), -1)
-            cv2.putText(frame, dtag, (dx1 + 4, max(12, dy1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
-
-            # Center physical interaction line
-            fcx, fcy = (fx1 + fx2) // 2, (fy1 + fy2) // 2
-            dcx, dcy = (dx1 + dx2) // 2, (dy1 + dy2) // 2
-            cv2.line(frame, (fcx, fcy), (dcx, dcy), (0, 0, 255), 2, cv2.LINE_AA)
-
-            # Defender Verticality Guideline (Legal 90-degree normal vs contest angle)
-            vert_color = (0, 220, 0) if vert_deg < 18.0 else (40, 60, 255)
-            cv2.line(frame, (dcx, dy2), (dcx, max(0, dy1 - 15)), (160, 160, 160), 1, cv2.LINE_AA)
-            cv2.putText(
-                frame,
-                f"Vert: {vert_deg:.1f}deg {'[LEGAL]' if vert_deg < 18.0 else '[BREACH]'}",
-                (dx1 + 4, min(frame_h - 10, dy2 + 16)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                vert_color,
-                1,
-                cv2.LINE_AA,
-            )
-
-            # 3. Main Enclosing Bounding Box (Bold Red)
-            cv2.rectangle(frame, (ux1, uy1), (ux2, uy2), (0, 0, 225), 4)
-
-            # Main Tag above the enclosing box
-            tag_y = max(34, uy1 - 10)
-            cur_tag_text = f"*** FOUL DETECTED: {call_type} ***"
-            (tw, th), _ = cv2.getTextSize(cur_tag_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-            cv2.rectangle(
-                frame,
-                (ux1, tag_y - th - 8),
-                (min(frame_w - 4, ux1 + tw + 14), tag_y + 4),
-                (0, 0, 225),
-                -1,
-            )
-            cv2.putText(
-                frame,
-                cur_tag_text,
-                (ux1 + 6, tag_y - 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        else:
-            # NO BOXES DRAWN! Clean broadcast view
-            cur_contact = 0.15
-            vert_deg = 8.0
-
-        # Dynamic state & broadcast replay bug styling:
-        if not is_foul:
-            cur_status_text = "● LEGAL DEFENSE | PLAY ON"
-            cur_status_color = (0, 220, 0)      # Bright Green
-        else:
-            if frame_idx < foul_window_start:
-                cur_status_text = f"● REVIEWING PLAY | {call_type.upper()}"
-                cur_status_color = (0, 205, 255)  # Amber / Cyan
-            elif frame_idx <= foul_window_end:
-                cur_status_text = f"● FOUL DETECTED | {call_type.upper()} ({foul_time_sec:.2f}s)"
-                cur_status_color = (40, 60, 255)  # Bright Red
-            else:
-                cur_status_text = f"● WHISTLE CONFIRMED | {call_type.upper()}"
-                cur_status_color = (40, 60, 255)  # Bright Red
-
-        if committing != "Unknown" or disadvantaged != "Unknown":
-            matchup_text = f"DEF: {committing} ({def_num_str}, {def_team_str})  vs  OFF: {disadvantaged} ({off_num_str}, {off_team_str})"
-        else:
-            matchup_text = f"CALL: {call_type}  |  CONFIDENCE: {foul_prob * 100:.1f}%"
-
-        # 4. Top-left Sleek Broadcast Replay HUD (Compact 2-line badge)
-        (tw1, _), _ = cv2.getTextSize(cur_status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
-        (tw2, _), _ = cv2.getTextSize(matchup_text, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
-        hud_w = max(460, max(tw1, tw2) + 38)
-        hud_h = 62
-
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (18, 18), (18 + hud_w, 18 + hud_h), (18, 18, 18), -1)
-        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-        # Left status accent stripe
-        cv2.rectangle(frame, (18, 18), (24, 18 + hud_h), cur_status_color, -1)
-        # Subtle crisp border
-        cv2.rectangle(frame, (18, 18), (18 + hud_w, 18 + hud_h), (50, 50, 50), 1)
-
-        cv2.putText(
-            frame,
-            cur_status_text,
-            (36, 42),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            cur_status_color,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            matchup_text,
-            (36, 65),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.44,
-            (235, 235, 235),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # 5. Sleek Bottom Timeline Progress Bar
-        bar_x1 = 30
-        bar_x2 = frame_w - 30
-        bar_y1 = frame_h - 26
-        bar_y2 = frame_h - 12
-        bar_w = bar_x2 - bar_x1
-
-        # Background track
-        cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (25, 25, 25), -1)
-
-        # Timeline segments
-        if is_foul and foul_frame < total_video_frames:
-            w_start_x = max(bar_x1, bar_x1 + int(bar_w * (float(foul_window_start) / float(total_video_frames))))
-            w_end_x = min(bar_x2, bar_x1 + int(bar_w * (float(foul_window_end) / float(total_video_frames))))
-            split_x = max(bar_x1, min(bar_x2, bar_x1 + int(bar_w * (float(foul_frame) / float(total_video_frames)))))
-            cv2.rectangle(frame, (bar_x1, bar_y1), (w_start_x, bar_y2), (0, 160, 0), -1)
-            cv2.rectangle(frame, (w_start_x, bar_y1), (w_end_x, bar_y2), (40, 60, 255), -1)
-            cv2.rectangle(frame, (w_end_x, bar_y1), (bar_x2, bar_y2), (180, 50, 0), -1)
-            cv2.line(frame, (split_x, bar_y1 - 6), (split_x, bar_y2 + 2), (255, 255, 255), 2)
-            w_label = f"FOUL APEX: {foul_time_sec:.2f}s"
-            cv2.putText(frame, w_label, (max(bar_x1, split_x - 55), bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (40, 60, 255), 1, cv2.LINE_AA)
-        else:
-            cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (0, 180, 0), -1)
-            cv2.putText(frame, "LEGAL PLAY (NO FOUL)", (bar_x1 + 10, bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 0), 1, cv2.LINE_AA)
-
-        # Current scrubbing playhead pip
-        curr_x = bar_x1 + int(bar_w * (float(frame_idx) / float(max(1, total_video_frames - 1))))
-        curr_x = max(bar_x1, min(bar_x2, curr_x))
-        cv2.circle(frame, (curr_x, (bar_y1 + bar_y2) // 2), 6, (0, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(frame, (curr_x, (bar_y1 + bar_y2) // 2), 7, (20, 20, 20), 1, cv2.LINE_AA)
-
-        # Timeline Labels
-        t_label = f"{float(frame_idx) / max(1.0, fps):.1f}s / {float(total_video_frames) / max(1.0, fps):.1f}s"
-        cv2.putText(frame, t_label, (bar_x2 - 110, bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
-
-        writer.write(frame)
-        frame_idx += 1
-
-    cap.release()
-    writer.release()
-
-    # Optional faststart remux with ffmpeg so QuickTime/macOS can play cleanly
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin and final_output_path.exists():
-        tmp_h264 = final_output_path.with_name(f"{final_output_path.stem}_h264.mp4")
-        remux_cmd = [
-            ffmpeg_bin,
-            "-y",
-            "-i",
-            str(final_output_path),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-loglevel",
-            "error",
-            str(tmp_h264),
-        ]
-        res = subprocess.run(remux_cmd, check=False)
-        if res.returncode == 0 and tmp_h264.exists() and tmp_h264.stat().st_size > 1000:
-            tmp_h264.replace(final_output_path)
+            with open(decisions_json_path, "r", encoding="utf-8") as jf:
+                loaded = json.load(jf)
+                if isinstance(loaded, dict):
+                    all_decisions = loaded
+        except Exception:
+            all_decisions = {}
+    all_decisions[resolved_video.stem] = decision_report
+    try:
+        with open(decisions_json_path, "w", encoding="utf-8") as jf:
+            json.dump(all_decisions, jf, indent=2)
+    except Exception as exc:
+        logger.debug("Could not write referee_decisions.json: %s", exc)
 
     logger.info("Saved annotated prediction video (%d frames) -> %s", frame_idx, final_output_path)
+    if return_details:
+        return decision_report
     return foul_prob
 
 
@@ -1961,17 +2118,19 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
             best_f1 = metrics["f1"]
             best_roc_auc = metrics["roc_auc"]
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "metrics": metrics,
-                    "optimal_threshold": metrics["threshold"],
-                    "val_loss": val_loss,
-                },
-                ckpt_path,
-            )
+            ckpt_payload = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "metrics": metrics,
+                "optimal_threshold": metrics["threshold"],
+                "val_loss": val_loss,
+            }
+            torch.save(ckpt_payload, ckpt_path)
+            weights_ckpt = BASE_DIR / "weights" / "best_foul_r2plus1d.pt"
+            if weights_ckpt.resolve() != ckpt_path.resolve():
+                weights_ckpt.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(ckpt_payload, weights_ckpt)
             logger.info(
                 "Saved new best foul checkpoint -> %s (F1=%.3f, ROC-AUC=%.3f, threshold=%.2f)",
                 ckpt_path,

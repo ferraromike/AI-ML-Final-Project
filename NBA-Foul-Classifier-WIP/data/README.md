@@ -85,14 +85,12 @@ All 123 processed samples are indexed in `data/processed/visual_embeddings_cache
 
 ## 5. Annotated Video Output (`data/annotated/`)
 
-Annotated videos exported into `data/annotated/<play_id>_annotated.mp4` deliver referee-grade evaluation:
-1. **Disputed Play Enclosing Box**: A unified smoothed bounding box encloses **ALL players involved** (`player_disadvantaged` shooter and `player_committing` defender) across 100% of video frames.
-2. **Bidirectional Court Player Tracking & Official Exclusion**:
-   - *Active Floor Constraint*: Geometric filter ($y_2 \le 0.72 \times \text{frame\_h}$, $y_{\text{center}} \in [0.25H, 0.68H]$, $x_{\text{center}} \in [0.12W, 0.80W]$) strictly eliminates foreground referees (e.g. Referee #43), sideline bench personnel, and baseline photographers.
-   - *Action Tube Anchor*: Locks onto shooter and defender at peak contact frame, tracking bidirectionally with speed-gated bipartite matching (`max_d = 160 px`) and mutual exclusion.
-3. **Dynamic Color Transition**: The box is **GREEN** with `LEGAL PLAY | NO FOUL` until frame $t_{\text{foul}}$ where contact surges into illegal impact, at which point the box **TURNS RED** with `*** FOUL DETECTED: {call_type} ({player_committing} on {player_disadvantaged}) ***`.
-4. **Top-Left HUD Stats Panel**:
-   - `STATUS`: Dynamic green indicator before foul $\to$ bright red indicator at and after foul (`*** FOUL CALLED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***`).
-   - `WHAT FOUL`: Explicit foul call type (`Shooting Foul`, `Personal Foul`).
-   - `WHO FOULED WHO`: Explicit player matchup (`Dalen Terry fouled Ricky Council IV`, `Josh Giddey fouled Tyrese Maxey`).
-   - `TELEMETRY`: Displays `P(FOUL)`, calibrated threshold, L2M review decision (`INC`, `CC`, `CNC`), and per-frame mechanical contact intensity.
+Annotated videos exported into `data/annotated/<play_id>_annotated.mp4` act as an **AI Referee**:
+1. **When a Foul Occurs (`is_foul == True`)**:
+   - **WHAT Foul It Is**: Displays the predicted foul category & NBA Rule 12 infraction subtype (e.g., `Shooting Foul (Illegal Arm/Wrist Contact)`, `Shooting Foul (Landing Space Violation)`, `Personal Foul (Blocking / Cylinder Breach)`).
+   - **WHERE It Occurred**: Highlights the foul zone with a translucent red region and bold red box, individual Offense/Defense boxes, and a **Foul Contact Target Reticle** at the exact contact coordinates `(x, y)` with court zone classification (`Left Paint / Rim Area`, `Right Paint / Rim Area`, etc.).
+   - **WHEN It Occurred**: Displays the exact foul timestamp and frame (`WHEN: 04.74s (Frame 142)`) on the foul call header, top-left AI Referee Whistle Banner, and bottom timeline marker during the foul window.
+2. **When NO Foul Occurs (`is_foul == False`)**:
+   - **Nothing Happens**: When no foul occurs, nothing happens on the video (zero boxes, zero HUD banners, 100% clean unaltered game footage).
+3. **Structured Telemetry (`data/annotated/referee_decisions.json`)**:
+   - Persists each evaluated clip's `is_foul`, `foul_prob`, `what_foul`, `foul_subtype`, `foul_mechanic`, `when_frame`, `when_time_sec`, `when_str`, `where_zone`, `where_point`, and `where_box` for instant in-notebook inspection.

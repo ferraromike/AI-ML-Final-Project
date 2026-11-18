@@ -86,21 +86,14 @@ Directly grounded in NBA Rulebook mechanics (Rule 12: Fouls and Penalties — cy
 11. **`[10] momentum_transfer_shock`**: Sudden deceleration and physical collision jolt upon impact.
 12. **`[11] airborne_contest_apex_diff`**: Vertical contest elevation differential between players.
 
-### Dynamic Video Output & HUD Telemetry
-Exported annotated MP4 videos in `data/annotated/<play_id>_annotated.mp4` deliver professional referee-grade visualization:
-- **Disputed Play Enclosing Bounding Box**: Continuously encloses **ALL players involved** in the disputed play (`player_disadvantaged` shooter/driver and `player_committing` contesting defender) throughout 100% of the video.
-- **Bidirectional Court Player Tracking**:
-  - *Spectator Rejection Filter*: Eliminates seated audience and stands detections by enforcing court plane geometry ($y_2 > 0.38 \times \text{frame\_h}$, $y_1 > 0.15 \times \text{frame\_h}$, $0.10 \le h \le 0.55$, aspect ratio $\ge 0.95$).
-  - *Action Tube Anchor*: Identifies the disputed interaction at peak contact from the action tube ROI, anchoring onto the offensive driver and contesting defender.
-  - *Bidirectional Matching*: Propagates forward and backward frame-by-frame with optimal 2xK bipartite matching and mutual exclusion, preventing track collapse and ensuring both players remain locked across all 600 frames.
-- **Where & When Foul Occurs**: Pinpoints the exact frame $t_{\text{foul}}$ and timestamp where physical contact surges into illegal impact.
-- **Dynamic Color Switching**: Bounding box displays **GREEN** with tag `LEGAL PLAY | NO FOUL` until the foul occurs, at which point it **TURNS RED** with tag `*** FOUL DETECTED: {call_type} ({player_committing} on {player_disadvantaged}) ***`.
-- **Top-Left HUD Stats Overlay**:
-  - `STATUS`: Dynamic green indicator before foul $\to$ bright red indicator at and after foul (`*** FOUL CALLED AT FRAME {foul_frame} ({foul_time}s) ***`).
-  - `WHAT FOUL`: Explicit foul call type (e.g. `Shooting Foul`, `Personal Foul`).
-  - `WHO FOULED WHO`: Identifies the exact matchup (e.g. `Caleb Wilson fouled LeBron James`).
-  - `METRICS & TELEMETRY`: Displays `P(FOUL)`, calibrated threshold, L2M review decision (`CC`, `INC`, `CNC`), and per-frame mechanical contact intensity.
-  - `INDIVIDUAL HIGHLIGHTS`: Subtle individual badges for `Offense: {player}` (gold) and `Defense: {player}` (amber) with a physical collision vector connector.
+### Dynamic Video Output & AI Referee Officiating Behavior
+Exported annotated MP4 videos in `data/annotated/<play_id>_annotated.mp4` act as an autonomous **AI Referee**:
+- **When a Foul Occurs (`is_foul == True`)**:
+  1. **WHAT Foul It Is**: Classifies the specific foul call and NBA Rule 12 infraction mechanic (e.g., `Shooting Foul (Illegal Arm/Wrist Contact)`, `Shooting Foul (Landing Space Violation)`, `Personal Foul (Blocking / Cylinder Breach)`, `Personal Foul (Reach-In / Arm Contact)`).
+  2. **WHERE It Occurred**: Highlights the localized foul collision zone with a translucent red box, individual `Fouled Player (Offense)` and `Committing Player (Defense)` bounding boxes, a high-visibility **Foul Contact Target Reticle** at the exact contact pixel `(x, y)`, and the court zone description (`Left Paint / Rim Area`, `Right Paint / Rim Area`, `Top of Key / Perimeter`, etc.).
+  3. **WHEN It Occurred**: Displays the exact timestamp and frame number (`WHEN: 04.74s (Frame 142)`) on the foul call header, top-left AI Referee Whistle Banner, and bottom timeline marker during the localized foul impact window.
+- **When NO Foul Occurs (`is_foul == False`)**:
+  - **Nothing Happens**: When the AI Referee determines that defense was legal (`P(Foul) < threshold`), **nothing happens** on the video — zero bounding boxes, zero banners, and zero timeline overlays, preserving 100% clean unaltered game footage.
 
 ---
 

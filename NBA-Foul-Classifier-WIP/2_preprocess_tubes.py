@@ -24,6 +24,7 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 import argparse
 import csv
@@ -165,6 +166,133 @@ def compute_arm_elevation(kpts_xy: np.ndarray, box_h: float) -> float:
     return float(np.clip((shoulder_y - highest_wrist_y) / max(box_h * 0.5, 1.0), -1.0, 1.5))
 
 
+def detect_basketball_hsv(
+    bgr_frame: Optional[np.ndarray],
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> Optional[np.ndarray]:
+    """Detect the orange basketball in a downscaled BGR frame via HSV color and circularity."""
+    if bgr_frame is None or bgr_frame.size == 0:
+        return None
+    hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([5, 110, 95]), np.array([22, 255, 255]))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_pt: Optional[np.ndarray] = None
+    best_score = 0.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 36.0 <= area <= 2600.0:
+            perim = cv2.arcLength(cnt, True)
+            if perim > 0:
+                circ = 4.0 * np.pi * area / (perim * perim)
+                if circ >= 0.42 and (circ * area) > best_score:
+                    best_score = float(circ * area)
+                    (cx, cy), _ = cv2.minEnclosingCircle(cnt)
+                    best_pt = np.array([cx * scale_x, cy * scale_y], dtype=np.float32)
+    return best_pt
+
+
+def extract_player_torso_hsv(
+    bgr_frame: Optional[np.ndarray],
+    box_xyxy: np.ndarray,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> Tuple[float, float, float]:
+    """Return mean `(H, S, V)` of a player's torso crop in `bgr_frame`."""
+    if bgr_frame is None or bgr_frame.size == 0:
+        return 0.0, 50.0, 128.0
+    fh, fw = bgr_frame.shape[:2]
+    x1 = float(box_xyxy[0]) / max(scale_x, 1e-5)
+    y1 = float(box_xyxy[1]) / max(scale_y, 1e-5)
+    x2 = float(box_xyxy[2]) / max(scale_x, 1e-5)
+    y2 = float(box_xyxy[3]) / max(scale_y, 1e-5)
+    bh = max(1.0, y2 - y1)
+    bw = max(1.0, x2 - x1)
+    ty1 = max(0, min(fh - 1, int(y1 + 0.18 * bh)))
+    ty2 = max(ty1 + 1, min(fh, int(y1 + 0.52 * bh)))
+    tx1 = max(0, min(fw - 1, int(x1 + 0.22 * bw)))
+    tx2 = max(tx1 + 1, min(fw, int(x2 - 0.22 * bw)))
+    torso = bgr_frame[ty1:ty2, tx1:tx2]
+    if torso.size == 0:
+        return 0.0, 50.0, 128.0
+    hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    return (
+        float(np.mean(hsv[:, :, 0])),
+        float(np.mean(hsv[:, :, 1])),
+        float(np.mean(hsv[:, :, 2])),
+    )
+
+
+def is_referee_or_sideline_official(
+    bgr_frame: Optional[np.ndarray],
+    box_xyxy: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> bool:
+    """
+    Identify NBA referees and sideline officials by uniform signature (dark gray/black low-saturation shirt
+    + black trousers) and foreground/sideline court position.
+    """
+    x1, y1, x2, y2 = float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])
+    if bgr_frame is None or bgr_frame.size == 0:
+        return False
+    fh, fw = bgr_frame.shape[:2]
+    sx1, sy1 = x1 / max(scale_x, 1e-5), y1 / max(scale_y, 1e-5)
+    sx2, sy2 = x2 / max(scale_x, 1e-5), y2 / max(scale_y, 1e-5)
+    sbh, sbw = max(1.0, sy2 - sy1), max(1.0, sx2 - sx1)
+
+    ty1, ty2 = max(0, min(fh - 1, int(sy1 + 0.18 * sbh))), max(1, min(fh, int(sy1 + 0.48 * sbh)))
+    tx1, tx2 = max(0, min(fw - 1, int(sx1 + 0.22 * sbw))), max(1, min(fw, int(sx2 - 0.22 * sbw)))
+    ly1, ly2 = max(0, min(fh - 1, int(sy1 + 0.52 * sbh))), max(1, min(fh, int(sy1 + 0.86 * sbh)))
+    lx1, lx2 = max(0, min(fw - 1, int(sx1 + 0.24 * sbw))), max(1, min(fw, int(sx2 - 0.24 * sbw)))
+
+    torso = bgr_frame[ty1:ty2, tx1:tx2]
+    lower = bgr_frame[ly1:ly2, lx1:lx2]
+    if torso.size == 0 or lower.size == 0:
+        return False
+
+    thsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    lhsv = cv2.cvtColor(lower, cv2.COLOR_BGR2HSV)
+    ts, tv = float(np.mean(thsv[:, :, 1])), float(np.mean(thsv[:, :, 2]))
+    ls, lv = float(np.mean(lhsv[:, :, 1])), float(np.mean(lhsv[:, :, 2]))
+
+    # Referee dark gray shirt + black trousers
+    if tv < 92.0 and ts < 78.0 and lv < 88.0:
+        return True
+    # Foreground sideline official standing at bottom edge of court
+    if y1 >= frame_h * 0.58 and y2 >= frame_h * 0.82 and ts < 75.0 and tv < 140.0:
+        return True
+    return False
+
+
+def synthesize_box_keypoints(box_xyxy: np.ndarray) -> np.ndarray:
+    """
+    Generate a canonical 17-keypoint COCO skeleton `(17, 2)` from a player bounding box `[x1, y1, x2, y2]`
+    when a player under the rim is detected by YOLOv11 detection but partially occluded for pose NMS.
+    """
+    x1, y1, x2, y2 = float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])
+    w = max(4.0, x2 - x1)
+    h = max(8.0, y2 - y1)
+    cx = 0.5 * (x1 + x2)
+    kpts = np.zeros((17, 2), dtype=np.float32)
+    kpts[0] = [cx, y1 + 0.10 * h]                     # nose
+    kpts[5] = [cx - 0.22 * w, y1 + 0.22 * h]          # L_shoulder
+    kpts[6] = [cx + 0.22 * w, y1 + 0.22 * h]          # R_shoulder
+    kpts[7] = [cx - 0.34 * w, y1 + 0.35 * h]          # L_elbow
+    kpts[8] = [cx + 0.34 * w, y1 + 0.35 * h]          # R_elbow
+    kpts[9] = [cx - 0.38 * w, y1 + 0.28 * h]          # L_wrist
+    kpts[10] = [cx + 0.38 * w, y1 + 0.28 * h]         # R_wrist
+    kpts[11] = [cx - 0.16 * w, y1 + 0.52 * h]         # L_hip
+    kpts[12] = [cx + 0.16 * w, y1 + 0.52 * h]         # R_hip
+    kpts[13] = [cx - 0.16 * w, y1 + 0.72 * h]         # L_knee
+    kpts[14] = [cx + 0.16 * w, y1 + 0.72 * h]         # R_knee
+    kpts[15] = [cx - 0.16 * w, y1 + 0.92 * h]         # L_ankle
+    kpts[16] = [cx + 0.16 * w, y1 + 0.92 * h]         # R_ankle
+    return kpts
+
+
 def analyze_foul_interaction_frame(
     pose_res,
     det_res,
@@ -172,6 +300,7 @@ def analyze_foul_interaction_frame(
     frame_h: int,
     scale_x: float = 1.0,
     scale_y: float = 1.0,
+    bgr_frame: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """
     Analyze player bounding boxes and 17-point human pose skeletons to:
@@ -186,68 +315,98 @@ def analyze_foul_interaction_frame(
     )
     feats = np.zeros(NUM_FOUL_FEATURES, dtype=np.float32)
 
-    active_res = pose_res if (pose_res is not None and pose_res.boxes is not None and len(pose_res.boxes) > 0) else det_res
-    if active_res is None or active_res.boxes is None or len(active_res.boxes) == 0:
+    merged_boxes_list: List[np.ndarray] = []
+    merged_kpts_list: List[np.ndarray] = []
+
+    if pose_res is not None and pose_res.boxes is not None and len(pose_res.boxes) > 0:
+        p_xyxy = pose_res.boxes.xyxy.cpu().numpy().astype(np.float32)
+        p_xyxy[:, [0, 2]] *= scale_x
+        p_xyxy[:, [1, 3]] *= scale_y
+        p_cls = pose_res.boxes.cls.cpu().numpy().astype(int)
+        p_conf = pose_res.boxes.conf.cpu().numpy().astype(np.float32)
+        p_mask = (p_cls == COCO_PERSON_CLS) & (p_conf >= 0.10)
+        p_boxes = p_xyxy[p_mask]
+
+        has_kpts = (
+            getattr(pose_res, "keypoints", None) is not None
+            and pose_res.keypoints.xy is not None
+            and len(pose_res.keypoints.xy) == len(p_xyxy)
+        )
+        if has_kpts:
+            p_kpts = pose_res.keypoints.xy.cpu().numpy().astype(np.float32)[p_mask]
+            p_kpts[:, :, 0] *= scale_x
+            p_kpts[:, :, 1] *= scale_y
+        else:
+            p_kpts = np.stack([synthesize_box_keypoints(b) for b in p_boxes], axis=0) if len(p_boxes) > 0 else np.empty((0, 17, 2), dtype=np.float32)
+
+        for b_idx in range(len(p_boxes)):
+            merged_boxes_list.append(p_boxes[b_idx])
+            merged_kpts_list.append(p_kpts[b_idx])
+
+    # Supplement with high-confidence det_res person boxes that pose_res missed due to collision occlusion
+    if det_res is not None and det_res.boxes is not None and len(det_res.boxes) > 0:
+        d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
+        d_xyxy[:, [0, 2]] *= scale_x
+        d_xyxy[:, [1, 3]] *= scale_y
+        d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
+        d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
+        d_mask = (d_cls == COCO_PERSON_CLS) & (d_conf >= 0.32)
+        d_boxes = d_xyxy[d_mask]
+
+        for db in d_boxes:
+            if all(box_iou_single(db, mb) < 0.32 for mb in merged_boxes_list):
+                merged_boxes_list.append(db)
+                merged_kpts_list.append(synthesize_box_keypoints(db))
+
+    if not merged_boxes_list:
         return default_roi, 0.0, feats
 
-    xyxy = active_res.boxes.xyxy.cpu().numpy().astype(np.float32)
-    xyxy[:, [0, 2]] *= scale_x
-    xyxy[:, [1, 3]] *= scale_y
-    cls = active_res.boxes.cls.cpu().numpy().astype(int)
-    conf = active_res.boxes.conf.cpu().numpy().astype(np.float32)
+    player_boxes = np.stack(merged_boxes_list, axis=0).astype(np.float32)
+    kpts_all: Optional[np.ndarray] = np.stack(merged_kpts_list, axis=0).astype(np.float32)
 
-    person_mask = (cls == COCO_PERSON_CLS) & (conf >= 0.25)
-    player_boxes = xyxy[person_mask]
+    # Reject close-up camera shots (e.g. referee/player face close-ups before inbound or during dead-ball replay)
+    # In wide broadcast court views, player bounding box heights are <= 0.44 * frame_h.
+    if len(player_boxes) > 0:
+        all_bh = player_boxes[:, 3] - player_boxes[:, 1]
+        if float(np.max(all_bh)) > frame_h * 0.44:
+            return default_roi, 0.0, feats
 
-    kpts_all: Optional[np.ndarray] = None
-    if (
-        pose_res is not None
-        and getattr(pose_res, "keypoints", None) is not None
-        and pose_res.keypoints.xy is not None
-        and len(pose_res.keypoints.xy) == len(xyxy)
-    ):
-        raw_kpts = pose_res.keypoints.xy.cpu().numpy().astype(np.float32)[person_mask]
-        raw_kpts[:, :, 0] *= scale_x
-        raw_kpts[:, :, 1] *= scale_y
-        kpts_all = raw_kpts
-
-    # Filter court players: reject foreground sideline (referees, bench personnel, photographers)
-    # and background stands / ceiling. In broadcast basketball camera views, the active court floor
-    # spans y in [0.22*H, 0.68*H] with y2 <= 0.72*H.
+    # Filter court players: reject upper stands / ceiling and sideline referees while retaining active court floor.
     if len(player_boxes) > 0:
         cy = 0.5 * (player_boxes[:, 1] + player_boxes[:, 3])
         cx = 0.5 * (player_boxes[:, 0] + player_boxes[:, 2])
         bh = player_boxes[:, 3] - player_boxes[:, 1]
         bw = player_boxes[:, 2] - player_boxes[:, 0]
+        non_ref_mask = np.array(
+            [
+                not is_referee_or_sideline_official(
+                    bgr_frame, player_boxes[idx_p], frame_w, frame_h, scale_x=scale_x, scale_y=scale_y
+                )
+                for idx_p in range(len(player_boxes))
+            ],
+            dtype=bool,
+        )
         court_mask = (
-            (player_boxes[:, 3] <= frame_h * 0.72)
-            & (player_boxes[:, 1] >= frame_h * 0.15)
-            & (cy >= frame_h * 0.22)
-            & (cy <= frame_h * 0.68)
-            & (cx >= frame_w * 0.10)
-            & (cx <= frame_w * 0.90)
-            & (bh >= frame_h * 0.08)
-            & (bh <= frame_h * 0.55)
+            non_ref_mask
+            & (player_boxes[:, 3] >= frame_h * 0.44)
+            & (player_boxes[:, 3] <= frame_h * 0.89)
+            & (player_boxes[:, 1] >= frame_h * 0.22)
+            & (cy >= frame_h * 0.34)
+            & (cy <= frame_h * 0.80)
+            & (cx >= frame_w * 0.08)
+            & (cx <= frame_w * 0.92)
+            & (bh >= frame_h * 0.10)
+            & (bh <= frame_h * 0.42)
             & (bw >= frame_w * 0.02)
-            & (bw <= frame_w * 0.35)
-            & ((bh / np.maximum(bw, 1.0)) >= 0.90)
+            & (bw <= frame_w * 0.30)
+            & ((bh / np.maximum(bw, 1.0)) >= 0.80)
         )
         if int(np.sum(court_mask)) >= 2:
             player_boxes = player_boxes[court_mask]
             if kpts_all is not None:
                 kpts_all = kpts_all[court_mask]
-        elif int(np.sum(court_mask)) == 1:
-            player_boxes = player_boxes[court_mask]
-            if kpts_all is not None:
-                kpts_all = kpts_all[court_mask]
-        elif len(player_boxes) > 2:
-            box_heights = player_boxes[:, 3] - player_boxes[:, 1]
-            max_h = float(np.max(box_heights))
-            h_mask = box_heights >= (max_h * 0.38)
-            if int(np.sum(h_mask)) >= 2:
-                player_boxes = player_boxes[h_mask]
-                if kpts_all is not None:
-                    kpts_all = kpts_all[h_mask]
+        else:
+            return default_roi, 0.0, feats
 
     n_players = len(player_boxes)
     if n_players == 0:
@@ -272,6 +431,13 @@ def analyze_foul_interaction_frame(
                 [(best_b[0] + best_b[2]) * 0.5 * scale_x, (best_b[1] + best_b[3]) * 0.5 * scale_y],
                 dtype=np.float32,
             )
+    if ball_pt is None and bgr_frame is not None:
+        ball_pt = detect_basketball_hsv(bgr_frame, scale_x=scale_x, scale_y=scale_y)
+
+    player_hsv = [
+        extract_player_torso_hsv(bgr_frame, player_boxes[i], scale_x=scale_x, scale_y=scale_y)
+        for i in range(n_players)
+    ]
 
     centers = np.column_stack(
         [
@@ -316,11 +482,21 @@ def analyze_foul_interaction_frame(
                 pair_mid = 0.5 * (centers[i] + centers[j])
                 ball_prox = max(0.0, 1.0 - float(np.linalg.norm(pair_mid - ball_pt)) / max(diag * 0.25, 1.0))
 
+            # Team jersey color separation bonus (opposing teams vs teammates)
+            team_contrast_bonus = 0.0
+            if bgr_frame is not None:
+                hi, si, vi = player_hsv[i]
+                hj, sj, vj = player_hsv[j]
+                dh = min(abs(hi - hj), 180.0 - abs(hi - hj))
+                color_diff = abs(vi - vj) + 0.75 * abs(si - sj) + 1.1 * dh
+                team_contrast_bonus = 0.22 if color_diff >= 30.0 else -0.18
+
             pair_score = (
-                0.45 * norm_arm_upper
-                + 0.25 * norm_torso
+                0.42 * norm_arm_upper
+                + 0.23 * norm_torso
                 + 0.20 * min(1.0, iou * 3.0)
-                + 0.10 * ball_prox
+                + 0.15 * ball_prox
+                + team_contrast_bonus
             )
             if pair_score > best_pair_score:
                 best_pair_score = pair_score
@@ -363,23 +539,29 @@ def analyze_foul_interaction_frame(
     union_y2 = max(float(box_a[3]), float(box_b[3]))
     roi_box = np.array([union_x1, union_y1, union_x2, union_y2], dtype=np.float32)
 
-    # 1. Arm Contact Intrusion (Defender hand/wrist striking shooter arm)
+    # 1. Arm Contact Intrusion (Defender hand/wrist striking shooter arm within physical contact radius)
     arms_off = valid_points(kpts_off, ARM_CONTACT_KPTS) if kpts_off is not None else np.empty((0, 2))
     arms_def = valid_points(kpts_def, ARM_CONTACT_KPTS) if kpts_def is not None else np.empty((0, 2))
     arm_dist = min_point_set_distance(arms_off, arms_def, arm_to_arm_dist)
-    arm_contact_val = float(np.clip(1.0 - (arm_dist / max(h_off * 0.40, 1.0)), 0.0, 1.0))
+    arm_contact_val = float(np.clip(1.0 - (arm_dist / max(h_off * 0.24, 1.0)), 0.0, 1.0))
 
     # 2. Body Cylinder Penetration (Defender invading offensive established space)
     torso_off = valid_points(kpts_off, TORSO_KPTS) if kpts_off is not None else np.empty((0, 2))
     torso_def = valid_points(kpts_def, TORSO_KPTS) if kpts_def is not None else np.empty((0, 2))
     torso_d = min_point_set_distance(torso_off, torso_def, torso_dist)
-    cylinder_pen_val = float(np.clip(0.55 * (1.0 - torso_d / max(h_off * 0.65, 1.0)) + 0.45 * min(1.0, pair_iou * 2.5), 0.0, 1.0))
+    cylinder_pen_val = float(
+        np.clip(
+            0.50 * (1.0 - torso_d / max(h_off * 0.34, 1.0)) + 0.50 * min(1.0, pair_iou * 2.4),
+            0.0,
+            1.0,
+        )
+    )
 
     # 3. Lower Body Landing Violation (Defender undercut in shooter landing zone)
     feet_off = valid_points(kpts_off, (13, 14, 15, 16)) if kpts_off is not None else np.empty((0, 2))
     feet_def = valid_points(kpts_def, (13, 14, 15, 16)) if kpts_def is not None else np.empty((0, 2))
     feet_dist = min_point_set_distance(feet_off, feet_def, 0.5 * (h_off + h_def))
-    landing_violation_val = float(np.clip(1.0 - (feet_dist / max(h_off * 0.45, 1.0)), 0.0, 1.0))
+    landing_violation_val = float(np.clip(1.0 - (feet_dist / max(h_off * 0.26, 1.0)), 0.0, 1.0))
 
     # 4. Defender Verticality Angle (Deviation from legal 90-degree vertical contest)
     sh_def = valid_points(kpts_def, (5, 6)) if kpts_def is not None else np.empty((0, 2))
@@ -417,15 +599,8 @@ def analyze_foul_interaction_frame(
     else:
         ball_shooter_val = 0.50
 
-    # 9. Ball Strike vs Body Ratio (Clean play on ball vs illegal body collision)
-    if ball_pt is not None:
-        c_def = 0.5 * (box_def[:2] + box_def[2:])
-        c_off = 0.5 * (box_off[:2] + box_off[2:])
-        d_ball = float(np.linalg.norm(c_def - ball_pt))
-        d_body = float(np.linalg.norm(c_def - c_off))
-        ball_ratio_val = float(np.clip(d_ball / max(d_body + 1.0, 1.0), 0.0, 1.0))
-    else:
-        ball_ratio_val = 0.35
+    # 9. Ball Strike vs Body Ratio (Body collision severity relative to clean play on ball)
+    ball_ratio_val = float(np.clip(cylinder_pen_val * (1.0 - 0.5 * def_ball_val), 0.0, 1.0))
 
     # 10. Relative Closing Velocity
     closing_vel_val = 0.50
@@ -433,16 +608,14 @@ def analyze_foul_interaction_frame(
     # 11. Momentum Transfer Shock
     momentum_shock_val = float(np.clip(pair_iou * 1.2, 0.0, 1.0))
 
-    # 12. Airborne Contest Apex Differential
-    apex_diff_val = float(np.clip(0.5 + 0.5 * (elev_off - elev_def), 0.0, 1.0))
-
-    # Composite physical contact score
+    # 12. Composite Physical Contact & Contest Apex Score
     physical_contact_score = float(
         0.35 * arm_contact_val
         + 0.30 * cylinder_pen_val
         + 0.20 * landing_violation_val
         + 0.15 * verticality_val
     )
+    apex_diff_val = float(np.clip(0.75 * physical_contact_score + 0.25 * max(0.0, elev_off), 0.0, 1.0))
 
     feats[0] = arm_contact_val
     feats[1] = cylinder_pen_val
@@ -502,6 +675,22 @@ def smooth_boxes_ema(boxes: np.ndarray, alpha: float = 0.35) -> np.ndarray:
     return backward
 
 
+_CACHED_DET_MODEL: Optional[object] = None
+
+
+def get_cached_det_model() -> Optional[object]:
+    """Lazily load and cache `yolo11n.pt` object detector to supplement wide-court player and ball detection."""
+    global _CACHED_DET_MODEL
+    if _CACHED_DET_MODEL is None and YOLO is not None:
+        det_path = resolve_project_path("yolo11n.pt")
+        if det_path.exists():
+            try:
+                _CACHED_DET_MODEL = YOLO(str(det_path))
+            except Exception:
+                _CACHED_DET_MODEL = None
+    return _CACHED_DET_MODEL
+
+
 def extract_action_tube(
     video_path: Path | str,
     det_model: Optional[object] = None,
@@ -510,17 +699,18 @@ def extract_action_tube(
     num_frames: int = 16,
     crop_size: int = 224,
     device: str = "cpu",
-    max_live_play_sec: float = 15.0,
-    max_scan_samples: int = 12,
+    max_live_play_sec: float = 22.0,
+    max_scan_samples: int = 16,
     yolo_batch_size: int = 4,
     **kwargs,
 ) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
     """
     Cross-Platform Memory-Safe & Deadlock-Free Action-Tube Extractor:
-      1. Caps live-play scanning to the first `max_live_play_sec` (15.0s) so multi-minute
-         replay review clips never exhaust RAM on 8GB laptops.
-      2. Decodes at most `max_scan_samples` (12) downscaled `640x360` frames and calls
-         `cap.release()` BEFORE running YOLOv11-pose in micro-batches (`yolo_batch_size=4`).
+      1. Caps live-play scanning to the first `max_live_play_sec` (22.0s) so multi-minute
+         replay review clips never exhaust RAM on 8GB laptops while covering the full
+         ~20s live-action broadcast play window.
+      2. Decodes downscaled `960x540` frames and calls `cap.release()` BEFORE running
+         YOLOv11-pose in micro-batches (`yolo_batch_size=4`).
       3. Reopens the video after YOLO completes to read ONLY the 16 sampled frames in the
          1.5s window around peak foul contact.
     """
@@ -531,6 +721,7 @@ def extract_action_tube(
     primary_pose = pose_model if pose_model is not None else det_model
     if primary_pose is None:
         raise ValueError("At least one YOLO model (pose_model or det_model) must be provided.")
+    active_det = det_model if det_model is not None else get_cached_det_model()
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -543,20 +734,24 @@ def extract_action_tube(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
 
-    max_horizon_frames = max(int(round(fps * max_live_play_sec)), num_frames * 2)
+    effective_horizon_sec = max(float(max_live_play_sec), 22.0)
+    max_horizon_frames = max(int(round(fps * effective_horizon_sec)), num_frames * 2)
     effective_total = min(reported_frames, max_horizon_frames) if reported_frames > 0 else max_horizon_frames
 
-    scan_start = int(effective_total * 0.12) if effective_total > 40 else 0
-    scan_end = int(effective_total * 0.88) if effective_total > 40 else max(effective_total - 1, 1)
+    scan_start = int(round(fps * 0.8)) if effective_total > 60 else 0
+    scan_end = int(effective_total * 0.96) if effective_total > 60 else max(effective_total - 1, 1)
+    effective_sec = float(max(1, scan_end - scan_start)) / max(fps, 1.0)
+    adaptive_samples = int(np.clip(round(effective_sec * 1.9), 18, 48))
+    num_scan_pts = max(int(max_scan_samples), adaptive_samples)
     target_scan_set = set(
-        np.linspace(scan_start, scan_end, num=min(max_scan_samples, max(scan_end - scan_start + 1, 1)))
+        np.linspace(scan_start, scan_end, num=min(num_scan_pts, max(scan_end - scan_start + 1, 1)))
         .round()
         .astype(int)
         .tolist()
     )
     max_scan_frame = max(target_scan_set) if target_scan_set else 0
 
-    scan_w, scan_h = 640, 360
+    scan_w, scan_h = 960, 540
     scale_x = float(frame_w) / float(scan_w)
     scale_y = float(frame_h) / float(scan_h)
 
@@ -570,7 +765,8 @@ def extract_action_tube(
             ret, frame = cap.read()
             if not ret:
                 break
-            small_bgr_frames.append(cv2.resize(frame, (scan_w, scan_h), interpolation=cv2.INTER_LINEAR))
+            small_frame = cv2.resize(frame, (scan_w, scan_h), interpolation=cv2.INTER_LINEAR)
+            small_bgr_frames.append(small_frame)
             scanned_frames.append(frame_idx)
         else:
             if not cap.grab():
@@ -595,19 +791,32 @@ def extract_action_tube(
             batch_frames = small_bgr_frames[b_start : b_start + batch_sz]
             pose_results = primary_pose.predict(
                 batch_frames,
-                conf=0.25,
-                imgsz=480,
+                conf=0.10,
+                imgsz=768,
                 verbose=False,
                 device=yolo_device,
             )
-            for pose_res in pose_results:
+            det_results = (
+                active_det.predict(
+                    batch_frames,
+                    conf=0.10,
+                    imgsz=768,
+                    classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
+                    verbose=False,
+                    device=yolo_device,
+                )
+                if (active_det is not None and active_det is not primary_pose)
+                else [None] * len(batch_frames)
+            )
+            for b_offset, (pose_res, det_res) in enumerate(zip(pose_results, det_results)):
                 roi, score, feat_vec = analyze_foul_interaction_frame(
                     pose_res=pose_res,
-                    det_res=None,
+                    det_res=det_res,
                     frame_w=frame_w,
                     frame_h=frame_h,
                     scale_x=scale_x,
                     scale_y=scale_y,
+                    bgr_frame=batch_frames[b_offset],
                 )
                 scanned_rois.append(roi)
                 scanned_scores.append(score)
@@ -628,6 +837,10 @@ def extract_action_tube(
         raw_rois[:, c] = np.interp(all_idx_arr, scan_idx_arr, scan_rois_arr[:, c])
 
     contact_scores = np.interp(all_idx_arr, scan_idx_arr, np.array(scanned_scores, dtype=np.float32))
+    if scan_start > 0:
+        contact_scores[:scan_start] = 0.0
+    if len(scanned_frames) > 0 and scanned_frames[-1] + 1 < horizon_len:
+        contact_scores[scanned_frames[-1] + 1 :] = 0.0
     scan_feats_arr = np.stack(scanned_feats, axis=0)
     full_feats = np.zeros((horizon_len, NUM_FOUL_FEATURES), dtype=np.float32)
     for f_dim in range(NUM_FOUL_FEATURES):
@@ -798,8 +1011,8 @@ def preprocess_dataset(
     num_frames: int = 16,
     crop_size: int = 224,
     device: str = "auto",
-    max_live_play_sec: float = 15.0,
-    max_scan_samples: int = 12,
+    max_live_play_sec: float = 22.0,
+    max_scan_samples: int = 16,
     max_clips: int = 12,
     yolo_batch_size: int = 4,
     synthetic_fallback: bool = False,
@@ -885,8 +1098,12 @@ def preprocess_dataset(
         if out_tensor_path.exists() and video_path.exists() and video_path.stat().st_size > 10_240:
             try:
                 existing_pt = torch.load(out_tensor_path, map_location="cpu", weights_only=False)
-                if isinstance(existing_pt, dict) and existing_pt.get("is_synthetic", True):
-                    needs_reprocess = True
+                if isinstance(existing_pt, dict):
+                    if existing_pt.get("is_synthetic", True):
+                        needs_reprocess = True
+                    ff = existing_pt.get("foul_features")
+                    if isinstance(ff, torch.Tensor) and ff.numel() >= 4 and float(ff[:, :4].abs().max().item()) < 1e-4:
+                        needs_reprocess = True
             except Exception:
                 needs_reprocess = True
 
@@ -1047,14 +1264,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-live-play-sec",
         type=float,
-        default=15.0,
-        help="Max live-play horizon in seconds to scan per clip (default: 15.0, skipping replay reviews)",
+        default=22.0,
+        help="Max live-play horizon in seconds to scan per clip (default: 22.0, skipping post-play replay reviews)",
     )
     parser.add_argument(
         "--max-scan-samples",
         type=int,
-        default=12,
-        help="Max frames sampled during Pass 1 pose/contact detection (default: 12; increase to 24 for higher temporal resolution)",
+        default=16,
+        help="Max frames sampled during Pass 1 pose/contact detection (default: 16; increase to 24 for higher temporal resolution)",
     )
     parser.add_argument(
         "--device",

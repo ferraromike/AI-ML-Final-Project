@@ -229,8 +229,11 @@ weights/*.pt
 # Video Outputs & Datasets
 *_annotated.mp4
 data/annotated/*.mp4
+**/data/annotated/*
 data/raw/
 data/processed/
+**/data/raw/
+**/data/processed/
 
 # Test Data (Video files ignored to keep repo lean)
 *.mp4

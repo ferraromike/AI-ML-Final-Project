@@ -322,6 +322,21 @@ class L2MFoulDataset(Dataset):
                     if pt_file not in seen_paths:
                         discovered.append((pt_file, label))
                         seen_paths.add(pt_file)
+
+        # Exclude synthetic placeholder tensors when real broadcast action tubes are available
+        real_only: List[Tuple[Path, int]] = []
+        for pt_path, lbl in discovered:
+            if pt_path.suffix == ".pt" and pt_path.exists():
+                try:
+                    payload = load_torch_file_safe(pt_path, map_location="cpu")
+                    if isinstance(payload, dict) and payload.get("is_synthetic", False):
+                        continue
+                except Exception:
+                    pass
+            real_only.append((pt_path, lbl))
+
+        if len(real_only) >= 10:
+            return real_only
         return discovered
 
     def __len__(self) -> int:
@@ -341,7 +356,10 @@ class L2MFoulDataset(Dataset):
 
             if isinstance(payload, dict) and payload.get("foul_features") is not None:
                 pose_features = payload["foul_features"].float()
-                if pose_features.shape != (self.num_frames, POSE_FEATURES):
+                if (
+                    pose_features.shape != (self.num_frames, POSE_FEATURES)
+                    or float(pose_features[:, :4].abs().max().item()) < 1e-4
+                ):
                     pose_features = derive_motion_foul_features_from_rgb(video_frames)
             else:
                 pose_features = derive_motion_foul_features_from_rgb(video_frames)
@@ -463,6 +481,124 @@ class BiomechanicalFoulEncoder(nn.Module):
         return torch.cat([mean_pooled, max_pooled], dim=-1)              # (B, 256)
 
 
+FOUL_CALL_CATEGORIES = (
+    "Personal Foul",
+    "Shooting Foul",
+)
+
+
+def classify_foul_call_and_mechanic(
+    foul_features: torch.Tensor | np.ndarray,
+    shooting_foul_prob: Optional[float] = None,
+    call_type_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    AI Referee Rule 12 Foul Taxonomy & Biomechanical Infraction Classifier.
+    Analyzes the 12-D biomechanical feature sequence `(FRAMES, 12)` and neural `foul_type_head`
+    probability to determine:
+      - `what_foul`: Primary NBA call category ("Shooting Foul", "Personal Foul")
+      - `foul_subtype`: Detailed officiating call ("Shooting Foul (Arm/Wrist Contact)",
+        "Shooting Foul (Landing Space Violation)", "Personal Foul (Blocking / Cylinder Breach)",
+        "Personal Foul (Reach-In / Arm Contact)", etc.)
+      - `foul_mechanic`: NBA Rule 12 biomechanical explanation of the infraction
+      - `apex_frame_offset`: Index `[0 .. FRAMES-1]` of peak contact intensity within the tube
+    """
+    if isinstance(foul_features, torch.Tensor):
+        f_mat = foul_features.detach().cpu().numpy().astype(np.float32)
+    else:
+        f_mat = np.asarray(foul_features, dtype=np.float32)
+
+    if f_mat.ndim == 1:
+        f_mat = f_mat[None, :]
+
+    # Composite per-frame contact intensity across Rule 12 dimensions
+    frame_severity = (
+        0.32 * f_mat[:, 0]  # arm_contact_intrusion
+        + 0.30 * f_mat[:, 1]  # body_cylinder_penetration
+        + 0.18 * f_mat[:, 2]  # lower_body_landing_violation
+        + 0.12 * f_mat[:, 3]  # defender_verticality_angle
+        + 0.08 * f_mat[:, 5]  # offensive_displacement
+    )
+    if len(frame_severity) > 2:
+        t_norm = np.linspace(-1.0, 1.0, len(frame_severity), dtype=np.float32)
+        center_weight = 1.0 - 0.22 * (t_norm ** 2)
+        apex_idx = int(np.argmax(frame_severity * center_weight))
+    else:
+        apex_idx = int(np.argmax(frame_severity)) if len(frame_severity) > 0 else 0
+    apex_vec = f_mat[apex_idx]
+    mean_vec = np.mean(f_mat, axis=0)
+
+    arm_intrusion = float(0.6 * apex_vec[0] + 0.4 * mean_vec[0])
+    cylinder_pen = float(0.6 * apex_vec[1] + 0.4 * mean_vec[1])
+    landing_viol = float(0.6 * apex_vec[2] + 0.4 * mean_vec[2])
+    verticality_dev = float(0.6 * apex_vec[3] + 0.4 * mean_vec[3])
+    displacement = float(0.6 * apex_vec[5] + 0.4 * mean_vec[5])
+    def_ball_prox = float(mean_vec[6])
+    ball_shooter_prox = float(mean_vec[7])
+    body_vs_ball_ratio = float(mean_vec[8])
+    airborne_apex = float(0.6 * apex_vec[11] + 0.4 * mean_vec[11])
+
+    # Determine shooting act score from on-ball shooting gather/contest + airborne elevation + neural head
+    on_ball_shooting_act = 1.0 if (ball_shooter_prox >= 0.03 or def_ball_prox >= 0.08) else 0.0
+    bio_shooting_score = (
+        0.35 * on_ball_shooting_act
+        + 0.25 * airborne_apex
+        + 0.20 * landing_viol
+        + 0.20 * max(ball_shooter_prox, def_ball_prox)
+    )
+    if shooting_foul_prob is not None:
+        combined_shooting_score = 0.35 * float(shooting_foul_prob) + 0.65 * bio_shooting_score
+    else:
+        combined_shooting_score = bio_shooting_score
+
+    if call_type_hint and call_type_hint.strip() in ("Shooting Foul", "Personal Foul", "Loose Ball Foul", "Offensive Foul"):
+        what_foul = call_type_hint.strip()
+    else:
+        what_foul = "Shooting Foul" if (on_ball_shooting_act > 0.5 and combined_shooting_score >= 0.42) else "Personal Foul"
+
+    if what_foul == "Shooting Foul":
+        if arm_intrusion >= cylinder_pen and arm_intrusion >= 0.55:
+            foul_subtype = "Shooting Foul (Illegal Arm/Wrist Contact)"
+            foul_mechanic = "Rule 12B Sec II: Defender struck shooter's arm/wrist during upward shooting motion"
+        elif landing_viol >= 0.72 and airborne_apex >= 0.55:
+            foul_subtype = "Shooting Foul (Landing Space Violation)"
+            foul_mechanic = "Rule 12B Sec I: Defender encroached into airborne shooter's landing zone"
+        elif verticality_dev >= 0.35:
+            foul_subtype = "Shooting Foul (Verticality & Cylinder Breach)"
+            foul_mechanic = "Rule 12B Sec I: Defender broke 90-deg vertical plane into shooter's cylinder"
+        else:
+            foul_subtype = "Shooting Foul (Body Contact on Drive/Shot)"
+            foul_mechanic = "Rule 12B Sec II: Illegal lower/upper body contact displacing shooter on gather"
+    else:
+        if arm_intrusion >= cylinder_pen * 1.05 and arm_intrusion >= 0.58:
+            foul_subtype = "Personal Foul (Reach-In / Arm Contact)"
+            foul_mechanic = "Rule 12B Sec I: Illegal hand/arm reach-in contact across ball-handler"
+        elif cylinder_pen >= 0.55 or displacement >= 0.35:
+            foul_subtype = "Personal Foul (Blocking / Cylinder Breach)"
+            foul_mechanic = "Rule 12B Sec I: Defender failed to establish legal guarding position in drive path"
+        else:
+            foul_subtype = "Personal Foul (Illegal On-Ball Contact)"
+            foul_mechanic = "Rule 12B Sec I: Illegal defensive contact impeding offensive player's freedom of movement"
+
+    return {
+        "what_foul": what_foul,
+        "foul_subtype": foul_subtype,
+        "foul_mechanic": foul_mechanic,
+        "shooting_foul_score": float(combined_shooting_score),
+        "apex_frame_offset": apex_idx,
+        "peak_severity": float(frame_severity[apex_idx]) if len(frame_severity) > 0 else 0.0,
+        "metrics": {
+            "arm_contact_intrusion": round(arm_intrusion, 3),
+            "body_cylinder_penetration": round(cylinder_pen, 3),
+            "lower_body_landing_violation": round(landing_viol, 3),
+            "defender_verticality_angle": round(verticality_dev, 3),
+            "offensive_displacement": round(displacement, 3),
+            "body_vs_ball_ratio": round(body_vs_ball_ratio, 3),
+            "airborne_contest_apex_diff": round(airborne_apex, 3),
+        },
+    }
+
+
 class FoulClassifier3D(nn.Module):
     """
     Simplified, High-Capacity Dual-Stream Foul Classifier (~33.8M parameters):
@@ -519,6 +655,16 @@ class FoulClassifier3D(nn.Module):
             nn.Linear(classifier_hidden_dim // 2, 1),
         )
         self.classifier = self.classifier_head  # backward compatibility alias
+
+        # Auxiliary multi-task head predicting specific foul category (Shooting Foul vs Personal Foul)
+        self.foul_type_head = nn.Sequential(
+            nn.LayerNorm(self.combined_feature_dim),
+            nn.Dropout(p=dropout_p * 0.5),
+            nn.Linear(self.combined_feature_dim, classifier_hidden_dim // 2),
+            nn.LayerNorm(classifier_hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(classifier_hidden_dim // 2, 1),
+        )
         self.backbone_frozen = False
 
         if freeze_backbone:
@@ -539,6 +685,8 @@ class FoulClassifier3D(nn.Module):
             param.requires_grad = True
         for param in self.classifier_head.parameters():
             param.requires_grad = True
+        for param in self.foul_type_head.parameters():
+            param.requires_grad = True
         self.backbone_frozen = True
 
     def freeze_early_layers(self) -> None:
@@ -557,6 +705,7 @@ class FoulClassifier3D(nn.Module):
             self.video_backbone.layer4,
             self.pose_network,
             self.classifier_head,
+            self.foul_type_head,
         ):
             for param in module.parameters():
                 param.requires_grad = True
@@ -632,6 +781,91 @@ class FoulClassifier3D(nn.Module):
 
         pose_embedding = self.pose_network(active_pose)
         return torch.cat([video_embedding, pose_embedding], dim=-1)
+
+    @torch.no_grad()
+    def predict_referee_decision(
+        self,
+        video_frames: torch.Tensor,
+        pose_features: torch.Tensor,
+        threshold: float = 0.50,
+        call_type_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        End-to-end AI Referee decision engine:
+        1. Evaluates dual-stream neural network (3D ConvNet + 4-Head Temporal Pose Attention).
+        2. Evaluates Rule 12 biomechanical contact severity to calibrate borderline calls.
+        3. Determines whether a foul occurred (`is_foul`), confidence (`foul_prob`), and
+           what specific foul occurred (`what_foul`, `foul_subtype`, `foul_mechanic`).
+        """
+        self.eval()
+        combined = self.extract_features(video_frames, pose_features)
+        foul_logit = self.classifier_head(combined)
+        neural_prob = float(torch.sigmoid(foul_logit).squeeze().item())
+
+        type_logit = self.foul_type_head(combined)
+        shooting_prob = float(torch.sigmoid(type_logit).squeeze().item())
+
+        pose_single = pose_features[0] if pose_features.dim() == 3 else pose_features
+        foul_details = classify_foul_call_and_mechanic(
+            foul_features=pose_single,
+            shooting_foul_prob=shooting_prob,
+            call_type_hint=call_type_hint,
+        )
+
+        # Combine neural spatiotemporal probability with Rule 12 biomechanical contact & verticality evidence
+        m = foul_details["metrics"]
+        mean_vert_dev = float(pose_single[:, 3].mean().item())
+        mean_lat_sep = float(pose_single[:, 4].mean().item())
+        mean_disp = float(pose_single[:, 5].mean().item())
+        mean_def_ball = float(pose_single[:, 6].mean().item())
+        mean_off_ball = float(pose_single[:, 7].mean().item())
+        on_ball_contest = float(min(1.0, (mean_def_ball + mean_off_ball) * 2.2))
+
+        rule12_score = (
+            0.24 * m["arm_contact_intrusion"]
+            + 0.24 * m["body_cylinder_penetration"]
+            + 0.16 * min(1.0, mean_vert_dev * 2.8)
+            + 0.14 * min(1.0, mean_disp * 2.0)
+            + 0.22 * on_ball_contest
+        )
+        # NBA Rule 12 Off-Ball & Verticality Principle: discount incidental off-ball overlap or low-contact contests
+        incidental_offball_discount = (
+            0.14
+            if (
+                on_ball_contest < 0.12
+                and mean_vert_dev < 0.42
+                and (m["arm_contact_intrusion"] < 0.70 or m["body_cylinder_penetration"] < 0.65)
+            )
+            else 0.0
+        )
+
+        foul_prob = float(np.clip(0.74 * neural_prob + 0.26 * rule12_score - incidental_offball_discount, 0.0, 1.0))
+        is_foul = bool(foul_prob >= threshold)
+
+        if not is_foul:
+            return {
+                "is_foul": False,
+                "foul_prob": foul_prob,
+                "neural_prob": neural_prob,
+                "threshold": threshold,
+                "what_foul": "No Foul",
+                "foul_subtype": "No Foul (Legal Play / Clean Contest)",
+                "foul_mechanic": "Rule 12B: Defender maintained legal guarding position without illegal contact",
+                "apex_frame_offset": foul_details["apex_frame_offset"],
+                "metrics": m,
+            }
+
+        return {
+            "is_foul": True,
+            "foul_prob": foul_prob,
+            "neural_prob": neural_prob,
+            "threshold": threshold,
+            "what_foul": foul_details["what_foul"],
+            "foul_subtype": foul_details["foul_subtype"],
+            "foul_mechanic": foul_details["foul_mechanic"],
+            "apex_frame_offset": foul_details["apex_frame_offset"],
+            "metrics": m,
+        }
 
 
 # ==============================================================================
