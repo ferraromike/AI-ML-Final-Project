@@ -555,6 +555,202 @@ def lookup_player_profile(name: str) -> Dict[str, str]:
     return {"number": "", "team": "", "last_name": last, "color_hint": ""}
 
 
+def track_foul_players_in_foul_window(
+    video_path: Path,
+    pose_model: object,
+    foul_frame: int,
+    foul_window_start: int,
+    foul_window_end: int,
+    anchor_roi: Optional[Union[Tuple[int, int, int, int], List[int], np.ndarray]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    device: str = "cpu",
+    frame_w: int = 1920,
+    frame_h: int = 1080,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Localizes player tracking strictly to the foul event window [foul_window_start, foul_window_end].
+    Anchors directly at the peak contact frame (foul_frame) within the action tube ROI and tracks the
+    offensive driver and contesting defender bidirectionally, eliminating all cross-court drift and
+    spurious detections outside the foul.
+    Returns mapping of frame_idx -> {off_box, def_box, union_box, vert_deg, contact}.
+    """
+    foul_window_start = max(0, int(foul_window_start))
+    foul_window_end = max(foul_window_start + 1, int(foul_window_end))
+
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, foul_window_start)
+    window_frames: Dict[int, np.ndarray] = {}
+    for f in range(foul_window_start, foul_window_end + 1):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        window_frames[f] = frame
+    cap.release()
+
+    if not window_frames:
+        return {}
+
+    all_keys = sorted(window_frames.keys())
+    yolo_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else ("mps" if device == "mps" else "cpu")
+
+    frame_dets: Dict[int, List[Dict[str, Any]]] = {}
+    with torch.inference_mode():
+        for b_idx in range(0, len(all_keys), 16):
+            b_keys = all_keys[b_idx : b_idx + 16]
+            b_imgs = [window_frames[k] for k in b_keys]
+            preds = pose_model.predict(b_imgs, conf=0.10, imgsz=640, verbose=False, device=yolo_dev)
+            for k, res in zip(b_keys, preds):
+                cands = []
+                if res.boxes is not None and len(res.boxes) > 0:
+                    bxs = res.boxes.xyxy.cpu().numpy()
+                    cfs = res.boxes.conf.cpu().numpy()
+                    cls = res.boxes.cls.cpu().numpy().astype(int)
+                    kpts = res.keypoints.xy.cpu().numpy() if res.keypoints is not None else None
+                    for i, (b, c, cl) in enumerate(zip(bxs, cfs, cls)):
+                        if cl == 0:  # person
+                            bh = b[3] - b[1]
+                            bw = b[2] - b[0]
+                            cx = 0.5 * (b[0] + b[2])
+                            cy = 0.5 * (b[1] + b[3])
+                            if (
+                                b[1] >= frame_h * 0.12
+                                and b[3] <= frame_h * 0.98
+                                and bh >= frame_h * 0.08
+                                and (bh / max(bw, 1.0)) >= 0.70
+                            ):
+                                kp = kpts[i] if (kpts is not None and i < len(kpts)) else np.empty((0, 2))
+                                elev = 0.0
+                                vert_angle = 15.0
+                                if kp is not None and len(kp) >= 17:
+                                    sh = kp[[5, 6]]
+                                    wr = kp[[9, 10]]
+                                    valid_sh = sh[sh[:, 1] > 0]
+                                    valid_wr = wr[wr[:, 1] > 0]
+                                    if len(valid_sh) > 0 and len(valid_wr) > 0:
+                                        elev = float(max(0.0, (np.mean(valid_sh[:, 1]) - np.mean(valid_wr[:, 1])) / max(bh, 1.0)))
+                                        dx = float(np.mean(valid_wr[:, 0]) - np.mean(valid_sh[:, 0]))
+                                        dy = float(np.mean(valid_wr[:, 1]) - np.mean(valid_sh[:, 1]))
+                                        vert_angle = float(np.degrees(np.arctan2(abs(dx), max(abs(dy), 1.0))))
+                                cands.append({
+                                    "box": b.astype(np.float32),
+                                    "conf": float(c),
+                                    "kpts": kp,
+                                    "cx": cx,
+                                    "cy": cy,
+                                    "bw": bw,
+                                    "bh": bh,
+                                    "elev": elev,
+                                    "vert_angle": vert_angle,
+                                })
+                frame_dets[k] = cands
+
+    roi_cx = 0.5 * (anchor_roi[0] + anchor_roi[2]) if anchor_roi is not None else frame_w * 0.5
+    roi_cy = 0.5 * (anchor_roi[1] + anchor_roi[3]) if anchor_roi is not None else frame_h * 0.7
+
+    valid_f_candidates = [k for k in all_keys if len(frame_dets.get(k, [])) > 0]
+    if not valid_f_candidates:
+        return {}
+    f_anchor = min(valid_f_candidates, key=lambda k: abs(k - foul_frame))
+    anchor_cands = frame_dets.get(f_anchor, [])
+
+    if len(anchor_cands) >= 2:
+        anchor_cands.sort(key=lambda c: np.hypot(c["cx"] - roi_cx, c["cy"] - roi_cy))
+        p1 = anchor_cands[0]
+        p2 = min(anchor_cands[1:], key=lambda c: np.hypot(c["cx"] - p1["cx"], c["cy"] - p1["cy"]))
+        if p1["elev"] >= p2["elev"]:
+            b_off = p1["box"].copy()
+            b_def = p2["box"].copy()
+        else:
+            b_off = p2["box"].copy()
+            b_def = p1["box"].copy()
+    elif len(anchor_cands) == 1:
+        primary = anchor_cands[0]
+        p_box = primary["box"].copy()
+        b_off = p_box.copy()
+        b_def = p_box.copy()
+    else:
+        def_b = (
+            np.array(anchor_roi, dtype=np.float32)
+            if anchor_roi is not None
+            else np.array([frame_w * 0.35, frame_h * 0.40, frame_w * 0.65, frame_h * 0.85], dtype=np.float32)
+        )
+        b_off = def_b.copy()
+        b_def = def_b.copy()
+
+    def match_candidate(prev_box: np.ndarray, cands: List[Dict[str, Any]]) -> Tuple[np.ndarray, float]:
+        if not cands:
+            return prev_box.copy(), 22.0
+        px1, py1, px2, py2 = prev_box
+        p_area = max(1.0, (px2 - px1) * (py2 - py1))
+        pcx, pcy = 0.5 * (px1 + px2), 0.5 * (py1 + py2)
+        best_c = None
+        best_score = -1e9
+        for c in cands:
+            bx1, by1, bx2, by2 = c["box"]
+            ix1, iy1 = max(px1, bx1), max(py1, by1)
+            ix2, iy2 = min(px2, bx2), min(py2, by2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            c_area = max(1.0, (bx2 - bx1) * (by2 - by1))
+            iou = inter / max(1.0, p_area + c_area - inter)
+            dist = np.hypot(c["cx"] - pcx, c["cy"] - pcy)
+            score = iou * 3.0 - (dist / max(py2 - py1, 1.0)) * 1.2
+            if score > best_score:
+                best_score = score
+                best_c = c
+        if best_c is not None and best_score > -1.5:
+            return best_c["box"].copy(), best_c.get("vert_angle", 22.0)
+        return prev_box.copy(), 22.0
+
+    off_tracks: Dict[int, np.ndarray] = {f_anchor: b_off.copy()}
+    def_tracks: Dict[int, np.ndarray] = {f_anchor: b_def.copy()}
+    vert_tracks: Dict[int, float] = {f_anchor: 25.0}
+
+    # Forward tracking
+    cur_off, cur_def = b_off.copy(), b_def.copy()
+    for f in range(f_anchor + 1, foul_window_end + 1):
+        cands = frame_dets.get(f, [])
+        cur_off, _ = match_candidate(cur_off, cands)
+        cur_def, va = match_candidate(cur_def, cands)
+        off_tracks[f] = cur_off.copy()
+        def_tracks[f] = cur_def.copy()
+        vert_tracks[f] = va
+
+    # Backward tracking
+    cur_off, cur_def = b_off.copy(), b_def.copy()
+    for f in range(f_anchor - 1, foul_window_start - 1, -1):
+        cands = frame_dets.get(f, [])
+        cur_off, _ = match_candidate(cur_off, cands)
+        cur_def, va = match_candidate(cur_def, cands)
+        off_tracks[f] = cur_off.copy()
+        def_tracks[f] = cur_def.copy()
+        vert_tracks[f] = va
+
+    sorted_fs = sorted(off_tracks.keys())
+    off_arr = np.stack([off_tracks[f] for f in sorted_fs], axis=0)
+    def_arr = np.stack([def_tracks[f] for f in sorted_fs], axis=0)
+    off_smooth = smooth_boxes_ema(off_arr, alpha=0.35)
+    def_smooth = smooth_boxes_ema(def_arr, alpha=0.35)
+
+    result: Dict[int, Dict[str, Any]] = {}
+    pad_x, pad_y = 20.0, 18.0
+    for idx_f, f in enumerate(sorted_fs):
+        ob = off_smooth[idx_f]
+        db = def_smooth[idx_f]
+        ux1 = int(round(max(0.0, min(ob[0], db[0]) - pad_x)))
+        uy1 = int(round(max(0.0, min(ob[1], db[1]) - pad_y)))
+        ux2 = int(round(min(float(frame_w), max(ob[2], db[2]) + pad_x)))
+        uy2 = int(round(min(float(frame_h), max(ob[3], db[3]) + pad_y)))
+
+        result[f] = {
+            "off_box": (int(round(ob[0])), int(round(ob[1])), int(round(ob[2])), int(round(ob[3]))),
+            "def_box": (int(round(db[0])), int(round(db[1])), int(round(db[2])), int(round(db[3]))),
+            "union_box": (ux1, uy1, ux2, uy2),
+            "vert_deg": vert_tracks.get(f, 25.0),
+            "contact": 0.85,
+        }
+    return result
+
+
 def track_disputed_players_full_video(
     video_path: Path,
     pose_model: object,
@@ -1228,21 +1424,45 @@ def predict_single_clip(
     def_num_str = f"#{def_p['number']}" if def_p.get("number") else ""
     def_team_str = def_p.get("team") or "DEF"
 
-    # Track classification boxes across 100% of frames enclosing ALL players involved in the disputed interaction
-    all_players_boxes, full_contact_scores, focal_boxes, defender_boxes, focal_info = (
-        track_disputed_players_full_video(
+    # Load video dimensions & frame count
+    cap_info = cv2.VideoCapture(str(resolved_video))
+    total_video_frames = int(cap_info.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_w = int(cap_info.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    frame_h = int(cap_info.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    cap_info.release()
+
+    # Derive anchor hints and pinpoint foul apex frame
+    foul_frame = anchor_hint_f if anchor_hint_f is not None else (total_video_frames // 2)
+    foul_time_sec = float(foul_frame) / max(fps, 1.0)
+
+    # REWORKED TRACKING LOGIC:
+    # Bounding boxes ONLY appear when there is a foul, specifically during the localized foul event window!
+    foul_window_boxes: Dict[int, Dict[str, Any]] = {}
+    if is_foul:
+        window_pre = int(round(fps * 0.70))   # ~21 frames before contact apex
+        window_post = int(round(fps * 0.85))  # ~25 frames after contact apex
+        foul_window_start = max(0, foul_frame - window_pre)
+        foul_window_end = min(total_video_frames - 1, foul_frame + window_post)
+        logger.info(
+            "🏀 Foul detected! Localizing player tracking exclusively to foul impact window [%d, %d] (apex: %d, %.2fs)...",
+            foul_window_start, foul_window_end, foul_frame, foul_time_sec,
+        )
+        foul_window_boxes = track_foul_players_in_foul_window(
             video_path=resolved_video,
             pose_model=pose_model,
-            device=str(device),
-            scan_stride=3,
-            anchor_hint_frame=anchor_hint_f,
-            anchor_hint_roi=anchor_hint_box,
+            foul_frame=foul_frame,
+            foul_window_start=foul_window_start,
+            foul_window_end=foul_window_end,
+            anchor_roi=anchor_hint_box,
             metadata=play_meta,
+            device=str(device),
+            frame_w=frame_w,
+            frame_h=frame_h,
         )
-    )
-
-    total_video_frames = len(all_players_boxes)
-    contact_arr = np.array(full_contact_scores, dtype=np.float32)
+    else:
+        foul_window_start = 999999
+        foul_window_end = -1
+        logger.info("🏀 Clean legal defense detected (No Foul). Video replay will render cleanly without player bounding boxes.")
 
     # Load trained Referee RL Agent if available for sequential decision evaluation
     rl_agent = None
@@ -1266,37 +1486,7 @@ def predict_single_clip(
         except Exception as exc:
             logger.debug("RL trajectory eval fallback: %s", exc)
 
-    # Determine where and when a foul should be called:
-    # Pinpoint the exact frame (and timestamp) where physical contact surges into illegal impact during the disputed play.
-    if is_foul:
-        if anchor_hint_f is not None:
-            window_start = max(0, anchor_hint_f - 40)
-            window_end = min(total_video_frames, anchor_hint_f + 25)
-            sub_contacts = contact_arr[window_start:window_end]
-            cands = np.where(sub_contacts >= 0.35)[0]
-            if len(cands) > 0:
-                foul_frame = window_start + int(cands[0])
-            elif len(sub_contacts) > 0:
-                foul_frame = window_start + int(np.argmax(sub_contacts))
-            else:
-                foul_frame = max(0, anchor_hint_f - 10)
-        else:
-            contact_thresh = 0.42
-            foul_cands = np.where(contact_arr >= contact_thresh)[0]
-            if len(foul_cands) > 0:
-                foul_frame = int(foul_cands[0])
-            elif len(contact_arr) > 0 and contact_arr.max() > 0.25:
-                foul_frame = int(np.argmax(contact_arr))
-            else:
-                foul_frame = total_video_frames // 2
-        foul_time_sec = float(foul_frame) / max(fps, 1.0)
-    else:
-        foul_frame = 999999
-        foul_time_sec = 0.0
-
     cap = cv2.VideoCapture(str(resolved_video))
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     writer = create_cross_platform_video_writer(final_output_path, fps, frame_w, frame_h)
 
     frame_idx = 0
@@ -1305,50 +1495,39 @@ def predict_single_clip(
         if not ret:
             break
 
-        b_idx = min(frame_idx, total_video_frames - 1)
-        cur_contact = full_contact_scores[b_idx]
-        foul_active = (frame_idx >= foul_frame) and is_foul
+        # Bounding boxes ONLY appear when there is a foul, inside the foul impact window!
+        draw_foul_boxes = (
+            is_foul
+            and (foul_window_start <= frame_idx <= foul_window_end)
+            and (frame_idx in foul_window_boxes)
+        )
 
-        # Biomechanical Rule 12 metrics for HUD and visual feedback
-        cyl_val = float(np.clip(cur_contact * 1.4, 0.0, 1.0))
-        arm_val = float(np.clip(cur_contact * 1.2, 0.0, 1.0))
-        vert_deg = float(np.clip(cur_contact * 32.0, 4.0, 45.0))
+        if draw_foul_boxes:
+            fdata = foul_window_boxes[frame_idx]
+            fx1, fy1, fx2, fy2 = fdata["off_box"]
+            dx1, dy1, dx2, dy2 = fdata["def_box"]
+            ux1, uy1, ux2, uy2 = fdata["union_box"]
+            vert_deg = float(fdata.get("vert_deg", 25.0))
+            cur_contact = float(fdata.get("contact", 0.85))
 
-        # Dynamic state and color switching:
-        if not foul_active:
-            cur_status_text = "LEGAL PLAY (NO FOUL) | IN CYLINDER"
-            cur_status_color = (0, 220, 0)      # Bright Green
-            cur_box_color = (0, 205, 0)         # Green
-            cur_tag_text = "LEGAL PLAY | IN CYLINDER"
-        else:
-            cur_status_text = f"*** FOUL DETECTED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***"
-            cur_status_color = (40, 60, 255)    # Bright Red
-            cur_box_color = (0, 0, 225)         # Red
-            cur_tag_text = f"*** FOUL DETECTED: {call_type} ***"
+            # 1. Offensive Shooter/Driver Box (Cyan/Gold)
+            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 2)
+            otag = f"Offense: {disadvantaged} ({off_num_str}, {off_team_str})"
+            (otw, oth), _ = cv2.getTextSize(otag, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            cv2.rectangle(frame, (fx1, max(0, fy1 - oth - 4)), (min(frame_w - 2, fx1 + otw + 8), fy1), (255, 200, 0), -1)
+            cv2.putText(frame, otag, (fx1 + 4, max(12, fy1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
 
-        # 1. Indicator for Offensive Shooter/Driver with roster jersey number & team
-        fx1, fy1, fx2, fy2 = focal_boxes[b_idx]
-        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 2)
-        otag = f"Offense: {disadvantaged} ({off_num_str}, {off_team_str})"
-        (otw, oth), _ = cv2.getTextSize(otag, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-        cv2.rectangle(frame, (fx1, max(0, fy1 - oth - 4)), (min(frame_w - 2, fx1 + otw + 8), fy1), (255, 200, 0), -1)
-        cv2.putText(frame, otag, (fx1 + 4, max(12, fy1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
-
-        # 2. Indicator for Contesting Defender with roster jersey number & team
-        def_box = defender_boxes[b_idx]
-        if def_box is not None:
-            dx1, dy1, dx2, dy2 = def_box
+            # 2. Contesting Defender Box (Orange)
             cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 165, 255), 2)
             dtag = f"Defense: {committing} ({def_num_str}, {def_team_str})"
             (dtw, dth), _ = cv2.getTextSize(dtag, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
             cv2.rectangle(frame, (dx1, max(0, dy1 - dth - 4)), (min(frame_w - 2, dx1 + dtw + 8), dy1), (0, 165, 255), -1)
             cv2.putText(frame, dtag, (dx1 + 4, max(12, dy1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
 
-            # Center connection line representing physical interaction vector
+            # Center physical interaction line
             fcx, fcy = (fx1 + fx2) // 2, (fy1 + fy2) // 2
             dcx, dcy = (dx1 + dx2) // 2, (dy1 + dy2) // 2
-            line_color = (0, 0, 255) if foul_active else (200, 200, 255)
-            cv2.line(frame, (fcx, fcy), (dcx, dcy), line_color, 2, cv2.LINE_AA)
+            cv2.line(frame, (fcx, fcy), (dcx, dcy), (0, 0, 255), 2, cv2.LINE_AA)
 
             # Defender Verticality Guideline (Legal 90-degree normal vs contest angle)
             vert_color = (0, 220, 0) if vert_deg < 18.0 else (40, 60, 255)
@@ -1364,45 +1543,72 @@ def predict_single_clip(
                 cv2.LINE_AA,
             )
 
-        # 3. Main Bounding Box enclosing ALL players involved in the disputed interaction
-        ux1, uy1, ux2, uy2 = all_players_boxes[b_idx]
-        cv2.rectangle(frame, (ux1, uy1), (ux2, uy2), cur_box_color, 4)
+            # 3. Main Enclosing Bounding Box (Bold Red)
+            cv2.rectangle(frame, (ux1, uy1), (ux2, uy2), (0, 0, 225), 4)
 
-        # Main Tag above the enclosing box
-        tag_y = max(34, uy1 - 10)
-        (tw, th), _ = cv2.getTextSize(cur_tag_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-        cv2.rectangle(
-            frame,
-            (ux1, tag_y - th - 8),
-            (min(frame_w - 4, ux1 + tw + 14), tag_y + 4),
-            cur_box_color,
-            -1,
-        )
-        cv2.putText(
-            frame,
-            cur_tag_text,
-            (ux1 + 6, tag_y - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        # Compute RL Telemetry for current frame
-        if rl_traj is not None:
-            traj_len = len(rl_traj["whistle_probs"])
-            t_ratio = float(frame_idx) / float(max(1, total_video_frames - 1))
-            t_idx = min(traj_len - 1, int(t_ratio * traj_len))
-            p_whistle = rl_traj["whistle_probs"][t_idx]
-            q_play = rl_traj["q_values"][t_idx][0]
-            q_foul = rl_traj["q_values"][t_idx][1]
-            rl_verdict = "WHISTLE BLOWN" if foul_active else "PLAY ON"
+            # Main Tag above the enclosing box
+            tag_y = max(34, uy1 - 10)
+            cur_tag_text = f"*** FOUL DETECTED: {call_type} ***"
+            (tw, th), _ = cv2.getTextSize(cur_tag_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            cv2.rectangle(
+                frame,
+                (ux1, tag_y - th - 8),
+                (min(frame_w - 4, ux1 + tw + 14), tag_y + 4),
+                (0, 0, 225),
+                -1,
+            )
+            cv2.putText(
+                frame,
+                cur_tag_text,
+                (ux1 + 6, tag_y - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         else:
-            p_whistle = foul_prob if foul_active else (foul_prob * 0.35)
-            q_play = 1.0 - p_whistle
-            q_foul = p_whistle * 2.0 - 1.0
-            rl_verdict = "WHISTLE BLOWN" if foul_active else "PLAY ON"
+            # NO BOXES DRAWN! Clean broadcast view
+            cur_contact = 0.15
+            vert_deg = 8.0
+
+        # Dynamic state & color switching:
+        if not is_foul:
+            cur_status_text = "LEGAL PLAY (NO FOUL) | IN CYLINDER"
+            cur_status_color = (0, 220, 0)      # Bright Green
+            rl_verdict = "PLAY ON"
+            q_play = +1.00
+            q_foul = -1.00
+            p_whistle = 0.0
+            rl_color = (0, 220, 0)
+        else:
+            if frame_idx < foul_window_start:
+                cur_status_text = f"APPROACHING DISPUTED PLAY | P(FOUL) = {foul_prob * 100:.1f}%"
+                cur_status_color = (0, 200, 255)  # Cyan
+                rl_verdict = "MONITORING"
+                q_play = 0.70
+                q_foul = -0.30
+                p_whistle = foul_prob * 0.20
+                rl_color = (0, 200, 255)
+            elif frame_idx <= foul_window_end:
+                cur_status_text = f"*** FOUL DETECTED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***"
+                cur_status_color = (40, 60, 255)    # Bright Red
+                rl_verdict = "WHISTLE BLOWN"
+                q_play = -0.80
+                q_foul = +0.95
+                p_whistle = max(0.85, foul_prob)
+                rl_color = (40, 60, 255)
+            else:
+                cur_status_text = f"FOUL CALLED (WHISTLE BLOWN) | {def_num_str} {committing}"
+                cur_status_color = (40, 60, 255)    # Red
+                rl_verdict = "WHISTLE CONFIRMED"
+                q_play = -1.00
+                q_foul = +1.00
+                p_whistle = 0.95
+                rl_color = (40, 60, 255)
+
+        cyl_val = float(np.clip(cur_contact * 1.4, 0.0, 1.0))
+        arm_val = float(np.clip(cur_contact * 1.2, 0.0, 1.0))
 
         # 4. Top-left HUD stats panel with binary classification, RL telemetry & Rule 12 metrics
         hud_w = 980
@@ -1432,7 +1638,6 @@ def predict_single_clip(
             2,
             cv2.LINE_AA,
         )
-        rl_color = (40, 60, 255) if foul_active else (0, 220, 0)
         cv2.putText(
             frame,
             f"RL REFEREE CALL: {rl_verdict} | Q(FOUL): {q_foul:+.2f} | Q(PLAY_ON): {q_play:+.2f} | P(WHISTLE): {p_whistle * 100:.1f}%",
@@ -1486,15 +1691,18 @@ def predict_single_clip(
 
         # Timeline segments
         if is_foul and foul_frame < total_video_frames:
-            split_x = bar_x1 + int(bar_w * (float(foul_frame) / float(total_video_frames)))
-            split_x = max(bar_x1, min(bar_x2, split_x))
-            cv2.rectangle(frame, (bar_x1, bar_y1), (split_x, bar_y2), (0, 180, 0), -1)
-            cv2.rectangle(frame, (split_x, bar_y1), (bar_x2, bar_y2), (0, 0, 220), -1)
+            w_start_x = max(bar_x1, bar_x1 + int(bar_w * (float(foul_window_start) / float(total_video_frames))))
+            w_end_x = min(bar_x2, bar_x1 + int(bar_w * (float(foul_window_end) / float(total_video_frames))))
+            split_x = max(bar_x1, min(bar_x2, bar_x1 + int(bar_w * (float(foul_frame) / float(total_video_frames)))))
+            cv2.rectangle(frame, (bar_x1, bar_y1), (w_start_x, bar_y2), (0, 160, 0), -1)
+            cv2.rectangle(frame, (w_start_x, bar_y1), (w_end_x, bar_y2), (40, 60, 255), -1)
+            cv2.rectangle(frame, (w_end_x, bar_y1), (bar_x2, bar_y2), (180, 50, 0), -1)
             cv2.line(frame, (split_x, bar_y1 - 6), (split_x, bar_y2 + 2), (255, 255, 255), 2)
-            w_label = f"WHISTLE: {foul_time_sec:.2f}s"
-            cv2.putText(frame, w_label, (max(bar_x1, split_x - 45), bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (40, 60, 255), 1, cv2.LINE_AA)
+            w_label = f"FOUL APEX: {foul_time_sec:.2f}s"
+            cv2.putText(frame, w_label, (max(bar_x1, split_x - 55), bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (40, 60, 255), 1, cv2.LINE_AA)
         else:
             cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (0, 180, 0), -1)
+            cv2.putText(frame, "LEGAL PLAY (NO FOUL)", (bar_x1 + 10, bar_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 0), 1, cv2.LINE_AA)
 
         # Current scrubbing playhead pip
         curr_x = bar_x1 + int(bar_w * (float(frame_idx) / float(max(1, total_video_frames - 1))))
