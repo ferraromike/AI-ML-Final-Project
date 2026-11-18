@@ -31,6 +31,7 @@ import csv
 import gc
 import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -691,41 +692,18 @@ def get_cached_det_model() -> Optional[object]:
     return _CACHED_DET_MODEL
 
 
-def extract_action_tube(
-    video_path: Path | str,
-    det_model: Optional[object] = None,
-    pose_model: Optional[object] = None,
-    window_sec: float = 1.5,
-    num_frames: int = 16,
-    crop_size: int = 224,
-    device: str = "cpu",
+def _decode_clip_scan_frames(
+    video_path: Path,
     max_live_play_sec: float = 22.0,
-    max_scan_samples: int = 16,
-    yolo_batch_size: int = 4,
-    **kwargs,
-) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
-    """
-    Cross-Platform Memory-Safe & Deadlock-Free Action-Tube Extractor:
-      1. Caps live-play scanning to the first `max_live_play_sec` (22.0s) so multi-minute
-         replay review clips never exhaust RAM on 8GB laptops while covering the full
-         ~20s live-action broadcast play window.
-      2. Decodes downscaled `960x540` frames and calls `cap.release()` BEFORE running
-         YOLOv11-pose in micro-batches (`yolo_batch_size=4`).
-      3. Reopens the video after YOLO completes to read ONLY the 16 sampled frames in the
-         1.5s window around peak foul contact.
-    """
-    if "max_scan_frames" in kwargs:
-        max_scan_samples = kwargs["max_scan_frames"]
-    if "ema_alpha" in kwargs:
-        pass
-    primary_pose = pose_model if pose_model is not None else det_model
-    if primary_pose is None:
-        raise ValueError("At least one YOLO model (pose_model or det_model) must be provided.")
-    active_det = det_model if det_model is not None else get_cached_det_model()
-
+    max_scan_samples: int = 24,
+    num_frames: int = 16,
+    scan_w: int = 960,
+    scan_h: int = 540,
+) -> Optional[Dict[str, object]]:
+    """Decode downscaled scan frames for a single video clip (safe to run in parallel CPU worker threads)."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Unable to open video file: {video_path}")
+        return None
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
     if fps <= 1.0 or np.isnan(fps):
@@ -741,8 +719,8 @@ def extract_action_tube(
     scan_start = int(round(fps * 0.8)) if effective_total > 60 else 0
     scan_end = int(effective_total * 0.96) if effective_total > 60 else max(effective_total - 1, 1)
     effective_sec = float(max(1, scan_end - scan_start)) / max(fps, 1.0)
-    adaptive_samples = int(np.clip(round(effective_sec * 1.9), 18, 48))
-    num_scan_pts = max(int(max_scan_samples), adaptive_samples)
+    adaptive_samples = int(np.clip(round(effective_sec * 1.6), 16, 32))
+    num_scan_pts = min(max(int(max_scan_samples), adaptive_samples), 32)
     target_scan_set = set(
         np.linspace(scan_start, scan_end, num=min(num_scan_pts, max(scan_end - scan_start + 1, 1)))
         .round()
@@ -751,16 +729,10 @@ def extract_action_tube(
     )
     max_scan_frame = max(target_scan_set) if target_scan_set else 0
 
-    scan_w, scan_h = (1280, 720) if str(device).startswith("cuda") else (960, 540)
-    yolo_imgsz = 1024 if str(device).startswith("cuda") else 768
-    scale_x = float(frame_w) / float(scan_w)
-    scale_y = float(frame_h) / float(scan_h)
-
     scanned_frames: List[int] = []
     small_bgr_frames: List[np.ndarray] = []
 
     frame_idx = 0
-    actual_total = 0
     while frame_idx <= max_scan_frame:
         if frame_idx in target_scan_set:
             ret, frame = cap.read()
@@ -773,57 +745,44 @@ def extract_action_tube(
             if not cap.grab():
                 break
         frame_idx += 1
-        actual_total = frame_idx
 
-    # Release FFmpeg decoder BEFORE invoking PyTorch/Ultralytics
     cap.release()
-
     if not small_bgr_frames:
-        raise RuntimeError(f"No readable video frames in {video_path}")
+        return None
 
-    scanned_rois: List[np.ndarray] = []
-    scanned_scores: List[float] = []
-    scanned_feats: List[np.ndarray] = []
+    return {
+        "video_path": video_path,
+        "fps": fps,
+        "reported_frames": reported_frames,
+        "frame_w": frame_w,
+        "frame_h": frame_h,
+        "scan_w": scan_w,
+        "scan_h": scan_h,
+        "scale_x": float(frame_w) / float(scan_w),
+        "scale_y": float(frame_h) / float(scan_h),
+        "scan_start": scan_start,
+        "scanned_frames": scanned_frames,
+        "small_bgr_frames": small_bgr_frames,
+    }
 
-    yolo_device = select_yolo_device(device)
-    batch_sz = max(1, int(yolo_batch_size))
-    with torch.inference_mode():
-        for b_start in range(0, len(small_bgr_frames), batch_sz):
-            batch_frames = small_bgr_frames[b_start : b_start + batch_sz]
-            pose_results = primary_pose.predict(
-                batch_frames,
-                conf=0.10,
-                imgsz=yolo_imgsz,
-                verbose=False,
-                device=yolo_device,
-            )
-            det_results = (
-                active_det.predict(
-                    batch_frames,
-                    conf=0.10,
-                    imgsz=yolo_imgsz,
-                    classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
-                    verbose=False,
-                    device=yolo_device,
-                )
-                if (active_det is not None and active_det is not primary_pose)
-                else [None] * len(batch_frames)
-            )
-            for b_offset, (pose_res, det_res) in enumerate(zip(pose_results, det_results)):
-                roi, score, feat_vec = analyze_foul_interaction_frame(
-                    pose_res=pose_res,
-                    det_res=det_res,
-                    frame_w=frame_w,
-                    frame_h=frame_h,
-                    scale_x=scale_x,
-                    scale_y=scale_y,
-                    bgr_frame=batch_frames[b_offset],
-                )
-                scanned_rois.append(roi)
-                scanned_scores.append(score)
-                scanned_feats.append(feat_vec)
 
-    del small_bgr_frames
+def _finalize_clip_action_tube(
+    scan_info: Dict[str, object],
+    scanned_rois: List[np.ndarray],
+    scanned_scores: List[float],
+    scanned_feats: List[np.ndarray],
+    window_sec: float = 1.5,
+    num_frames: int = 16,
+    crop_size: int = 224,
+) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
+    """Interpolate trajectories, locate peak foul contact, and decode the 16 action-tube frames."""
+    video_path = scan_info["video_path"]
+    fps = float(scan_info["fps"])  # type: ignore[arg-type]
+    reported_frames = int(scan_info["reported_frames"])  # type: ignore[arg-type]
+    frame_w = int(scan_info["frame_w"])  # type: ignore[arg-type]
+    frame_h = int(scan_info["frame_h"])  # type: ignore[arg-type]
+    scan_start = int(scan_info["scan_start"])  # type: ignore[arg-type]
+    scanned_frames: List[int] = scan_info["scanned_frames"]  # type: ignore[assignment]
 
     horizon_len = max(scanned_frames[-1] + int(round(fps * 1.0)), num_frames + 1)
     if reported_frames > 0:
@@ -867,7 +826,6 @@ def extract_action_tube(
     sampled_set = set(sampled_indices)
     stabilized_rois = smooth_boxes_ema(raw_rois, alpha=0.32)
 
-    # Pass 2: Open video and decode ONLY the 16 sampled frames
     cap2 = cv2.VideoCapture(str(video_path))
     decoded_samples: Dict[int, np.ndarray] = {}
     max_needed = max(sampled_indices)
@@ -912,11 +870,112 @@ def extract_action_tube(
         cropped_rgb_frames.append(decoded_samples.get(f_idx, fallback_rgb))
         sampled_feats_list.append(full_feats[f_idx])
 
-    stacked_rgb = np.stack(cropped_rgb_frames, axis=0)  # (16, 224, 224, 3)
-    tube_tensor = torch.from_numpy(stacked_rgb).permute(3, 0, 1, 2).contiguous()  # (3, 16, 224, 224)
-    foul_features_tensor = torch.from_numpy(np.stack(sampled_feats_list, axis=0)).float()  # (16, 12)
+    stacked_rgb = np.stack(cropped_rgb_frames, axis=0)
+    tube_tensor = torch.from_numpy(stacked_rgb).permute(3, 0, 1, 2).contiguous()
+    foul_features_tensor = torch.from_numpy(np.stack(sampled_feats_list, axis=0)).float()
 
     return tube_tensor, crop_boxes, sampled_indices, fps, foul_features_tensor
+
+
+def extract_action_tube(
+    video_path: Path | str,
+    det_model: Optional[object] = None,
+    pose_model: Optional[object] = None,
+    window_sec: float = 1.5,
+    num_frames: int = 16,
+    crop_size: int = 224,
+    device: str = "cpu",
+    max_live_play_sec: float = 22.0,
+    max_scan_samples: int = 16,
+    yolo_batch_size: int = 4,
+    **kwargs,
+) -> Tuple[torch.Tensor, List[Tuple[int, int, int, int]], List[int], float, torch.Tensor]:
+    """
+    Cross-Platform Memory-Safe & Deadlock-Free Action-Tube Extractor:
+      1. Caps live-play scanning to the first `max_live_play_sec` (22.0s) so multi-minute
+         replay review clips never exhaust RAM on 8GB laptops while covering the full
+         ~20s live-action broadcast play window.
+      2. Decodes downscaled `960x540` frames and calls `cap.release()` BEFORE running
+         YOLOv11-pose in micro-batches.
+      3. Reopens the video after YOLO completes to read ONLY the 16 sampled frames in the
+         1.5s window around peak foul contact.
+    """
+    if "max_scan_frames" in kwargs:
+        max_scan_samples = kwargs["max_scan_frames"]
+    primary_pose = pose_model if pose_model is not None else det_model
+    if primary_pose is None:
+        raise ValueError("At least one YOLO model (pose_model or det_model) must be provided.")
+    active_det = det_model if det_model is not None else get_cached_det_model()
+
+    scan_info = _decode_clip_scan_frames(
+        video_path=Path(video_path),
+        max_live_play_sec=max_live_play_sec,
+        max_scan_samples=max_scan_samples,
+        num_frames=num_frames,
+        scan_w=960,
+        scan_h=540,
+    )
+    if scan_info is None:
+        raise RuntimeError(f"Unable to open or read video frames in {video_path}")
+
+    small_bgr_frames: List[np.ndarray] = scan_info["small_bgr_frames"]  # type: ignore[assignment]
+    frame_w = int(scan_info["frame_w"])  # type: ignore[arg-type]
+    frame_h = int(scan_info["frame_h"])  # type: ignore[arg-type]
+    scale_x = float(scan_info["scale_x"])  # type: ignore[arg-type]
+    scale_y = float(scan_info["scale_y"])  # type: ignore[arg-type]
+
+    scanned_rois: List[np.ndarray] = []
+    scanned_scores: List[float] = []
+    scanned_feats: List[np.ndarray] = []
+
+    yolo_device = select_yolo_device(device)
+    batch_sz = max(1, int(yolo_batch_size))
+    with torch.inference_mode():
+        for b_start in range(0, len(small_bgr_frames), batch_sz):
+            batch_frames = small_bgr_frames[b_start : b_start + batch_sz]
+            pose_results = primary_pose.predict(
+                batch_frames,
+                conf=0.10,
+                imgsz=768,
+                verbose=False,
+                device=yolo_device,
+            )
+            det_results = (
+                active_det.predict(
+                    batch_frames,
+                    conf=0.10,
+                    imgsz=768,
+                    classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
+                    verbose=False,
+                    device=yolo_device,
+                )
+                if (active_det is not None and active_det is not primary_pose)
+                else [None] * len(batch_frames)
+            )
+            for b_offset, (pose_res, det_res) in enumerate(zip(pose_results, det_results)):
+                roi, score, feat_vec = analyze_foul_interaction_frame(
+                    pose_res=pose_res,
+                    det_res=det_res,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    bgr_frame=batch_frames[b_offset],
+                )
+                scanned_rois.append(roi)
+                scanned_scores.append(score)
+                scanned_feats.append(feat_vec)
+
+    scan_info["small_bgr_frames"] = []
+    return _finalize_clip_action_tube(
+        scan_info=scan_info,
+        scanned_rois=scanned_rois,
+        scanned_scores=scanned_scores,
+        scanned_feats=scanned_feats,
+        window_sec=window_sec,
+        num_frames=num_frames,
+        crop_size=crop_size,
+    )
 
 
 def synthesize_fallback_action_tube(
@@ -1073,10 +1132,9 @@ def preprocess_dataset(
         if yolo_dev == "cuda" and torch.cuda.is_available():
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             if vram_gb >= 12.0:
-                if yolo_batch_size < 48:
-                    yolo_batch_size = 64
-                if max_scan_samples < 36:
-                    max_scan_samples = 48
+                if yolo_batch_size < 128:
+                    yolo_batch_size = 128
+                max_scan_samples = min(max_scan_samples, 20)
         logger.info("Loading Ultralytics pose/detection model: %s (device=%s, batch_size=%d)", active_pose_weights, yolo_dev, yolo_batch_size)
         pose_model = YOLO(active_pose_weights)
 
@@ -1093,6 +1151,9 @@ def preprocess_dataset(
         yolo_batch_size,
     )
 
+    real_tasks: List[Tuple[int, Dict[str, str], Path, Path]] = []
+    ready_map: Dict[int, Dict[str, str]] = {}
+
     for idx, row in enumerate(rows, start=1):
         play_id = row["play_id"]
         label = int(row["label"])
@@ -1101,7 +1162,6 @@ def preprocess_dataset(
         out_tensor_path = processed_dir / class_name / f"{play_id}.pt"
         out_tensor_path.parent.mkdir(parents=True, exist_ok=True)
 
-        used_synthetic = False
         needs_reprocess = not out_tensor_path.exists()
         if out_tensor_path.exists() and video_path.exists() and video_path.stat().st_size > 10_240:
             try:
@@ -1115,46 +1175,19 @@ def preprocess_dataset(
             except Exception:
                 needs_reprocess = True
 
-        if needs_reprocess:
-            if video_path.exists() and video_path.stat().st_size > 10_240 and pose_model is not None:
-                try:
-                    tube_tensor, crop_boxes, sampled_indices, fps, foul_features = extract_action_tube(
-                        video_path=video_path,
-                        det_model=None,
-                        pose_model=pose_model,
-                        window_sec=window_sec,
-                        num_frames=num_frames,
-                        crop_size=crop_size,
-                        device=device,
-                        max_live_play_sec=max_live_play_sec,
-                        max_scan_samples=max_scan_samples,
-                        yolo_batch_size=yolo_batch_size,
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to preprocess %s: %s", video_path, exc)
-                    if not synthetic_fallback:
-                        continue
-                    used_synthetic = True
-                    tube_tensor, crop_boxes, sampled_indices, fps, foul_features = synthesize_fallback_action_tube(
-                        play_id=play_id,
-                        label=label,
-                        num_frames=num_frames,
-                        crop_size=crop_size,
-                    )
-                finally:
-                    gc.collect()
-            elif synthetic_fallback:
-                used_synthetic = True
-                tube_tensor, crop_boxes, sampled_indices, fps, foul_features = synthesize_fallback_action_tube(
-                    play_id=play_id,
-                    label=label,
-                    num_frames=num_frames,
-                    crop_size=crop_size,
-                )
-            else:
-                logger.warning("Skipping missing raw video: %s (pass --synthetic-fallback for offline tensor demo)", video_path)
-                continue
-
+        if not needs_reprocess:
+            out_row = dict(row)
+            out_row["tensor_path"] = (Path("data") / "processed" / class_name / f"{play_id}.pt").as_posix()
+            ready_map[idx] = out_row
+        elif video_path.exists() and video_path.stat().st_size > 10_240 and pose_model is not None:
+            real_tasks.append((idx, row, video_path, out_tensor_path))
+        elif synthetic_fallback:
+            tube_tensor, crop_boxes, sampled_indices, fps, foul_features = synthesize_fallback_action_tube(
+                play_id=play_id,
+                label=label,
+                num_frames=num_frames,
+                crop_size=crop_size,
+            )
             torch.save(
                 {
                     "video": tube_tensor,
@@ -1166,22 +1199,154 @@ def preprocess_dataset(
                     "crop_boxes": crop_boxes,
                     "sampled_indices": sampled_indices,
                     "fps": fps,
-                    "is_synthetic": used_synthetic,
+                    "is_synthetic": True,
                 },
                 out_tensor_path,
             )
-            logger.info(
-                "[%d/%d] Saved foul action tube -> %s",
-                idx,
-                len(rows),
-                out_tensor_path,
-            )
+            out_row = dict(row)
+            out_row["tensor_path"] = (Path("data") / "processed" / class_name / f"{play_id}.pt").as_posix()
+            ready_map[idx] = out_row
+        else:
+            logger.warning("Skipping missing raw video: %s (pass --synthetic-fallback for offline tensor demo)", video_path)
 
-        out_row = dict(row)
-        rel_tensor = Path("data") / "processed" / class_name / f"{play_id}.pt"
-        out_row["tensor_path"] = rel_tensor.as_posix()
-        processed_rows.append(out_row)
-        write_processed_metadata(processed_metadata_csv, processed_rows)
+    # High-Throughput Multi-Clip Parallel CPU Decoding + Mega-Batch GPU Inference
+    if real_tasks and pose_model is not None:
+        yolo_dev = select_yolo_device(device)
+        active_det = get_cached_det_model()
+        clips_per_superbatch = 12 if yolo_dev == "cuda" else 4
+        cpu_workers = 4 if yolo_dev == "cuda" else 2
+
+        for sb_start in range(0, len(real_tasks), clips_per_superbatch):
+            sb_tasks = real_tasks[sb_start : sb_start + clips_per_superbatch]
+
+            # 1. Parallel CPU video decoding across clips
+            with ThreadPoolExecutor(max_workers=cpu_workers) as pool:
+                decoded_infos = list(
+                    pool.map(
+                        lambda t: _decode_clip_scan_frames(
+                            video_path=t[2],
+                            max_live_play_sec=max_live_play_sec,
+                            max_scan_samples=max_scan_samples,
+                            num_frames=num_frames,
+                            scan_w=960,
+                            scan_h=540,
+                        ),
+                        sb_tasks,
+                    )
+                )
+
+            # 2. Concatenate all frames across the superbatch and run ONE massive GPU YOLO forward pass
+            mega_frames: List[np.ndarray] = []
+            clip_slices: List[Tuple[int, int, int, Dict[str, object]]] = []
+            for t_idx, scan_info in enumerate(decoded_infos):
+                if scan_info is None:
+                    continue
+                frames_list: List[np.ndarray] = scan_info["small_bgr_frames"]  # type: ignore[assignment]
+                start_f = len(mega_frames)
+                mega_frames.extend(frames_list)
+                end_f = len(mega_frames)
+                clip_slices.append((t_idx, start_f, end_f, scan_info))
+
+            mega_pose_res: List[object] = []
+            mega_det_res: List[object] = []
+            if mega_frames:
+                batch_sz = max(1, int(yolo_batch_size))
+                with torch.inference_mode():
+                    for b_start in range(0, len(mega_frames), batch_sz):
+                        b_frames = mega_frames[b_start : b_start + batch_sz]
+                        p_res = pose_model.predict(
+                            b_frames,
+                            conf=0.10,
+                            imgsz=768,
+                            verbose=False,
+                            device=yolo_dev,
+                        )
+                        d_res = (
+                            active_det.predict(
+                                b_frames,
+                                conf=0.10,
+                                imgsz=768,
+                                classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
+                                verbose=False,
+                                device=yolo_dev,
+                            )
+                            if (active_det is not None and active_det is not pose_model)
+                            else [None] * len(b_frames)
+                        )
+                        mega_pose_res.extend(p_res)
+                        mega_det_res.extend(d_res)
+
+            # 3. Analyze interaction per clip and parallelize Pass 2 tube cropping
+            def _crop_and_save_clip(item_tuple):
+                t_idx, start_f, end_f, scan_info = item_tuple
+                idx, row, video_path, out_tensor_path = sb_tasks[t_idx]
+                play_id = row["play_id"]
+                label = int(row["label"])
+                class_name = "foul" if label == 1 else "no_foul"
+                frame_w = int(scan_info["frame_w"])
+                frame_h = int(scan_info["frame_h"])
+                scale_x = float(scan_info["scale_x"])
+                scale_y = float(scan_info["scale_y"])
+                frames_list: List[np.ndarray] = scan_info["small_bgr_frames"]  # type: ignore[assignment]
+
+                scanned_rois: List[np.ndarray] = []
+                scanned_scores: List[float] = []
+                scanned_feats: List[np.ndarray] = []
+                for local_i, global_i in enumerate(range(start_f, end_f)):
+                    roi, score, feat_vec = analyze_foul_interaction_frame(
+                        pose_res=mega_pose_res[global_i],
+                        det_res=mega_det_res[global_i],
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                        bgr_frame=frames_list[local_i],
+                    )
+                    scanned_rois.append(roi)
+                    scanned_scores.append(score)
+                    scanned_feats.append(feat_vec)
+
+                scan_info["small_bgr_frames"] = []
+                tube_tensor, crop_boxes, sampled_indices, fps, foul_features = _finalize_clip_action_tube(
+                    scan_info=scan_info,
+                    scanned_rois=scanned_rois,
+                    scanned_scores=scanned_scores,
+                    scanned_feats=scanned_feats,
+                    window_sec=window_sec,
+                    num_frames=num_frames,
+                    crop_size=crop_size,
+                )
+                torch.save(
+                    {
+                        "video": tube_tensor,
+                        "foul_features": foul_features,
+                        "label": label,
+                        "play_id": play_id,
+                        "call_type": row.get("call_type", ""),
+                        "review_decision": row.get("review_decision", ""),
+                        "crop_boxes": crop_boxes,
+                        "sampled_indices": sampled_indices,
+                        "fps": fps,
+                        "is_synthetic": False,
+                    },
+                    out_tensor_path,
+                )
+                out_row = dict(row)
+                out_row["tensor_path"] = (Path("data") / "processed" / class_name / f"{play_id}.pt").as_posix()
+                return idx, out_row, out_tensor_path
+
+            with ThreadPoolExecutor(max_workers=cpu_workers) as pool:
+                saved_results = list(pool.map(_crop_and_save_clip, clip_slices))
+
+            for idx, out_row, out_tensor_path in saved_results:
+                ready_map[idx] = out_row
+                logger.info("[%d/%d] Saved foul action tube -> %s", idx, len(rows), out_tensor_path)
+
+            del mega_frames, mega_pose_res, mega_det_res, decoded_infos
+
+    for idx in sorted(ready_map.keys()):
+        processed_rows.append(ready_map[idx])
+    write_processed_metadata(processed_metadata_csv, processed_rows)
 
     logger.info(
         "Completed preprocessing: %d action tubes saved to %s (index: %s)",
