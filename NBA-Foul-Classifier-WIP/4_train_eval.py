@@ -1955,10 +1955,10 @@ def run_training_pipeline(args: argparse.Namespace) -> None:
     use_cached_embeddings = True
     if high_vram_active and not getattr(args, "freeze_backbone", False):
         use_cached_embeddings = False
-        if args.batch_size <= 2 or args.batch_size > 8:
-            args.batch_size = 4
-        if args.accum_steps <= 2:
-            args.accum_steps = 8
+        if args.batch_size < 16:
+            args.batch_size = 16
+        if args.accum_steps < 2:
+            args.accum_steps = 2
         args.freeze_backbone = False
         logger.info(
             "🚀 Google Colab T4 High-Compute Mode Active! Total VRAM: %.1f GB.",

@@ -751,7 +751,8 @@ def extract_action_tube(
     )
     max_scan_frame = max(target_scan_set) if target_scan_set else 0
 
-    scan_w, scan_h = 960, 540
+    scan_w, scan_h = (1280, 720) if str(device).startswith("cuda") else (960, 540)
+    yolo_imgsz = 1024 if str(device).startswith("cuda") else 768
     scale_x = float(frame_w) / float(scan_w)
     scale_y = float(frame_h) / float(scan_h)
 
@@ -785,6 +786,7 @@ def extract_action_tube(
     scanned_feats: List[np.ndarray] = []
 
     yolo_device = select_yolo_device(device)
+    use_half = (yolo_device == "cuda")
     batch_sz = max(1, int(yolo_batch_size))
     with torch.inference_mode():
         for b_start in range(0, len(small_bgr_frames), batch_sz):
@@ -792,7 +794,8 @@ def extract_action_tube(
             pose_results = primary_pose.predict(
                 batch_frames,
                 conf=0.10,
-                imgsz=768,
+                imgsz=yolo_imgsz,
+                half=use_half,
                 verbose=False,
                 device=yolo_device,
             )
@@ -800,7 +803,8 @@ def extract_action_tube(
                 active_det.predict(
                     batch_frames,
                     conf=0.10,
-                    imgsz=768,
+                    imgsz=yolo_imgsz,
+                    half=use_half,
                     classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
                     verbose=False,
                     device=yolo_device,
@@ -1069,7 +1073,14 @@ def preprocess_dataset(
             else (pose_weights or yolo_weights)
         )
         yolo_dev = select_yolo_device(device)
-        logger.info("Loading Ultralytics pose/detection model: %s (device=%s)", active_pose_weights, yolo_dev)
+        if yolo_dev == "cuda" and torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if vram_gb >= 12.0:
+                if yolo_batch_size < 48:
+                    yolo_batch_size = 64
+                if max_scan_samples < 36:
+                    max_scan_samples = 48
+        logger.info("Loading Ultralytics pose/detection model: %s (device=%s, batch_size=%d)", active_pose_weights, yolo_dev, yolo_batch_size)
         pose_model = YOLO(active_pose_weights)
 
     processed_dir.mkdir(parents=True, exist_ok=True)
