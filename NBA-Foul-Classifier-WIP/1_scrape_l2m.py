@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import re
 import time
@@ -1283,6 +1284,102 @@ def populate_foul_csv_from_local_metadata(
     return populated
 
 
+def _video_content_fingerprint(video_path: Path) -> str:
+    """Compute a fast, collision-resistant content fingerprint (size + first/last 64KB MD5)."""
+    size = video_path.stat().st_size
+    h = hashlib.md5()
+    h.update(str(size).encode("utf-8"))
+    with open(video_path, "rb") as fp:
+        h.update(fp.read(65536))
+        if size > 131072:
+            fp.seek(-65536, 2)
+            h.update(fp.read(65536))
+    return h.hexdigest()
+
+
+def deduplicate_raw_dataset(
+    metadata_csv: Path = BASE_DIR / "data" / "l2m_metadata.csv",
+    raw_dir: Path = BASE_DIR / "data" / "raw",
+    remove_duplicate_files: bool = False,
+) -> Dict[str, int]:
+    """
+    Eliminate duplicate and label-conflicting broadcast MP4s from `l2m_metadata.csv`.
+    When multiple L2M rows share the exact same NBA Stats video file:
+      - If one row is labeled `foul` (1) and another is `no_foul` (0), the clip DOES contain a foul,
+        so we keep the `foul` row and drop the contradictory `no_foul` duplicate.
+      - If multiple rows share the same label and exact same video bytes, keep the first unique row.
+    """
+    metadata_csv = resolve_project_path(metadata_csv)
+    raw_dir = resolve_project_path(raw_dir)
+    if not metadata_csv.exists():
+        return {"total_before": 0, "total_after": 0, "dropped_conflicts": 0, "dropped_dups": 0}
+
+    with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    hash_groups: Dict[str, List[int]] = {}
+    for idx, row in enumerate(rows):
+        vp = resolve_project_path(row.get("video_path", ""))
+        if vp.exists() and vp.stat().st_size > 10_240:
+            fp = _video_content_fingerprint(vp)
+            hash_groups.setdefault(fp, []).append(idx)
+
+    drop_indices: Set[int] = set()
+    dropped_conflicts = 0
+    dropped_dups = 0
+
+    for fp, idxs in hash_groups.items():
+        if len(idxs) <= 1:
+            continue
+        labels_present = {int(rows[i].get("label", 0)) for i in idxs}
+        if len(labels_present) > 1:
+            # Conflict: identical video file labeled both 1 (foul) and 0 (no_foul).
+            # Keep the single highest-priority foul row (CC/INC) and drop contradictory duplicates.
+            foul_idxs = [i for i in idxs if int(rows[i].get("label", 0)) == 1]
+            keep_i = foul_idxs[0]
+            for i in idxs:
+                if i != keep_i:
+                    drop_indices.add(i)
+                    dropped_conflicts += 1
+        else:
+            keep_i = idxs[0]
+            for i in idxs[1:]:
+                drop_indices.add(i)
+                dropped_dups += 1
+
+    if remove_duplicate_files:
+        for i in drop_indices:
+            vp = resolve_project_path(rows[i].get("video_path", ""))
+            if vp.exists():
+                try:
+                    vp.unlink()
+                except Exception:
+                    pass
+
+    cleaned_rows = [r for idx, r in enumerate(rows) if idx not in drop_indices]
+    if drop_indices:
+        fieldnames = list(rows[0].keys()) if rows else MASTER_CSV_COLUMNS
+        with open(metadata_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(cleaned_rows)
+        logger.info(
+            "Deduplicated %s: %d -> %d rows (dropped %d conflicting-label clips, %d same-class duplicates)",
+            metadata_csv.name,
+            len(rows),
+            len(cleaned_rows),
+            dropped_conflicts,
+            dropped_dups,
+        )
+
+    return {
+        "total_before": len(rows),
+        "total_after": len(cleaned_rows),
+        "dropped_conflicts": dropped_conflicts,
+        "dropped_dups": dropped_dups,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="NBA Last Two Minute (L2M) Report & Video Scraper"
@@ -1348,18 +1445,30 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Worker threads for concurrent downloading (default: 4)",
     )
+    parser.add_argument(
+        "--deduplicate",
+        action="store_true",
+        help="Remove duplicate and conflicting-label video entries from data/l2m_metadata.csv",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.download_missing:
+    if args.deduplicate:
+        deduplicate_raw_dataset(
+            metadata_csv=args.metadata_csv,
+            raw_dir=args.output_dir,
+            remove_duplicate_files=False,
+        )
+    elif args.download_missing:
         bulk_download_missing_clips(
             metadata_csv=args.metadata_csv,
             output_dir=args.output_dir,
             max_workers=args.workers,
             max_clips=args.max_clips if args.max_clips > 30 else 0,
         )
+        deduplicate_raw_dataset(metadata_csv=args.metadata_csv, raw_dir=args.output_dir)
     elif args.fill_from_local:
         populate_foul_csv_from_local_metadata(
             metadata_csv=args.metadata_csv,

@@ -238,7 +238,6 @@ play_id,game_id,player_committing,player_disadvantaged,call_type,review_decision
 0022600219_2101_02,0022600219,RJ Barrett,Jayson Tatum,Shooting Foul,CNC,0,data/raw/no_foul/0022600219_2101_02.mp4
 0022600219_2102_03,0022600219,Payton Pritchard,RJ Barrett,Shooting Foul,CNC,0,data/raw/no_foul/0022600219_2102_03.mp4
 0022600219_2104_05,0022600219,Jamal Shead,Neemias Queta,Personal Foul,CNC,0,data/raw/no_foul/0022600219_2104_05.mp4
-0022600219_2105_06,0022600219,Jayson Tatum,Jamal Shead,Personal Foul,CNC,0,data/raw/no_foul/0022600219_2105_06.mp4
 0022600219_2107_08,0022600219,Immanuel Quickley,Jayson Tatum,Personal Foul,CNC,0,data/raw/no_foul/0022600219_2107_08.mp4
 0022600219_2109_10,0022600219,Jakob Poeltl,Neemias Queta,Shooting Foul,CNC,0,data/raw/no_foul/0022600219_2109_10.mp4
 0022600219_2110_11,0022600219,Sam Hauser,RJ Barrett,Personal Foul,CNC,0,data/raw/no_foul/0022600219_2110_11.mp4
@@ -253,12 +252,10 @@ play_id,game_id,player_committing,player_disadvantaged,call_type,review_decision
 0022600221_2110_04,0022600221,Isaiah Stewart,Nikola Jokic,Personal Foul,CNC,0,data/raw/no_foul/0022600221_2110_04.mp4
 0022600221_2112_06,0022600221,Zach Edey,Cameron Johnson,Shooting Foul,CNC,0,data/raw/no_foul/0022600221_2112_06.mp4
 0022600221_2114_08,0022600221,Ty Jerome,Aaron Gordon,Personal Foul,CNC,0,data/raw/no_foul/0022600221_2114_08.mp4
-0022600221_2115_09,0022600221,Cameron Boozer,Nikola Jokic,Personal Foul,CNC,0,data/raw/no_foul/0022600221_2115_09.mp4
 0022600221_2117_11,0022600221,Jamal Murray,Zach Edey,Shooting Foul,CNC,0,data/raw/no_foul/0022600221_2117_11.mp4
 0022600221_2118_12,0022600221,Zach Edey,Cameron Johnson,Personal Foul,CC,1,data/raw/foul/0022600221_2118_12.mp4
 0022600221_2120_14,0022600221,Cameron Boozer,Nikola Jokic,Personal Foul,CC,1,data/raw/foul/0022600221_2120_14.mp4
 0022600221_2122_16,0022600221,Cameron Johnson,Cameron Boozer,Personal Foul,CNC,0,data/raw/no_foul/0022600221_2122_16.mp4
-0022600221_2123_17,0022600221,Spencer Jones,Cameron Boozer,Shooting Foul,CNC,0,data/raw/no_foul/0022600221_2123_17.mp4
 0022600221_2125_18,0022600221,Isaiah Stewart,Aaron Gordon,Personal Foul,CC,1,data/raw/foul/0022600221_2125_18.mp4
 0022600221_2126_21,0022600221,Christian Braun,Cameron Boozer,Shooting Foul,CNC,0,data/raw/no_foul/0022600221_2126_21.mp4
 0022600171_2089_01,0022600171,Scottie Barnes,Kris Dunn,Shooting Foul,CNC,0,data/raw/no_foul/0022600171_2089_01.mp4
@@ -307,7 +304,6 @@ play_id,game_id,player_committing,player_disadvantaged,call_type,review_decision
 0022600018_2183_18,0022600018,Jalen Brunson,LeBron James,Personal Foul,CC,1,data/raw/foul/0022600018_2183_18.mp4
 0022600018_2184_19,0022600018,Miles McBride,Tyrese Maxey,Personal Foul,CC,1,data/raw/foul/0022600018_2184_19.mp4
 0022600021_2149_00,0022600021,Caleb Martin,Kevin Durant,Personal Foul,CC,1,data/raw/foul/0022600021_2149_00.mp4
-0022600021_2150_01,0022600021,Tari Eason,Cooper Flagg,Personal Foul,CNC,0,data/raw/no_foul/0022600021_2150_01.mp4
 0022600021_2151_02,0022600021,Jabari Smith Jr.,Cooper Flagg,Shooting Foul,CC,1,data/raw/foul/0022600021_2151_02.mp4
 0022600021_2152_03,0022600021,Caleb Martin,Kevin Durant,Personal Foul,CNC,0,data/raw/no_foul/0022600021_2152_03.mp4
 0022600021_2154_05,0022600021,Caleb Martin,Kevin Durant,Shooting Foul,CNC,0,data/raw/no_foul/0022600021_2154_05.mp4
@@ -323,7 +319,6 @@ play_id,game_id,player_committing,player_disadvantaged,call_type,review_decision
 0022600144_2112_00,0022600144,Donovan Mitchell,Jalen Johnson,Shooting Foul,CNC,0,data/raw/no_foul/0022600144_2112_00.mp4
 0022600144_2113_01,0022600144,Nickeil Alexander-Walker,James Harden,Shooting Foul,IC,0,data/raw/no_foul/0022600144_2113_01.mp4
 0022600144_2114_02,0022600144,James Harden,Nickeil Alexander-Walker,Personal Foul,CNC,0,data/raw/no_foul/0022600144_2114_02.mp4
-0022600144_2115_03,0022600144,Donovan Mitchell,Nickeil Alexander-Walker,Personal Foul,CNC,0,data/raw/no_foul/0022600144_2115_03.mp4
 0022600144_2116_04,0022600144,Donovan Mitchell,Nickeil Alexander-Walker,Shooting Foul,CNC,0,data/raw/no_foul/0022600144_2116_04.mp4
 0022600144_2117_06,0022600144,Dyson Daniels,Donovan Mitchell,Personal Foul,CNC,0,data/raw/no_foul/0022600144_2117_06.mp4
 0022600144_2118_07,0022600144,Dyson Daniels,Donovan Mitchell,Personal Foul,CNC,0,data/raw/no_foul/0022600144_2118_07.mp4
