@@ -62,11 +62,12 @@ jupyter notebook NBA_Foul_Classifier_Full_Pipeline.ipynb
 
 ### Run via Command Line
 ```bash
-# 1. Deduplicate raw clips & metadata (or scrape more games with --max-games 60 --max-clips 250 --include-archive)
-python 1_scrape_l2m.py --deduplicate
+# 1. Refresh ALL NBA L2M games across 2018-2027 seasons + archive (3,194+ games / 37,671+ plays in ~45s!)
+python 1_scrape_l2m.py --all-games --skip-download --workers 16
 
-# 2. Extract v3 E-BARD + 2-Team CIELAB + Swin3D-T Multi-Window MIL bags
-python 2_preprocess_tubes.py --max-clips 0
+# 2. Stream-download balanced MP4 chunks, extract compact (~45KB) Swin3D-T MIL bags & clean temp MP4s
+#    (--max-clips 1000 for fast T4 run, or --max-clips 0 to stream ALL 37,671 plays!)
+python 2_preprocess_tubes.py --stream --max-clips 1000 --chunk-size 100 --cleanup-raw
 
 # 3. Verify FoulMILClassifier shapes and parameter summary
 python 3_model_and_dataset.py

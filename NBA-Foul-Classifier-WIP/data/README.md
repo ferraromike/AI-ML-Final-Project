@@ -8,8 +8,8 @@ This directory stores official NBA Last Two Minute (L2M) metadata, raw broadcast
 
 ```text
 data/
-├── l2m_metadata.csv               # Deduplicated L2M plays with real `call_type` and `game_id`
-├── l2m_incorrect_fouls.csv        # Officiating review breakdown (INC / IC / CC)
+├── l2m_metadata.csv               # Full-archive deduplicated L2M index (37,671 plays across 3,194 NBA games!)
+├── l2m_incorrect_fouls.csv        # Official INC / IC officiating review archive (1,815+ reviews)
 ├── raw/                           # Raw broadcast MP4 clips downloaded from NBA CDN (gitignored)
 │   ├── foul/                      # Label 1: CC (Correct Call) + INC (Incorrect Non-Call)
 │   └── no_foul/                   # Label 0: CNC (Correct Non-Call) + IC (Incorrect Call)
@@ -51,8 +51,8 @@ Each `.pt` file in `data/processed/{foul,no_foul}/` (`extractor_v = 3`) contains
 - **`window_pose_features`**: `torch.Tensor` `(K, 16, 16)` — 16-D depth-gated NBA Rule 12 + E-BARD ball/hoop kinematic sequences per window (with referees and spectators strictly excluded via E-BARD + 2-team CIELAB clustering).
 - **`window_center_frames`**: `torch.Tensor` `(K,)` — Original broadcast video center frame index for each candidate window.
 - **`window_activity_scores`**: `torch.Tensor` `(K,)` — Per-window on-ball contest activity summary.
-- **`video`**: `torch.Tensor` `(3, 16, 224, 224)` uint8 — Stabilized RGB action tube for the peak window.
 - **`label`**, **`call_type`**, **`call_type_label`** (`1` = Shooting Foul, `0` = Personal Foul), **`review_decision`**, **`game_id`**, **`fps`**, **`used_ebard`**, **`is_synthetic`**.
+- **Compact Disk Footprint (~45 KB/clip)**: By default (`save_raw_tube=False`), raw RGB frames are omitted from saved `.pt` MIL bags so 1,000 clips occupy only ~45 MB and all 37,671 clips fit in ~1.7 GB (with disk-safe chunked MP4 cleanup via `--stream --cleanup-raw`).
 
 ---
 

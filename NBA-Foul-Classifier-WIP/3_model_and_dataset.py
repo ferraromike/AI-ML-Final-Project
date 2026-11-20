@@ -221,8 +221,12 @@ def get_shared_embedding_extractor() -> nn.Module:
 
 
 # ==============================================================================
-# Dataset Loader with Strict Test Segregation & Game-Grouped Splitting
+# Dataset Loader with Strict Test Segregation, RAM Caching & Game-Grouped Splits
 # ==============================================================================
+_MIL_BAG_RAM_CACHE: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_MIL_BAG_RAM_CACHE_MAX = 12_000
+
+
 class L2MFoulDataset(Dataset):
     """
     Multi-Window MIL Bag Dataset for NBA L2M Foul Detection.
@@ -301,6 +305,27 @@ class L2MFoulDataset(Dataset):
                     call_type = str(payload.get("call_type", "")).strip()
                 if not review_decision:
                     review_decision = str(payload.get("review_decision", "")).strip().upper()
+                # Pre-populate compact RAM cache on initial discovery to avoid reading disk twice
+                cache_key = str(pt_path.resolve())
+                if cache_key not in _MIL_BAG_RAM_CACHE and len(_MIL_BAG_RAM_CACHE) < _MIL_BAG_RAM_CACHE_MAX:
+                    we = payload.get("window_embeddings")
+                    wp = payload.get("window_pose_features")
+                    wc = payload.get("window_center_frames")
+                    if (
+                        isinstance(we, torch.Tensor)
+                        and we.dim() == 2
+                        and we.size(-1) == VIDEO_FEATURE_DIM
+                        and isinstance(wp, torch.Tensor)
+                        and wp.dim() == 3
+                    ):
+                        embs_h = torch.nan_to_num(we.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                        poses_h = torch.stack([harmonize_pose_tensor(wp[i]) for i in range(wp.size(0))], dim=0)
+                        centers_h = (
+                            wc.long()
+                            if isinstance(wc, torch.Tensor) and len(wc) == len(embs_h)
+                            else torch.arange(len(embs_h), dtype=torch.long) * 30
+                        )
+                        _MIL_BAG_RAM_CACHE[cache_key] = (embs_h, poses_h, centers_h)
         except Exception:
             pass
         if not call_type:
@@ -363,7 +388,12 @@ class L2MFoulDataset(Dataset):
         return len(self.samples_meta)
 
     def load_bag_payload(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        """Load `(win_embs [K, 768], win_poses [K, 16, 16], win_centers [K], payload)` from a `.pt` file."""
+        """Load `(win_embs [K, 768], win_poses [K, 16, 16], win_centers [K], payload)` with fast RAM caching."""
+        cache_key = str(path.resolve())
+        cached = _MIL_BAG_RAM_CACHE.get(cache_key)
+        if cached is not None:
+            return cached[0], cached[1], cached[2], {}
+
         payload = load_torch_file_safe(path, map_location="cpu")
         if not isinstance(payload, dict):
             payload = {"video": payload}
@@ -386,6 +416,8 @@ class L2MFoulDataset(Dataset):
                 if isinstance(win_centers, torch.Tensor) and len(win_centers) == len(embs_h)
                 else torch.arange(len(embs_h), dtype=torch.long) * 30
             )
+            if len(_MIL_BAG_RAM_CACHE) < _MIL_BAG_RAM_CACHE_MAX:
+                _MIL_BAG_RAM_CACHE[cache_key] = (embs_h, poses_h, centers_h)
             return embs_h, poses_h, centers_h, payload
 
         # Fallback: legacy single-window `.pt` -> encode with Swin3D-T on-the-fly
@@ -401,7 +433,12 @@ class L2MFoulDataset(Dataset):
         if raw_pose is None or not isinstance(raw_pose, torch.Tensor):
             raw_pose = derive_motion_foul_features_from_rgb(raw_vid)
         pose_h = harmonize_pose_tensor(raw_pose)
-        return emb.unsqueeze(0), pose_h.unsqueeze(0), torch.tensor([FRAMES // 2], dtype=torch.long), payload
+        out_e = emb.unsqueeze(0)
+        out_p = pose_h.unsqueeze(0)
+        out_c = torch.tensor([FRAMES // 2], dtype=torch.long)
+        if len(_MIL_BAG_RAM_CACHE) < _MIL_BAG_RAM_CACHE_MAX:
+            _MIL_BAG_RAM_CACHE[cache_key] = (out_e, out_p, out_c)
+        return out_e, out_p, out_c, payload
 
     def __getitem__(self, index: int):
         meta = self.samples_meta[index]

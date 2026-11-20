@@ -1908,6 +1908,8 @@ def preprocess_dataset(
     synthetic_fallback: bool = False,
     force_reprocess: bool = False,
     auto_download_if_empty: bool = True,
+    save_raw_tube: bool = False,
+    cleanup_raw_after_extract: bool = False,
 ) -> List[Dict[str, str]]:
     """
     Build clean, deduplicated, test-isolated v3 Multi-Window MIL `.pt` bags from real raw MP4 clips:
@@ -2082,33 +2084,37 @@ def preprocess_dataset(
                     best_idx = int(torch.argmax(win_acts).item())
                     best_w = windows[best_idx]
 
-                    torch.save(
-                        {
-                            "video": best_w["tube"],
-                            "foul_features": best_w["foul_features"],
-                            "video_embedding": best_w["embedding"],
-                            "window_embeddings": win_embs,
-                            "window_pose_features": win_poses,
-                            "window_center_frames": win_centers,
-                            "window_activity_scores": win_acts,
-                            "label": label,
-                            "play_id": play_id,
-                            "game_id": game_id,
-                            "call_type": call_type,
-                            "call_type_label": call_type_label,
-                            "review_decision": review_decision,
-                            "crop_boxes": best_w["crop_boxes"],
-                            "sampled_indices": best_w["sampled_indices"],
-                            "fps": float(bag["fps"]),
-                            "is_synthetic": False,
-                            "used_ebard": bool(bag["used_ebard"]),
-                            "extractor_v": EXTRACTOR_VERSION,
-                        },
-                        out_tensor_path,
-                    )
+                    payload_out: Dict[str, Any] = {
+                        "foul_features": best_w["foul_features"],
+                        "video_embedding": best_w["embedding"],
+                        "window_embeddings": win_embs,
+                        "window_pose_features": win_poses,
+                        "window_center_frames": win_centers,
+                        "window_activity_scores": win_acts,
+                        "label": label,
+                        "play_id": play_id,
+                        "game_id": game_id,
+                        "call_type": call_type,
+                        "call_type_label": call_type_label,
+                        "review_decision": review_decision,
+                        "crop_boxes": best_w["crop_boxes"],
+                        "sampled_indices": best_w["sampled_indices"],
+                        "fps": float(bag["fps"]),
+                        "is_synthetic": False,
+                        "used_ebard": bool(bag["used_ebard"]),
+                        "extractor_v": EXTRACTOR_VERSION,
+                    }
+                    if save_raw_tube:
+                        payload_out["video"] = best_w["tube"]
+                    torch.save(payload_out, out_tensor_path)
+                    if cleanup_raw_after_extract:
+                        try:
+                            video_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                     if idx % 10 == 0 or idx == len(rows):
                         logger.info(
-                            "[%d/%d] Saved v%d MIL bag (%d windows, Swin3D-T 768-D) -> %s",
+                            "[%d/%d] Saved v%d compact MIL bag (%d windows, Swin3D-T 768-D) -> %s",
                             idx,
                             len(rows),
                             EXTRACTOR_VERSION,
@@ -2167,6 +2173,226 @@ def preprocess_dataset(
     return processed_rows
 
 
+def stream_download_and_preprocess(
+    metadata_csv: Path = BASE_DIR / "data" / "l2m_metadata.csv",
+    raw_dir: Path = BASE_DIR / "data" / "raw",
+    processed_dir: Path = BASE_DIR / "data" / "processed",
+    processed_metadata_csv: Path = BASE_DIR / "data" / "processed" / "processed_metadata.csv",
+    test_dir: Optional[Path] = None,
+    yolo_weights: str = EBARD_WEIGHTS_NAME,
+    pose_weights: Optional[str] = "yolo11n-pose.pt",
+    window_sec: float = 2.0,
+    stride_sec: float = 1.0,
+    num_frames: int = 16,
+    crop_size: int = 224,
+    device: str = "auto",
+    max_live_play_sec: float = 24.0,
+    target_clips: int = 0,
+    chunk_size: int = 100,
+    download_workers: int = 12,
+    yolo_batch_size: int = 64,
+    max_bag_windows: int = MAX_BAG_WINDOWS,
+    cleanup_raw_after_extract: bool = True,
+) -> List[Dict[str, str]]:
+    """
+    Disk-Safe Resumable Streaming Pipeline for Scaling to Thousands (or ALL 30,000+) NBA L2M Clips:
+      1. Selects balanced, newest-season-first plays across ALL unique NBA games in `l2m_metadata.csv`,
+         skipping any clips already converted to compact v3 MIL bags (~45 KB/clip) and excluding `data/test/`.
+      2. Downloads raw MP4s in chunks of `chunk_size` (default 100) using `download_workers` threads.
+      3. Extracts compact v3 Swin3D-T + E-BARD + 16-D kinematic MIL bags on GPU.
+      4. Deletes temporary chunk MP4s right after extraction (`cleanup_raw_after_extract=True`) so disk usage
+         stays under ~2 GB even when processing 5,000–35,000+ NBA clips on Google Colab!
+    """
+    scrape_mod = importlib.import_module("1_scrape_l2m")
+    metadata_csv = resolve_project_path(metadata_csv)
+    raw_dir = resolve_project_path(raw_dir)
+    processed_dir = resolve_project_path(processed_dir)
+    processed_metadata_csv = resolve_project_path(processed_metadata_csv)
+    active_test_dir = resolve_project_path(test_dir) if test_dir is not None else resolve_project_path(BASE_DIR / "data" / "test")
+
+    if not metadata_csv.exists():
+        raise FileNotFoundError(f"Metadata file {metadata_csv} not found. Run Stage 1 scraper first.")
+
+    with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
+        all_rows = list(csv.DictReader(f))
+
+    test_stems: set = set()
+    if active_test_dir.exists():
+        for p in active_test_dir.iterdir():
+            if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+                test_stems.add(p.stem)
+
+    # First check already-extracted v3 MIL bags so runs are 100% resumable!
+    done_rows: List[Dict[str, str]] = []
+    done_pids: set = set()
+    pending_by_game_class: Dict[Tuple[str, int], List[Dict[str, str]]] = {}
+
+    for r in all_rows:
+        pid = str(r.get("play_id", "")).strip()
+        if not pid or pid in test_stems:
+            continue
+        lbl = int(r.get("label", 0))
+        cls_name = "foul" if lbl == 1 else "no_foul"
+        pt_path = processed_dir / cls_name / f"{pid}.pt"
+        if pt_path.exists() and pt_path.stat().st_size > 4_096:
+            out_r = dict(r)
+            out_r["tensor_path"] = (Path("data") / "processed" / cls_name / f"{pid}.pt").as_posix()
+            done_rows.append(out_r)
+            done_pids.add(pid)
+        else:
+            gid = scrape_mod.normalize_game_id(str(r.get("game_id", ""))) or pid.split("_")[0]
+            pending_by_game_class.setdefault((gid, lbl), []).append(r)
+
+    # Order pending clips round-robin newest-season-first alternating foul & no_foul
+    ordered_pending: List[Dict[str, str]] = []
+    unique_gids = sorted({k[0] for k in pending_by_game_class.keys()}, key=scrape_mod.game_season_sort_key, reverse=True)
+    more = True
+    while more:
+        more = False
+        for gid in unique_gids:
+            for lbl in (1, 0):
+                bucket = pending_by_game_class.get((gid, lbl))
+                if bucket:
+                    ordered_pending.append(bucket.pop(0))
+                    more = True
+
+    if target_clips > 0:
+        needed = max(0, target_clips - len(done_rows))
+        ordered_pending = ordered_pending[:needed]
+
+    logger.info(
+        "Streaming v%d MIL Extractor: %d bags already cached | %d new clips queued (target=%s, chunk=%d, cleanup_raw=%s)",
+        EXTRACTOR_VERSION,
+        len(done_rows),
+        len(ordered_pending),
+        "ALL" if target_clips <= 0 else str(target_clips),
+        chunk_size,
+        cleanup_raw_after_extract,
+    )
+    if not ordered_pending:
+        write_processed_metadata(processed_metadata_csv, done_rows)
+        return done_rows
+
+    det_model, use_ebard = get_cached_basketball_model(yolo_weights)
+    pose_model = get_cached_pose_model(pose_weights or "yolo11n-pose.pt")
+    if select_yolo_device(device) == "cuda" and torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if vram_gb >= 12.0:
+            yolo_batch_size = max(yolo_batch_size, 64)
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    total_chunks = (len(ordered_pending) + chunk_size - 1) // chunk_size
+
+    for c_idx in range(total_chunks):
+        chunk_rows = ordered_pending[c_idx * chunk_size : (c_idx + 1) * chunk_size]
+        logger.info(
+            "=== Stream Chunk [%d/%d] (%d clips) — Downloading MP4s & Extracting Swin3D-T MIL Bags ===",
+            c_idx + 1,
+            total_chunks,
+            len(chunk_rows),
+        )
+        scrape_mod.bulk_download_missing_clips(
+            metadata_csv=metadata_csv,
+            output_dir=raw_dir,
+            max_workers=download_workers,
+            max_clips=0,
+            exclude_stems=test_stems,
+            rows_override=chunk_rows,
+            prefer_newest=True,
+        )
+
+        chunk_done = 0
+        for r in chunk_rows:
+            play_id = r["play_id"]
+            label = int(r["label"])
+            call_type = str(r.get("call_type", "Personal Foul")).strip()
+            call_type_label = 1 if "shoot" in call_type.lower() else 0
+            review_decision = str(r.get("review_decision", "CC" if label == 1 else "CNC")).strip().upper()
+            game_id = str(r.get("game_id", play_id.split("_")[0])).strip()
+            class_name = "foul" if label == 1 else "no_foul"
+            video_path = resolve_project_path(r["video_path"])
+            out_tensor_path = processed_dir / class_name / f"{play_id}.pt"
+            out_tensor_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not (video_path.exists() and video_path.stat().st_size > 10_240):
+                continue
+            try:
+                bag = extract_candidate_windows(
+                    video_path=video_path,
+                    det_model=det_model,
+                    pose_model=pose_model,
+                    window_sec=window_sec,
+                    stride_sec=stride_sec,
+                    num_frames=num_frames,
+                    crop_size=crop_size,
+                    device=device,
+                    max_live_play_sec=max_live_play_sec,
+                    max_windows=max_bag_windows,
+                    scan_fps=2.2,
+                    yolo_batch_size=yolo_batch_size,
+                    encode_embeddings=True,
+                )
+                windows = bag["windows"]
+                win_embs = torch.stack([w["embedding"] for w in windows], dim=0).float()
+                win_poses = torch.stack([w["foul_features"] for w in windows], dim=0).float()
+                win_centers = torch.tensor([w["center_frame"] for w in windows], dtype=torch.long)
+                win_acts = torch.tensor([w["activity_score"] for w in windows], dtype=torch.float32)
+                best_idx = int(torch.argmax(win_acts).item())
+                best_w = windows[best_idx]
+
+                torch.save(
+                    {
+                        "foul_features": best_w["foul_features"],
+                        "video_embedding": best_w["embedding"],
+                        "window_embeddings": win_embs,
+                        "window_pose_features": win_poses,
+                        "window_center_frames": win_centers,
+                        "window_activity_scores": win_acts,
+                        "label": label,
+                        "play_id": play_id,
+                        "game_id": game_id,
+                        "call_type": call_type,
+                        "call_type_label": call_type_label,
+                        "review_decision": review_decision,
+                        "crop_boxes": best_w["crop_boxes"],
+                        "sampled_indices": best_w["sampled_indices"],
+                        "fps": float(bag["fps"]),
+                        "is_synthetic": False,
+                        "used_ebard": bool(bag["used_ebard"]),
+                        "extractor_v": EXTRACTOR_VERSION,
+                    },
+                    out_tensor_path,
+                )
+                out_r = dict(r)
+                out_r["tensor_path"] = (Path("data") / "processed" / class_name / f"{play_id}.pt").as_posix()
+                done_rows.append(out_r)
+                chunk_done += 1
+            except Exception as exc:
+                logger.warning("Stream extract failed on %s: %s", video_path.name, exc)
+            finally:
+                if cleanup_raw_after_extract:
+                    try:
+                        video_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # Checkpoint processed_metadata.csv after EVERY chunk so progress is never lost!
+        write_processed_metadata(processed_metadata_csv, done_rows)
+        logger.info(
+            "Chunk [%d/%d] complete (+%d extracted | %d total v%d MIL bags saved)",
+            c_idx + 1,
+            total_chunks,
+            chunk_done,
+            len(done_rows),
+            EXTRACTOR_VERSION,
+        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return done_rows
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="E-BARD Basketball Perception, 2-Team CIELAB Clustering & Multi-Window MIL Extractor"
@@ -2177,7 +2403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-dir", type=Path, default=BASE_DIR / "data" / "test")
     parser.add_argument("--yolo-weights", type=str, default=EBARD_WEIGHTS_NAME)
     parser.add_argument("--pose-weights", type=str, default="yolo11n-pose.pt")
-    parser.add_argument("--max-clips", type=int, default=0, help="0 = process all real raw videos")
+    parser.add_argument("--max-clips", type=int, default=0, help="0 = process all available clips")
     parser.add_argument("--yolo-batch-size", type=int, default=32)
     parser.add_argument("--window-sec", type=float, default=2.0)
     parser.add_argument("--stride-sec", type=float, default=1.0)
@@ -2189,28 +2415,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--force-reprocess", action="store_true")
     parser.add_argument("--synthetic-fallback", action="store_true")
+    parser.add_argument("--stream", action="store_true", help="Stream-download in chunks, extract compact 45KB MIL bags, and optionally delete temp MP4s")
+    parser.add_argument("--chunk-size", type=int, default=100)
+    parser.add_argument("--download-workers", type=int, default=12)
+    parser.add_argument("--cleanup-raw", action="store_true", help="Delete raw MP4 after extracting its compact MIL bag (disk-safe for 1,000-37,000+ clips)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    preprocess_dataset(
-        metadata_csv=args.metadata_csv,
-        processed_dir=args.processed_dir,
-        processed_metadata_csv=args.processed_metadata_csv,
-        test_dir=args.test_dir,
-        yolo_weights=args.yolo_weights,
-        pose_weights=args.pose_weights or None,
-        window_sec=args.window_sec,
-        stride_sec=args.stride_sec,
-        num_frames=args.num_frames,
-        crop_size=args.crop_size,
-        device=args.device,
-        max_live_play_sec=args.max_live_play_sec,
-        max_scan_samples=args.max_scan_samples,
-        max_clips=args.max_clips,
-        yolo_batch_size=args.yolo_batch_size,
-        max_bag_windows=args.max_bag_windows,
-        synthetic_fallback=args.synthetic_fallback,
-        force_reprocess=args.force_reprocess,
-    )
+    if args.stream:
+        stream_download_and_preprocess(
+            metadata_csv=args.metadata_csv,
+            processed_dir=args.processed_dir,
+            processed_metadata_csv=args.processed_metadata_csv,
+            test_dir=args.test_dir,
+            yolo_weights=args.yolo_weights,
+            pose_weights=args.pose_weights or None,
+            window_sec=args.window_sec,
+            stride_sec=args.stride_sec,
+            num_frames=args.num_frames,
+            crop_size=args.crop_size,
+            device=args.device,
+            max_live_play_sec=args.max_live_play_sec,
+            target_clips=args.max_clips,
+            chunk_size=args.chunk_size,
+            download_workers=args.download_workers,
+            yolo_batch_size=args.yolo_batch_size,
+            max_bag_windows=args.max_bag_windows,
+            cleanup_raw_after_extract=args.cleanup_raw,
+        )
+    else:
+        preprocess_dataset(
+            metadata_csv=args.metadata_csv,
+            processed_dir=args.processed_dir,
+            processed_metadata_csv=args.processed_metadata_csv,
+            test_dir=args.test_dir,
+            yolo_weights=args.yolo_weights,
+            pose_weights=args.pose_weights or None,
+            window_sec=args.window_sec,
+            stride_sec=args.stride_sec,
+            num_frames=args.num_frames,
+            crop_size=args.crop_size,
+            device=args.device,
+            max_live_play_sec=args.max_live_play_sec,
+            max_scan_samples=args.max_scan_samples,
+            max_clips=args.max_clips,
+            yolo_batch_size=args.yolo_batch_size,
+            max_bag_windows=args.max_bag_windows,
+            synthetic_fallback=args.synthetic_fallback,
+            force_reprocess=args.force_reprocess,
+            cleanup_raw_after_extract=args.cleanup_raw,
+        )
