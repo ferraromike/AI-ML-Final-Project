@@ -562,6 +562,21 @@ def resolve_mp4_url(
     if not event_id:
         return None
 
+    # Fast-path: Direct Akamai static CDN URL (works across 2018-19 through 2026-27 without
+    # hitting official.nba.com WordPress HTML pages, avoiding rate limits & halving latency!)
+    direct_cdn_url = (
+        f"https://ak-static.cms.nba.com/wp-content/uploads/referee-clips/"
+        f"{game_id}_{event_id}_DF%20BCAST_1509kbps.mp4"
+    )
+    try:
+        head_fn = getattr(session, "head", None)
+        if callable(head_fn):
+            hr = head_fn(direct_cdn_url, headers=OFFICIAL_HEADERS, timeout=8, allow_redirects=True)
+            if hr.status_code == 200:
+                return direct_cdn_url
+    except Exception:
+        pass
+
     video_page_url = f"{official_root}/last-two-minute-report/?gameNo={game_id}&eventNum={event_id}"
     try:
         page_resp = session.get(video_page_url, headers=OFFICIAL_HEADERS, timeout=12)
@@ -869,8 +884,10 @@ def bulk_download_missing_clips(
     )
 
     downloaded = 0
+    failed = 0
+    first_errors: List[str] = []
 
-    def _worker(row: Dict[str, Any]) -> bool:
+    def _worker(row: Dict[str, Any]) -> Tuple[bool, str]:
         play_id = str(row.get("play_id", "")).strip()
         game_id = normalize_game_id(str(row.get("game_id", "")))
         label = int(row.get("label", 0))
@@ -880,29 +897,38 @@ def bulk_download_missing_clips(
         parts = play_id.split("_")
         event_id = parts[1] if len(parts) > 1 else ""
         if not event_id:
-            return False
+            return False, f"{play_id}: missing event_id"
 
         # Thread-local session avoids urllib3 connection-pool contention across threads
         worker_sess = build_session()
         mp4_url = resolve_mp4_url(worker_sess, game_id, event_id)
         if not mp4_url:
-            return False
-        return download_mp4_clip(worker_sess, mp4_url, dest)
+            return False, f"{play_id}: could not resolve MP4 URL"
+        ok = download_mp4_clip(worker_sess, mp4_url, dest)
+        return ok, "" if ok else f"{play_id}: download failed for {mp4_url}"
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker, r): r.get("play_id") for r in to_download}
         for fut in as_completed(futures):
             pid = futures[fut]
             try:
-                ok = fut.result()
+                ok, err_msg = fut.result()
                 if ok:
                     downloaded += 1
                     if downloaded % 25 == 0 or downloaded == len(to_download):
                         logger.info("Download progress: %d / %d clips retrieved", downloaded, len(to_download))
+                else:
+                    failed += 1
+                    if len(first_errors) < 3 and err_msg:
+                        first_errors.append(err_msg)
             except Exception as exc:
-                logger.debug("Download failed for %s: %s", pid, exc)
+                failed += 1
+                if len(first_errors) < 3:
+                    first_errors.append(f"{pid}: {exc}")
 
-    logger.info("Bulk download complete! Successfully retrieved %d / %d clips.", downloaded, len(to_download))
+    if failed > 0 and downloaded == 0:
+        logger.warning("All %d clip downloads failed! Sample errors: %s", failed, first_errors)
+    logger.info("Bulk download complete! Successfully retrieved %d / %d clips (%d failed).", downloaded, len(to_download), failed)
     return downloaded
 
 
