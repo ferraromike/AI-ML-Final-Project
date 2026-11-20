@@ -36,7 +36,9 @@ import argparse
 import csv
 import gc
 import hashlib
+import importlib
 import logging
+import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,6 +59,8 @@ except ImportError:
     YOLO = None  # type: ignore[assignment]
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2310,7 +2314,9 @@ def stream_download_and_preprocess(
             review_decision = str(r.get("review_decision", "CC" if label == 1 else "CNC")).strip().upper()
             game_id = str(r.get("game_id", play_id.split("_")[0])).strip()
             class_name = "foul" if label == 1 else "no_foul"
-            video_path = resolve_project_path(r["video_path"])
+            video_path = raw_dir / class_name / f"{play_id}.mp4"
+            if not video_path.exists():
+                video_path = resolve_project_path(r["video_path"])
             out_tensor_path = processed_dir / class_name / f"{play_id}.pt"
             out_tensor_path.parent.mkdir(parents=True, exist_ok=True)
 
