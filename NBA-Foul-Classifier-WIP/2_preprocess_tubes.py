@@ -1907,14 +1907,16 @@ def preprocess_dataset(
     max_bag_windows: int = MAX_BAG_WINDOWS,
     synthetic_fallback: bool = False,
     force_reprocess: bool = False,
+    auto_download_if_empty: bool = True,
 ) -> List[Dict[str, str]]:
     """
     Build clean, deduplicated, test-isolated v3 Multi-Window MIL `.pt` bags from real raw MP4 clips:
       1. Strictly excludes all clips in `data/test/` (by stem AND video content hash!) to prevent leakage.
-      2. Deduplicates conflicting/identical raw MP4s (prioritizing foul label when two L2M events share one video).
-      3. Runs E-BARD Basketball YOLO + 2-Team CIELAB Clustering + YOLOv11-Pose + Swin3D-T (`768-D`)
+      2. Auto-downloads missing raw `.mp4` files from `l2m_metadata.csv` if `data/raw/` is empty (e.g. fresh Colab clone).
+      3. Deduplicates conflicting/identical raw MP4s (prioritizing foul label when two L2M events share one video).
+      4. Runs E-BARD Basketball YOLO + 2-Team CIELAB Clustering + YOLOv11-Pose + Swin3D-T (`768-D`)
          across up to `max_bag_windows` (default `8`) 2.0s candidate windows per clip.
-      4. Saves real ground-truth `label`, `call_type`, `call_type_label`, `review_decision`, and `game_id`.
+      5. Saves real ground-truth `label`, `call_type`, `call_type_label`, `review_decision`, and `game_id`.
     """
     metadata_csv = resolve_project_path(metadata_csv)
     processed_dir = resolve_project_path(processed_dir)
@@ -1937,28 +1939,60 @@ def preprocess_dataset(
                 if p.stat().st_size > 10_240:
                     test_hashes.add(_video_content_hash(p))
 
-    filtered_rows: List[Dict[str, str]] = []
-    seen_hashes: Dict[str, Tuple[int, int]] = {}  # hash -> (index_in_filtered, label)
-    for r in all_rows:
-        pid = r.get("play_id", "").strip()
-        vp = resolve_project_path(r.get("video_path", ""))
-        if pid in test_stems or vp.stem in test_stems:
-            continue
-        if vp.exists() and vp.stat().st_size > 10_240:
-            vh = _video_content_hash(vp)
-            if vh in test_hashes:
+    def _collect_available_rows() -> List[Dict[str, str]]:
+        out_rows: List[Dict[str, str]] = []
+        seen_hashes: Dict[str, Tuple[int, int]] = {}  # hash -> (index_in_filtered, label)
+        for r in all_rows:
+            pid = r.get("play_id", "").strip()
+            vp = resolve_project_path(r.get("video_path", ""))
+            if pid in test_stems or vp.stem in test_stems:
                 continue
-            lbl = int(r.get("label", 0))
-            if vh in seen_hashes:
-                prev_idx, prev_lbl = seen_hashes[vh]
-                if lbl == 1 and prev_lbl == 0:
-                    filtered_rows[prev_idx] = r
-                    seen_hashes[vh] = (prev_idx, 1)
-                continue
-            seen_hashes[vh] = (len(filtered_rows), lbl)
-            filtered_rows.append(r)
-        elif synthetic_fallback:
-            filtered_rows.append(r)
+            if vp.exists() and vp.stat().st_size > 10_240:
+                vh = _video_content_hash(vp)
+                if vh in test_hashes:
+                    continue
+                lbl = int(r.get("label", 0))
+                if vh in seen_hashes:
+                    prev_idx, prev_lbl = seen_hashes[vh]
+                    if lbl == 1 and prev_lbl == 0:
+                        out_rows[prev_idx] = r
+                        seen_hashes[vh] = (prev_idx, 1)
+                    continue
+                seen_hashes[vh] = (len(out_rows), lbl)
+                out_rows.append(r)
+            elif synthetic_fallback:
+                out_rows.append(r)
+        return out_rows
+
+    filtered_rows = _collect_available_rows()
+
+    # Safety net for fresh Git clones / Google Colab where `data/raw/*.mp4` is gitignored:
+    if len(filtered_rows) == 0 and auto_download_if_empty and not synthetic_fallback:
+        logger.warning(
+            "Found 0 downloaded raw `.mp4` videos on disk for %d metadata rows! "
+            "Auto-downloading missing L2M broadcast clips via `1_scrape_l2m.bulk_download_missing_clips()`...",
+            len(all_rows),
+        )
+        try:
+            scrape_mod = importlib.import_module("1_scrape_l2m")
+            dl_limit = max_clips if max_clips > 0 else 0
+            scrape_mod.bulk_download_missing_clips(
+                metadata_csv=metadata_csv,
+                output_dir=BASE_DIR / "data" / "raw",
+                max_workers=10,
+                max_clips=dl_limit,
+                exclude_stems=test_stems,
+            )
+            filtered_rows = _collect_available_rows()
+        except Exception as exc:
+            logger.error("Auto-download of raw L2M clips failed: %s", exc)
+
+    if len(filtered_rows) == 0:
+        logger.error(
+            "Still 0 raw `.mp4` videos available to preprocess! "
+            "Run Stage 1 (`python 1_scrape_l2m.py --bulk-download` or Notebook Cell 2) with internet access first."
+        )
+        return []
 
     if test_stems:
         logger.info("Segregated %d test clips (excluded by stem + content hash): %s", len(test_stems), sorted(test_stems))

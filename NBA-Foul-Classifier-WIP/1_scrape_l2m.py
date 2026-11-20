@@ -570,7 +570,8 @@ def resolve_mp4_url(
     except Exception as exc:
         logger.debug("Failed fetching L2M video page for game=%s event=%s: %s", game_id, event_id, exc)
 
-    return None
+    # Secondary fallback via NBA Stats videoeventsasset endpoint
+    return query_stats_video_asset(session, game_id, event_id)
 
 
 def download_mp4_clip(
@@ -773,12 +774,14 @@ def download_missing_clips_from_rows(
 def bulk_download_missing_clips(
     metadata_csv: Optional[Path | str] = None,
     output_dir: Optional[Path | str] = None,
-    max_workers: int = 4,
+    max_workers: int = 8,
     max_clips: int = 0,
+    exclude_stems: Optional[Set[str]] = None,
 ) -> int:
     """
-    High-throughput multithreaded downloader for Google Colab and high-compute environments.
-    Concurrently resolves CDN video URLs and downloads missing `.mp4` clips for rows in `metadata_csv`.
+    High-throughput multithreaded downloader for Google Colab and local environments.
+    Interleaves missing `.mp4` clips across all unique NBA `game_id`s and both classes (`foul` / `no_foul`),
+    then concurrently resolves official NBA CDN URLs and downloads them into `data/raw/{foul,no_foul}/`.
     """
     csv_path = resolve_project_path(metadata_csv or (BASE_DIR / "data" / "l2m_metadata.csv"))
     raw_dir = resolve_project_path(output_dir or (BASE_DIR / "data" / "raw"))
@@ -794,15 +797,38 @@ def bulk_download_missing_clips(
     with open(csv_path, "r", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    # Identify rows whose video files are missing on disk
-    to_download: List[Dict[str, Any]] = []
+    skip_stems = set(exclude_stems or set())
+    test_dir = BASE_DIR / "data" / "test"
+    if test_dir.exists():
+        for p in test_dir.iterdir():
+            if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+                skip_stems.add(p.stem)
+
+    # Identify rows whose video files are missing on disk, grouped round-robin across games & classes
+    by_game_class: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     for r in rows:
         play_id = str(r.get("play_id", "")).strip()
+        if not play_id or play_id in skip_stems:
+            continue
         label = int(r.get("label", 0))
         target_dir = foul_dir if label == 1 else no_foul_dir
         dest = target_dir / f"{play_id}.mp4"
         if not dest.exists() or dest.stat().st_size < 10_240:
-            to_download.append(r)
+            gid = normalize_game_id(str(r.get("game_id", ""))) or play_id.split("_")[0]
+            by_game_class.setdefault((gid, label), []).append(r)
+
+    # Round-robin interleave across games and classes (foul, no_foul) so partial subsets stay balanced
+    to_download: List[Dict[str, Any]] = []
+    unique_gids = sorted({k[0] for k in by_game_class.keys()})
+    more = True
+    while more:
+        more = False
+        for gid in unique_gids:
+            for lbl in (1, 0):
+                bucket = by_game_class.get((gid, lbl))
+                if bucket:
+                    to_download.append(bucket.pop(0))
+                    more = True
 
     if not to_download:
         logger.info("All %d videos in metadata are already present on disk!", len(rows))
@@ -812,12 +838,12 @@ def bulk_download_missing_clips(
         to_download = to_download[:max_clips]
 
     logger.info(
-        "Initiating parallel download for %d missing clips (Workers: %d)...",
+        "Initiating parallel download for %d missing clips across %d NBA games (Workers: %d)...",
         len(to_download),
+        len({normalize_game_id(str(r.get('game_id', ''))) for r in to_download}),
         max_workers,
     )
 
-    session = build_session()
     downloaded = 0
 
     def _worker(row: Dict[str, Any]) -> bool:
@@ -832,10 +858,12 @@ def bulk_download_missing_clips(
         if not event_id:
             return False
 
-        mp4_url = resolve_mp4_url(session, game_id, event_id)
+        # Thread-local session avoids urllib3 connection-pool contention across threads
+        worker_sess = build_session()
+        mp4_url = resolve_mp4_url(worker_sess, game_id, event_id)
         if not mp4_url:
             return False
-        return download_mp4_clip(session, mp4_url, dest)
+        return download_mp4_clip(worker_sess, mp4_url, dest)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker, r): r.get("play_id") for r in to_download}
@@ -845,12 +873,12 @@ def bulk_download_missing_clips(
                 ok = fut.result()
                 if ok:
                     downloaded += 1
-                    if downloaded % 10 == 0 or downloaded == len(to_download):
-                        logger.info("Progress: %d / %d clips downloaded", downloaded, len(to_download))
+                    if downloaded % 15 == 0 or downloaded == len(to_download):
+                        logger.info("Download progress: %d / %d clips retrieved", downloaded, len(to_download))
             except Exception as exc:
                 logger.debug("Download failed for %s: %s", pid, exc)
 
-    logger.info("Bulk download complete! Successfully retrieved %d clips.", downloaded)
+    logger.info("Bulk download complete! Successfully retrieved %d / %d clips.", downloaded, len(to_download))
     return downloaded
 
 
