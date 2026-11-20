@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import logging
 import re
 import time
@@ -125,14 +124,6 @@ logger = logging.getLogger("l2m_scraper")
 
 CURRENT_SEASON_URL = "https://official.nba.com/2026-27-nba-officiating-last-two-minute-reports/"
 ARCHIVE_URL = "https://official.nba.com/nba-officiating-last-two-minute-reports-archive/"
-ALL_SEASON_L2M_URLS = [
-    "https://official.nba.com/2026-27-nba-officiating-last-two-minute-reports/",
-    "https://official.nba.com/2025-26-nba-officiating-last-two-minute-reports/",
-    "https://official.nba.com/2024-25-nba-officiating-last-two-minute-reports/",
-    "https://official.nba.com/2023-24-nba-officiating-last-two-minute-reports/",
-    "https://official.nba.com/2022-23-nba-officiating-last-two-minute-reports/",
-    ARCHIVE_URL,
-]
 L2M_JSON_ENDPOINT = "https://official.nba.com/l2m/json/{game_id}.json"
 L2M_HTML_ENDPOINT = "https://official.nba.com/l2m/L2MReport.html?gameId={game_id}"
 NBA_VIDEO_ASSET_ENDPOINT = "https://stats.nba.com/stats/videoeventsasset"
@@ -224,16 +215,6 @@ def normalize_game_id(raw_game_id: str) -> str:
     """Zero-pad numeric NBA game IDs to standard 10-digit strings (e.g., '0022600186')."""
     digits = re.sub(r"\D", "", str(raw_game_id))
     return digits.zfill(10) if digits else str(raw_game_id).strip()
-
-
-def game_season_sort_key(game_id: str) -> Tuple[int, str]:
-    """
-    Sort 10-digit NBA `game_id`s newest-season-first (e.g. `00226...` (2026-27) > `00225...` (2025-26) > ...).
-    Digits `[3:5]` encode the 2-digit NBA season year (`26`, `25`, `24`, ..., `15`).
-    """
-    gid = normalize_game_id(game_id)
-    yr = int(gid[3:5]) if (len(gid) == 10 and gid[3:5].isdigit()) else 0
-    return (yr, gid)
 
 
 def discover_l2m_game_ids(
@@ -369,7 +350,7 @@ def fetch_l2m_report_entries(
                     else (game_meta if isinstance(game_meta, dict) else {})
                 )
                 if isinstance(l2m_rows, list) and l2m_rows:
-                    logger.debug("Loaded %d L2M play entries for game %s", len(l2m_rows), game_id)
+                    logger.info("Loaded %d L2M play entries for game %s", len(l2m_rows), game_id)
                     return meta_dict, l2m_rows
     except Exception as exc:
         logger.debug("JSON endpoint fallback for game %s: %s", game_id, exc)
@@ -562,21 +543,6 @@ def resolve_mp4_url(
     if not event_id:
         return None
 
-    # Fast-path: Direct Akamai static CDN URL (works across 2018-19 through 2026-27 without
-    # hitting official.nba.com WordPress HTML pages, avoiding rate limits & halving latency!)
-    direct_cdn_url = (
-        f"https://ak-static.cms.nba.com/wp-content/uploads/referee-clips/"
-        f"{game_id}_{event_id}_DF%20BCAST_1509kbps.mp4"
-    )
-    try:
-        head_fn = getattr(session, "head", None)
-        if callable(head_fn):
-            hr = head_fn(direct_cdn_url, headers=OFFICIAL_HEADERS, timeout=8, allow_redirects=True)
-            if hr.status_code == 200:
-                return direct_cdn_url
-    except Exception:
-        pass
-
     video_page_url = f"{official_root}/last-two-minute-report/?gameNo={game_id}&eventNum={event_id}"
     try:
         page_resp = session.get(video_page_url, headers=OFFICIAL_HEADERS, timeout=12)
@@ -603,8 +569,7 @@ def resolve_mp4_url(
     except Exception as exc:
         logger.debug("Failed fetching L2M video page for game=%s event=%s: %s", game_id, event_id, exc)
 
-    # Secondary fallback via NBA Stats videoeventsasset endpoint
-    return query_stats_video_asset(session, game_id, event_id)
+    return None
 
 
 def download_mp4_clip(
@@ -807,17 +772,12 @@ def download_missing_clips_from_rows(
 def bulk_download_missing_clips(
     metadata_csv: Optional[Path | str] = None,
     output_dir: Optional[Path | str] = None,
-    max_workers: int = 12,
+    max_workers: int = 4,
     max_clips: int = 0,
-    exclude_stems: Optional[Set[str]] = None,
-    rows_override: Optional[List[Dict[str, Any]]] = None,
-    prefer_newest: bool = True,
 ) -> int:
     """
-    High-throughput multithreaded downloader for Google Colab and local environments.
-    Interleaves missing `.mp4` clips round-robin across unique NBA `game_id`s (newest seasons first!)
-    and alternates `foul` / `no_foul` (50/50 balanced), then concurrently resolves official NBA CDN
-    URLs and downloads them into `data/raw/{foul,no_foul}/`.
+    High-throughput multithreaded downloader for Google Colab and high-compute environments.
+    Concurrently resolves CDN video URLs and downloads missing `.mp4` clips for rows in `metadata_csv`.
     """
     csv_path = resolve_project_path(metadata_csv or (BASE_DIR / "data" / "l2m_metadata.csv"))
     raw_dir = resolve_project_path(output_dir or (BASE_DIR / "data" / "raw"))
@@ -826,68 +786,40 @@ def bulk_download_missing_clips(
     foul_dir.mkdir(parents=True, exist_ok=True)
     no_foul_dir.mkdir(parents=True, exist_ok=True)
 
-    if rows_override is not None:
-        rows = list(rows_override)
-    else:
-        if not csv_path.exists():
-            logger.warning("Metadata CSV not found: %s", csv_path)
-            return 0
-        with open(csv_path, "r", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
+    if not csv_path.exists():
+        logger.warning("Metadata CSV not found: %s", csv_path)
+        return 0
 
-    skip_stems = set(exclude_stems or set())
-    test_dir = BASE_DIR / "data" / "test"
-    if test_dir.exists():
-        for p in test_dir.iterdir():
-            if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
-                skip_stems.add(p.stem)
+    with open(csv_path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
 
-    # Identify rows whose video files are missing on disk, grouped round-robin across games & classes
-    by_game_class: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    # Identify rows whose video files are missing on disk
+    to_download: List[Dict[str, Any]] = []
     for r in rows:
         play_id = str(r.get("play_id", "")).strip()
-        if not play_id or play_id in skip_stems:
-            continue
         label = int(r.get("label", 0))
         target_dir = foul_dir if label == 1 else no_foul_dir
         dest = target_dir / f"{play_id}.mp4"
         if not dest.exists() or dest.stat().st_size < 10_240:
-            gid = normalize_game_id(str(r.get("game_id", ""))) or play_id.split("_")[0]
-            by_game_class.setdefault((gid, label), []).append(r)
-
-    # Round-robin interleave newest-season-first across games & alternating classes (foul, no_foul)
-    to_download: List[Dict[str, Any]] = []
-    unique_gids = sorted({k[0] for k in by_game_class.keys()}, key=game_season_sort_key, reverse=prefer_newest)
-    more = True
-    while more:
-        more = False
-        for gid in unique_gids:
-            for lbl in (1, 0):
-                bucket = by_game_class.get((gid, lbl))
-                if bucket:
-                    to_download.append(bucket.pop(0))
-                    more = True
+            to_download.append(r)
 
     if not to_download:
-        logger.info("All %d videos in target list are already present on disk!", len(rows))
+        logger.info("All %d videos in metadata are already present on disk!", len(rows))
         return 0
 
     if max_clips > 0:
         to_download = to_download[:max_clips]
 
     logger.info(
-        "Initiating parallel download for %d missing clips across %d NBA games (Workers: %d, newest_first=%s)...",
+        "Initiating parallel download for %d missing clips (Workers: %d)...",
         len(to_download),
-        len({normalize_game_id(str(r.get('game_id', ''))) for r in to_download}),
         max_workers,
-        prefer_newest,
     )
 
+    session = build_session()
     downloaded = 0
-    failed = 0
-    first_errors: List[str] = []
 
-    def _worker(row: Dict[str, Any]) -> Tuple[bool, str]:
+    def _worker(row: Dict[str, Any]) -> bool:
         play_id = str(row.get("play_id", "")).strip()
         game_id = normalize_game_id(str(row.get("game_id", "")))
         label = int(row.get("label", 0))
@@ -897,243 +829,28 @@ def bulk_download_missing_clips(
         parts = play_id.split("_")
         event_id = parts[1] if len(parts) > 1 else ""
         if not event_id:
-            return False, f"{play_id}: missing event_id"
+            return False
 
-        # Thread-local session avoids urllib3 connection-pool contention across threads
-        worker_sess = build_session()
-        mp4_url = resolve_mp4_url(worker_sess, game_id, event_id)
+        mp4_url = resolve_mp4_url(session, game_id, event_id)
         if not mp4_url:
-            return False, f"{play_id}: could not resolve MP4 URL"
-        ok = download_mp4_clip(worker_sess, mp4_url, dest)
-        return ok, "" if ok else f"{play_id}: download failed for {mp4_url}"
+            return False
+        return download_mp4_clip(session, mp4_url, dest)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker, r): r.get("play_id") for r in to_download}
         for fut in as_completed(futures):
             pid = futures[fut]
             try:
-                ok, err_msg = fut.result()
+                ok = fut.result()
                 if ok:
                     downloaded += 1
-                    if downloaded % 25 == 0 or downloaded == len(to_download):
-                        logger.info("Download progress: %d / %d clips retrieved", downloaded, len(to_download))
-                else:
-                    failed += 1
-                    if len(first_errors) < 3 and err_msg:
-                        first_errors.append(err_msg)
+                    if downloaded % 10 == 0 or downloaded == len(to_download):
+                        logger.info("Progress: %d / %d clips downloaded", downloaded, len(to_download))
             except Exception as exc:
-                failed += 1
-                if len(first_errors) < 3:
-                    first_errors.append(f"{pid}: {exc}")
+                logger.debug("Download failed for %s: %s", pid, exc)
 
-    if failed > 0 and downloaded == 0:
-        logger.warning("All %d clip downloads failed! Sample errors: %s", failed, first_errors)
-    logger.info("Bulk download complete! Successfully retrieved %d / %d clips (%d failed).", downloaded, len(to_download), failed)
+    logger.info("Bulk download complete! Successfully retrieved %d clips.", downloaded)
     return downloaded
-
-
-def scrape_all_l2m_metadata(
-    metadata_csv: Path = BASE_DIR / "data" / "l2m_metadata.csv",
-    daily_csv: Optional[Path] = BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
-    include_archive: bool = True,
-    max_games: int = 0,
-    max_workers: int = 16,
-    force_rescrape: bool = False,
-) -> List[Dict[str, Any]]:
-    """
-    High-throughput parallel L2M metadata harvester covering ALL official NBA L2M seasons
-    (2026-27, 2025-26, 2024-25, 2023-24, 2022-23, and the full Archive — 3,194+ NBA games!).
-
-    - `max_games <= 0` scrapes EVERY discovered NBA L2M game.
-    - Keeps only Shooting Foul & Personal Foul assessments (`CC`, `INC`, `CNC`, `IC`) that have a
-      valid numeric `video_event_id` (ensuring downloadable clips).
-    - Automatically deduplicates identical `(game_id, video_event_id)` events and drops conflicting-label
-      collisions before writing `data/l2m_metadata.csv`.
-    """
-    metadata_csv = resolve_project_path(metadata_csv)
-    if daily_csv is not None:
-        daily_csv = resolve_project_path(daily_csv)
-    metadata_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load existing metadata so incremental re-runs only fetch brand-new games
-    existing_rows: List[Dict[str, Any]] = []
-    existing_games: Set[str] = set()
-    if metadata_csv.exists() and not force_rescrape:
-        with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                pid = str(row.get("play_id", "")).strip()
-                gid = normalize_game_id(str(row.get("game_id", "")))
-                if pid and gid:
-                    existing_rows.append(row)
-                    existing_games.add(gid)
-
-    season_urls = list(ALL_SEASON_L2M_URLS) if include_archive else list(ALL_SEASON_L2M_URLS[:-1])
-    sess = build_session()
-    discovered_ids = discover_l2m_game_ids(
-        sess,
-        season_urls,
-        max_games=(max_games if max_games > 0 else None),
-    )
-    # Sort newest-season-first so 2026-27 -> 2025-26 -> 2024-25 -> ... are prioritized
-    discovered_ids = sorted(discovered_ids, key=game_season_sort_key, reverse=True)
-    if max_games > 0:
-        discovered_ids = discovered_ids[:max_games]
-
-    pending_games = [g for g in discovered_ids if g not in existing_games]
-    logger.info(
-        "L2M Metadata Harvester: %d games discovered (%d already in CSV, %d new games to fetch with %d workers)...",
-        len(discovered_ids),
-        len(existing_games),
-        len(pending_games),
-        max_workers,
-    )
-
-    parsed_base = urlparse(CURRENT_SEASON_URL)
-    official_root = f"{parsed_base.scheme}://{parsed_base.netloc}"
-
-    def _fetch_one_game(game_id: str) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        ws = build_session(retries=2, backoff_factor=0.5)
-        game_meta, entries = fetch_l2m_report_entries(ws, game_id)
-        if not entries:
-            return game_id, [], []
-        game_date = str(
-            game_meta.get("GameDateOut")
-            or game_meta.get("GameDate")
-            or game_meta.get("game_date")
-            or ""
-        ).strip()
-        meta_out: List[Dict[str, Any]] = []
-        inc_out: List[Dict[str, Any]] = []
-        for idx, raw_entry in enumerate(entries):
-            parsed = extract_entry_fields(game_id, idx, raw_entry)
-            norm_call_type = is_shooting_or_personal_foul(parsed["call_type_raw"])
-            if norm_call_type is None:
-                continue
-            decision = parsed["review_decision"]
-            if decision not in LABEL_MAP:
-                continue
-            event_digits = re.sub(r"\D", "", str(parsed.get("video_event_id", "")))
-            if not event_digits:
-                continue
-            label = LABEL_MAP[decision]
-            play_id = parsed["play_id"]
-            rel_path = (Path("data") / "raw" / ("foul" if label == 1 else "no_foul") / f"{play_id}.mp4").as_posix()
-            meta_out.append(
-                {
-                    "play_id": play_id,
-                    "game_id": game_id,
-                    "player_committing": parsed["player_committing"],
-                    "player_disadvantaged": parsed["player_disadvantaged"],
-                    "call_type": norm_call_type,
-                    "review_decision": decision,
-                    "label": label,
-                    "video_path": rel_path,
-                }
-            )
-            if decision in {"INC", "IC"}:
-                inc_out.append(
-                    {
-                        "play_id": play_id,
-                        "game_id": game_id,
-                        "game_date": game_date,
-                        "period": parsed["period"],
-                        "time_remaining": parsed["time_remaining"],
-                        "call_type": norm_call_type,
-                        "player_committing": parsed["player_committing"],
-                        "player_disadvantaged": parsed["player_disadvantaged"],
-                        "review_decision": decision,
-                        "video_url": f"{official_root}/last-two-minute-report/?gameNo={game_id}&eventNum={event_digits}",
-                        "comments": parsed["comments"],
-                    }
-                )
-        return game_id, meta_out, inc_out
-
-    new_rows: List[Dict[str, Any]] = []
-    new_inc_rows: List[Dict[str, Any]] = []
-    completed = 0
-    if pending_games:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_fetch_one_game, g): g for g in pending_games}
-            for fut in as_completed(futures):
-                completed += 1
-                try:
-                    _, g_rows, g_inc = fut.result()
-                    if g_rows:
-                        new_rows.extend(g_rows)
-                    if g_inc:
-                        new_inc_rows.extend(g_inc)
-                except Exception as exc:
-                    logger.debug("Game fetch error for %s: %s", futures[fut], exc)
-                if completed % 200 == 0 or completed == len(pending_games):
-                    logger.info(
-                        "Scraped [%d/%d] NBA games (+%d new foul/no-foul plays)...",
-                        completed,
-                        len(pending_games),
-                        len(new_rows),
-                    )
-
-    # Merge + Deduplicate by (game_id, video_event_id) to remove identical-video conflicts at CSV time!
-    combined = existing_rows + new_rows
-    by_event_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for r in combined:
-        pid = str(r.get("play_id", "")).strip()
-        gid = normalize_game_id(str(r.get("game_id", "")))
-        parts = pid.split("_")
-        ev_id = parts[1] if len(parts) > 1 else pid
-        by_event_key.setdefault((gid, ev_id), []).append(r)
-
-    clean_rows: List[Dict[str, Any]] = []
-    dropped_conflicts = 0
-    dropped_dups = 0
-    for (_, _), grp in by_event_key.items():
-        lbls = {int(x.get("label", 0)) for x in grp}
-        if len(lbls) > 1:
-            # Ambiguous play clip labeled both foul & no_foul -> drop conflict!
-            dropped_conflicts += len(grp)
-            continue
-        clean_rows.append(grp[0])
-        if len(grp) > 1:
-            dropped_dups += len(grp) - 1
-
-    # Sort newest-season-first so CSV is deterministic and top rows are latest NBA games
-    clean_rows.sort(
-        key=lambda r: (game_season_sort_key(str(r.get("game_id", ""))), str(r.get("play_id", ""))),
-        reverse=True,
-    )
-    write_metadata_rows(metadata_csv, clean_rows)
-
-    if daily_csv is not None and new_inc_rows:
-        daily_csv.parent.mkdir(parents=True, exist_ok=True)
-        seen_inc: Set[str] = set()
-        if daily_csv.exists():
-            with open(daily_csv, "r", newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row.get("play_id"):
-                        seen_inc.add(row["play_id"])
-        to_append = [r for r in new_inc_rows if r["play_id"] not in seen_inc]
-        if to_append:
-            write_header = not daily_csv.exists() or daily_csv.stat().st_size == 0
-            with open(daily_csv, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=DAILY_INC_IC_COLUMNS)
-                if write_header:
-                    w.writeheader()
-                w.writerows(to_append)
-
-    n_games = len({str(r.get("game_id", "")) for r in clean_rows})
-    n_foul = sum(1 for r in clean_rows if int(r.get("label", 0)) == 1)
-    n_nf = len(clean_rows) - n_foul
-    logger.info(
-        "🏁 Full L2M Metadata Harvest Complete! %d clean plays across %d unique NBA games "
-        "(%d foul, %d no_foul | dropped %d conflicts, %d event-ID duplicates) -> %s",
-        len(clean_rows),
-        n_games,
-        n_foul,
-        n_nf,
-        dropped_conflicts,
-        dropped_dups,
-        metadata_csv,
-    )
-    return clean_rows
 
 
 def run_training_dataset_scraper(
@@ -1141,45 +858,214 @@ def run_training_dataset_scraper(
     metadata_csv: Path,
     daily_csv: Optional[Path] = BASE_DIR / "data" / "l2m_incorrect_fouls.csv",
     include_archive: bool = True,
-    max_games: int = 0,
-    max_clips: int = 0,
+    max_games: int = 10,
+    max_clips: int = 30,
     skip_download: bool = False,
-    sleep_sec: float = 0.0,
-    max_workers: int = 16,
+    sleep_sec: float = 0.20,
 ) -> List[Dict[str, Any]]:
     """
-    Fast parallel L2M dataset harvester + MP4 downloader:
-      1. Scrapes ALL official NBA L2M reports (`max_games <= 0` = every available game across
-         2026-27, 2025-26, 2024-25, 2023-24, 2022-23 & Archive) via 16-worker `scrape_all_l2m_metadata()`.
-      2. Unless `skip_download=True`, downloads balanced `foul` / `no_foul` broadcast `.mp4` clips
-         newest-season-first across all unique games via `bulk_download_missing_clips()`.
+    Scrape NBA L2M reports, create `data/raw/{foul,no_foul}/`, preserve existing rows in
+    `data/l2m_metadata.csv`, discover new games (across current + archive pages), and
+    download up to `max_clips` `.mp4` videos into `data/raw/{foul,no_foul}/`.
     """
     output_dir = resolve_project_path(output_dir)
     metadata_csv = resolve_project_path(metadata_csv)
     if daily_csv is not None:
         daily_csv = resolve_project_path(daily_csv)
 
-    (output_dir / "foul").mkdir(parents=True, exist_ok=True)
-    (output_dir / "no_foul").mkdir(parents=True, exist_ok=True)
+    foul_dir = output_dir / "foul"
+    no_foul_dir = output_dir / "no_foul"
+    foul_dir.mkdir(parents=True, exist_ok=True)
+    no_foul_dir.mkdir(parents=True, exist_ok=True)
     metadata_csv.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Initialized raw video directories: %s and %s", foul_dir, no_foul_dir)
 
-    collected_rows = scrape_all_l2m_metadata(
-        metadata_csv=metadata_csv,
-        daily_csv=daily_csv,
-        include_archive=include_archive,
-        max_games=max_games,
-        max_workers=max_workers,
+    session = build_session()
+    parsed_base = urlparse(CURRENT_SEASON_URL)
+    official_root = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    # Load existing metadata rows so we never overwrite or lose already-scraped plays
+    collected_rows: List[Dict[str, Any]] = []
+    seen_play_ids: Set[str] = set()
+    existing_game_ids: List[str] = []
+    if metadata_csv.exists():
+        with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                pid = row.get("play_id")
+                gid = normalize_game_id(row.get("game_id", ""))
+                if pid and pid not in seen_play_ids:
+                    seen_play_ids.add(pid)
+                    collected_rows.append(row)
+                if gid and gid not in existing_game_ids:
+                    existing_game_ids.append(gid)
+
+    existing_inc_ic_ids: Set[str] = set()
+    if daily_csv is not None:
+        daily_csv.parent.mkdir(parents=True, exist_ok=True)
+        if daily_csv.exists():
+            with open(daily_csv, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("play_id"):
+                        existing_inc_ic_ids.add(row["play_id"])
+
+    season_urls = [
+        CURRENT_SEASON_URL,
+        f"{official_root}/2025-26-nba-officiating-last-two-minute-reports/",
+        f"{official_root}/2024-25-nba-officiating-last-two-minute-reports/",
+    ]
+    if include_archive:
+        season_urls.append(ARCHIVE_URL)
+
+    # Discover more games than already in CSV so new games are always inspected
+    target_discover = max(max_games, len(existing_game_ids) + max_games)
+    discovered_ids = discover_l2m_game_ids(session, season_urls, max_games=target_discover)
+
+    # Prioritize newly discovered games first, then existing games
+    new_game_ids = [g for g in discovered_ids if g not in existing_game_ids]
+    game_ids = (new_game_ids + [g for g in discovered_ids if g in existing_game_ids] + existing_game_ids)[: max(max_games, len(new_game_ids[:max_games])) or max_games]
+
+    pbp_cache: Dict[str, List[Dict[str, Any]]] = {}
+    downloaded_count = 0
+    new_rows_added = 0
+
+    try:
+        for game_id in game_ids:
+            if not skip_download and max_clips > 0 and downloaded_count >= max_clips:
+                break
+
+            game_meta, entries = fetch_l2m_report_entries(session, game_id)
+            if not entries:
+                continue
+
+            game_date = str(
+                game_meta.get("GameDateOut")
+                or game_meta.get("GameDate")
+                or game_meta.get("game_date")
+                or ""
+            ).strip()
+
+            game_added = 0
+            game_inc_ic_rows: List[Dict[str, Any]] = []
+            for idx, raw_entry in enumerate(entries):
+                parsed = extract_entry_fields(game_id, idx, raw_entry)
+                norm_call_type = is_shooting_or_personal_foul(parsed["call_type_raw"])
+                if norm_call_type is None:
+                    continue
+
+                decision = parsed["review_decision"]
+                if decision not in LABEL_MAP:
+                    continue
+
+                label = LABEL_MAP[decision]
+                class_subdir = foul_dir if label == 1 else no_foul_dir
+                play_id = parsed["play_id"]
+
+                rel_video_path = Path("data") / "raw" / ("foul" if label == 1 else "no_foul") / f"{play_id}.mp4"
+                abs_video_path = class_subdir / f"{play_id}.mp4"
+                video_path_str = rel_video_path.as_posix()
+
+                need_clip = (not skip_download) and (max_clips <= 0 or downloaded_count < max_clips) and not (abs_video_path.exists() and abs_video_path.stat().st_size > 10_240)
+                mp4_url: Optional[str] = None
+                if need_clip or decision in {"INC", "IC"}:
+                    mp4_url = resolve_mp4_url(
+                        session=session,
+                        game_id=game_id,
+                        video_event_id=parsed['video_event_id'],
+                        period_name=parsed["period"],
+                        pc_time=parsed["time_remaining"],
+                        pbp_cache=pbp_cache,
+                    )
+                if need_clip and mp4_url and download_mp4_clip(session, mp4_url, abs_video_path):
+                    downloaded_count += 1
+
+                if play_id not in seen_play_ids:
+                    row = {
+                        "play_id": play_id,
+                        "game_id": game_id,
+                        "player_committing": parsed["player_committing"],
+                        "player_disadvantaged": parsed["player_disadvantaged"],
+                        "call_type": norm_call_type,
+                        "review_decision": decision,
+                        "label": label,
+                        "video_path": video_path_str,
+                    }
+                    collected_rows.append(row)
+                    seen_play_ids.add(play_id)
+                    game_added += 1
+                    new_rows_added += 1
+
+                if daily_csv is not None and decision in {"INC", "IC"} and play_id not in existing_inc_ic_ids:
+                    fallback_url = (
+                        f"{official_root}/last-two-minute-report/"
+                        f"?gameNo={game_id}&eventNum={parsed['video_event_id']}"
+                    )
+                    game_inc_ic_rows.append(
+                        {
+                            "play_id": play_id,
+                            "game_id": game_id,
+                            "game_date": game_date,
+                            "period": parsed["period"],
+                            "time_remaining": parsed["time_remaining"],
+                            "call_type": norm_call_type,
+                            "player_committing": parsed["player_committing"],
+                            "player_disadvantaged": parsed["player_disadvantaged"],
+                            "review_decision": decision,
+                            "video_url": mp4_url or fallback_url,
+                            "comments": parsed["comments"],
+                        }
+                    )
+                    existing_inc_ic_ids.add(play_id)
+
+            if game_added > 0:
+                write_metadata_rows(metadata_csv, collected_rows)
+                logger.info(
+                    "Game %s: added %d new foul plays (total metadata rows: %d, downloaded clips: %d)",
+                    game_id,
+                    game_added,
+                    len(collected_rows),
+                    downloaded_count,
+                )
+
+            if daily_csv is not None and game_inc_ic_rows:
+                write_header = not daily_csv.exists() or daily_csv.stat().st_size == 0
+                with open(daily_csv, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=DAILY_INC_IC_COLUMNS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerows(game_inc_ic_rows)
+
+            time.sleep(sleep_sec)
+
+        # If we still need more MP4 clips in data/raw/ to reach max_clips, backfill from collected_rows
+        if not skip_download and (max_clips <= 0 or downloaded_count < max_clips) and collected_rows:
+            remaining = (max_clips - downloaded_count) if max_clips > 0 else 0
+            logger.info(
+                "Backfilling up to %d missing MP4 video clips into %s from %d metadata rows...",
+                remaining,
+                output_dir,
+                len(collected_rows),
+            )
+            downloaded_count += download_missing_clips_from_rows(
+                session=session,
+                rows=collected_rows,
+                output_dir=output_dir,
+                max_clips=remaining,
+                sleep_sec=sleep_sec,
+            )
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user; saving %d collected rows to %s", len(collected_rows), metadata_csv)
+    finally:
+        write_metadata_rows(metadata_csv, collected_rows)
+
+    existing_mp4_total = len(list(output_dir.rglob("*.mp4")))
+    logger.info(
+        "Scraper complete: %d total metadata rows (%d newly added) | %d new MP4s downloaded (%d total MP4s in %s)",
+        len(collected_rows),
+        new_rows_added,
+        downloaded_count,
+        existing_mp4_total,
+        output_dir,
     )
-
-    if not skip_download and collected_rows:
-        bulk_download_missing_clips(
-            metadata_csv=metadata_csv,
-            output_dir=output_dir,
-            max_workers=min(max_workers, 12),
-            max_clips=max_clips,
-            prefer_newest=True,
-        )
-
     return collected_rows
 
 
@@ -1397,102 +1283,6 @@ def populate_foul_csv_from_local_metadata(
     return populated
 
 
-def _video_content_fingerprint(video_path: Path) -> str:
-    """Compute a fast, collision-resistant content fingerprint (size + first/last 64KB MD5)."""
-    size = video_path.stat().st_size
-    h = hashlib.md5()
-    h.update(str(size).encode("utf-8"))
-    with open(video_path, "rb") as fp:
-        h.update(fp.read(65536))
-        if size > 131072:
-            fp.seek(-65536, 2)
-            h.update(fp.read(65536))
-    return h.hexdigest()
-
-
-def deduplicate_raw_dataset(
-    metadata_csv: Path = BASE_DIR / "data" / "l2m_metadata.csv",
-    raw_dir: Path = BASE_DIR / "data" / "raw",
-    remove_duplicate_files: bool = False,
-) -> Dict[str, int]:
-    """
-    Eliminate duplicate and label-conflicting broadcast MP4s from `l2m_metadata.csv`.
-    When multiple L2M rows share the exact same NBA Stats video file:
-      - If one row is labeled `foul` (1) and another is `no_foul` (0), the clip DOES contain a foul,
-        so we keep the `foul` row and drop the contradictory `no_foul` duplicate.
-      - If multiple rows share the same label and exact same video bytes, keep the first unique row.
-    """
-    metadata_csv = resolve_project_path(metadata_csv)
-    raw_dir = resolve_project_path(raw_dir)
-    if not metadata_csv.exists():
-        return {"total_before": 0, "total_after": 0, "dropped_conflicts": 0, "dropped_dups": 0}
-
-    with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    hash_groups: Dict[str, List[int]] = {}
-    for idx, row in enumerate(rows):
-        vp = resolve_project_path(row.get("video_path", ""))
-        if vp.exists() and vp.stat().st_size > 10_240:
-            fp = _video_content_fingerprint(vp)
-            hash_groups.setdefault(fp, []).append(idx)
-
-    drop_indices: Set[int] = set()
-    dropped_conflicts = 0
-    dropped_dups = 0
-
-    for fp, idxs in hash_groups.items():
-        if len(idxs) <= 1:
-            continue
-        labels_present = {int(rows[i].get("label", 0)) for i in idxs}
-        if len(labels_present) > 1:
-            # Conflict: identical video file labeled both 1 (foul) and 0 (no_foul).
-            # Keep the single highest-priority foul row (CC/INC) and drop contradictory duplicates.
-            foul_idxs = [i for i in idxs if int(rows[i].get("label", 0)) == 1]
-            keep_i = foul_idxs[0]
-            for i in idxs:
-                if i != keep_i:
-                    drop_indices.add(i)
-                    dropped_conflicts += 1
-        else:
-            keep_i = idxs[0]
-            for i in idxs[1:]:
-                drop_indices.add(i)
-                dropped_dups += 1
-
-    if remove_duplicate_files:
-        for i in drop_indices:
-            vp = resolve_project_path(rows[i].get("video_path", ""))
-            if vp.exists():
-                try:
-                    vp.unlink()
-                except Exception:
-                    pass
-
-    cleaned_rows = [r for idx, r in enumerate(rows) if idx not in drop_indices]
-    if drop_indices:
-        fieldnames = list(rows[0].keys()) if rows else MASTER_CSV_COLUMNS
-        with open(metadata_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(cleaned_rows)
-        logger.info(
-            "Deduplicated %s: %d -> %d rows (dropped %d conflicting-label clips, %d same-class duplicates)",
-            metadata_csv.name,
-            len(rows),
-            len(cleaned_rows),
-            dropped_conflicts,
-            dropped_dups,
-        )
-
-    return {
-        "total_before": len(rows),
-        "total_after": len(cleaned_rows),
-        "dropped_conflicts": dropped_conflicts,
-        "dropped_dups": dropped_dups,
-    }
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="NBA Last Two Minute (L2M) Report & Video Scraper"
@@ -1512,25 +1302,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-archive",
         action="store_true",
-        default=True,
-        help="Include historical games from the NBA L2M Archive page (default: True)",
-    )
-    parser.add_argument(
-        "--all-games",
-        action="store_true",
-        help="Scrape EVERY available NBA L2M game across all seasons + archive (equivalent to --max-games 0)",
+        help="Also scrape historical games from the NBA L2M Archive page",
     )
     parser.add_argument(
         "--max-games",
         type=int,
-        default=0,
-        help="Maximum number of L2M game reports to inspect (0 = ALL available games across seasons & archive!)",
+        default=10,
+        help="Maximum number of L2M game reports to inspect (default: 10; increase for larger datasets)",
     )
     parser.add_argument(
         "--max-clips",
         type=int,
-        default=0,
-        help="Maximum number of foul/no_foul MP4 clips to download (0 = ALL missing clips)",
+        default=30,
+        help="Maximum number of foul/no_foul MP4 clips to download (default: 30; increase for larger datasets)",
     )
     parser.add_argument(
         "--skip-download",
@@ -1556,38 +1340,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--download-missing",
         action="store_true",
-        help="Bulk download missing MP4 video clips present in metadata CSV using parallel threads",
+        help="Bulk download all missing MP4 video clips present in metadata CSV using parallel threads",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=16,
-        help="Worker threads for concurrent L2M JSON scraping & downloading (default: 16)",
-    )
-    parser.add_argument(
-        "--deduplicate",
-        action="store_true",
-        help="Remove duplicate and conflicting-label video entries from data/l2m_metadata.csv",
+        default=4,
+        help="Worker threads for concurrent downloading (default: 4)",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.deduplicate:
-        deduplicate_raw_dataset(
-            metadata_csv=args.metadata_csv,
-            raw_dir=args.output_dir,
-            remove_duplicate_files=False,
-        )
-    elif args.download_missing:
+    if args.download_missing:
         bulk_download_missing_clips(
             metadata_csv=args.metadata_csv,
             output_dir=args.output_dir,
             max_workers=args.workers,
-            max_clips=args.max_clips,
+            max_clips=args.max_clips if args.max_clips > 30 else 0,
         )
-        deduplicate_raw_dataset(metadata_csv=args.metadata_csv, raw_dir=args.output_dir)
     elif args.fill_from_local:
         populate_foul_csv_from_local_metadata(
             metadata_csv=args.metadata_csv,
@@ -1597,17 +1369,15 @@ if __name__ == "__main__":
     elif args.daily_inc_ic:
         run_daily_inc_ic_monitor(
             daily_csv=args.daily_csv,
-            max_recent_games=args.max_games if args.max_games > 0 else 25,
+            max_recent_games=args.max_games,
         )
     else:
-        eff_max_games = 0 if args.all_games else args.max_games
         run_training_dataset_scraper(
             output_dir=args.output_dir,
             metadata_csv=args.metadata_csv,
             daily_csv=args.daily_csv,
             include_archive=args.include_archive,
-            max_games=eff_max_games,
+            max_games=args.max_games,
             max_clips=args.max_clips,
             skip_download=args.skip_download,
-            max_workers=args.workers,
         )

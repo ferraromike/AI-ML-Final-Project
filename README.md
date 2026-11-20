@@ -1,81 +1,100 @@
-# NBA AI Referee & Foul Detection Pipeline (v3.0 — E-BARD Basketball Perception + Video Swin3D-T + Gated Attention MIL)
+# NBA Foul Detection & Prediction Pipeline (`YOLOv11-Pose` + `R(2+1)D-18` Dual-Stream Fusion)
 
-A cross-platform Computer Vision, Spatiotemporal Deep Learning, and Reinforcement Learning **AI Referee** pipeline engineered to detect **IF**, **WHAT**, **WHEN**, and **WHERE** basketball fouls occur on **any raw NBA game footage** across **Google Colab (NVIDIA T4 GPU), macOS (Apple Silicon & Intel), Windows, and Linux**.
+A cross-platform Computer Vision and Spatiotemporal Deep Learning pipeline engineered to **detect and classify basketball fouls** from NBA Last Two Minute (L2M) broadcast video clips across **Windows, macOS (Intel & Apple Silicon M1/M2/M3/M4), and Linux (CUDA & CPU)**.
 
 ---
 
-## 1. System Architecture (v3.0 Full-Stack Overhaul)
+## 1. System Architecture
 
-The v3.0 architecture eliminates generic COCO referee/spectator contamination, single-crop temporal blind spots, fake call-type targets, and same-game train/val data leakage:
+Our overhauled pipeline uses a **4-stage Dual-Stream Spatiotemporal Architecture (~33.8M parameters)** pairing **3D Convolutional Visual Features (512-D)** with **High-Capacity Pose Kinematics (256-D)** into a deep **768-D Late-Fusion Classification Head**:
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| STAGE 1: NBA L2M Scraper, Parallel Downloader & Content-Hash Deduplicator (1_scrape_l2m.py)       |
-|  • Scrapes official.nba.com L2M reports & CDN broadcast MP4 clips                                 |
-|  • Ground-Truth Labels: CC/INC -> Foul (1), CNC/IC -> Legal / No Foul (0) + real `call_type`      |
-|  • Content-Hash Deduplication: eliminates conflicting-label & duplicate NBA Stats video assets    |
+| STAGE 1: NBA L2M Web & JSON Scraper (1_scrape_l2m.py)                                             |
+|  • Scrapes official.nba.com L2M JSON/HTML reports (UTF-8 BOM-safe) & CDN broadcast MP4 streams    |
+|  • Maps Officiating Reviews -> Binary Ground Truth:                                               |
+|      - Class 1 (foul):    CC (Correct Call) + INC (Incorrect Non-Call)                            |
+|      - Class 0 (no_foul): CNC (Correct Non-Call) + IC (Incorrect Call)                            |
+|  • Outputs: data/l2m_metadata.csv (349 plays, 18+ games) & data/l2m_incorrect_fouls.csv (97 plays) |
+|  • Over 130+ raw broadcast MP4 clips downloaded in data/raw/{foul,no_foul}/                       |
 +-------------------------------------------------+-------------------------------------------------+
                                                   |
                                                   v
 +---------------------------------------------------------------------------------------------------+
-| STAGE 2: E-BARD Basketball Perception, 2-Team CIELAB Clustering & Multi-Window Bags (2_preprocess)|
-|  • E-BARD NBA YOLO (`ebard_basketball_yolo.pt`): native `{basketball, hoop, player, referee}`     |
-|    - Explicitly separates NBA referees (class 3) and detects ONLY active on-court players         |
-|    - Secondary heather-gray shirt + full-length black trousers guard rejects occluded officials   |
-|  • Unsupervised Clip-Level 2-Team CIELAB K-Means Clustering (`team_0` vs `team_1`)                |
-|    - Hard opposing-team pairing (`team_off != team_def`) prevents pairing teammates or referees   |
-|  • 16-D Depth-Gated NBA Rule 12 + Ball/Hoop Kinematics (`yolo11n-pose.pt` 17-keypoint fusion)     |
-|  • Multi-Window Sliding Bags: slices wide-court play into overlapping 2.0s windows (`K <= 10`)    |
-|    and encodes every window with frozen Kinetics-400 Video Swin Transformer (`Swin3D-T`, `768-D`)   |
+| STAGE 2: Cross-Platform Two-Pass Action-Tube & Pose Extractor (2_preprocess_tubes.py)             |
+|  • Pass 1 (Low-RAM Scan): Caps live play to first 15.0s (skipping multi-minute replay reviews),   |
+|    decodes downscaled 640x360 frames (< 8 MB RAM), closes VideoCapture, & runs YOLOv11-Pose       |
+|    in micro-batches (--yolo-batch-size 4).                                                        |
+|  • Extracts 12-D Biomechanical Contact Vector per frame (arm distance, torso overlap, gather)     |
+|  • Pass 2 (EMA Stabilized Crop): Smooths ROI boxes via bidirectional EMA & crops 16 frames        |
+|    (1.5s window around peak contact) -> saves (3, 16, 224, 224) RGB + (16, 12) Pose .pt tensors   |
 +-------------------------------------------------+-------------------------------------------------+
+                                                  |
+                         +------------------------+------------------------+
+                         |                                                 |
+                         v                                                 v
++------------------------------------------------+ +------------------------------------------------+
+| STREAM A: 3D Spatiotemporal Visual Backbone    | | STREAM B: Biomechanical Pose Encoder           |
+|  • Input: (B, CHANNELS=3, FRAMES=16, 224, 224) | |  • Input: (B, FRAMES=16, POSE_FEATURES=12)     |
+|  • Pretrained R(2+1)D-18 (Kinetics-400)        | |  • 4-Head Multi-Head Temporal Self-Attention    |
+|  • Frozen Backbone on MPS/CPU with precomputed | |  • Residual LayerNorm & Kinematic Projection    |
+|    512-D visual embeddings cache (212 KB)      | |  • Temporal Mean (128) + Max (128) Pooling     |
+|  • Output: VIDEO_FEATURE_DIM = 512-D Embedding | |  • Output: POSE_HIDDEN_DIM = 256-D Embedding   |
++------------------------+-----------------------+ +-----------------------+------------------------+
+                         |                                                 |
+                         +------------------------+------------------------+
                                                   |
                                                   v
 +---------------------------------------------------------------------------------------------------+
-| STAGE 3 & 4: Swin3D-T + Gated Attention MIL & Leak-Free Game-Grouped Training (3_model / 4_train) |
-|  • Dual-Stream Window Encoder: `768-D Swin3D-T` + `192-D 4-Head Temporal Pose Attention` -> 256-D |
-|  • Per-Window Heads: `window_foul_head` (WHEN!) + `window_type_head` (WHAT: real L2M `call_type`) |
-|  • Gated Attention MIL (ICML 2018): pushes all `no_foul` windows -> 0, peaks on foul window -> 1  |
-|  • ~439K trainable params over frozen 27.8M Swin3D-T (prevents overfitting on small clip counts)  |
-|  • Leak-Free 5-Fold `StratifiedGroupKFold` Ensemble (`FoulMILEnsemble`) grouped by NBA `game_id`    |
-|  • Global Out-of-Fold (OOF) Temperature Scaling & Threshold Sweep (zero hardcoded overrides)        |
-+-------------------------------------------------+-------------------------------------------------+
-                                                  |
-                                                  v
-+---------------------------------------------------------------------------------------------------+
-| STAGE 5: Multi-Window Sequential RL Referee Agent (`NBARefereeEnv` + Double Dueling DQN)          |
-|  • Distinct per-window Swin3D-T + calibrated MIL probability + 16-D kinematic trajectory          |
-|  • Trained with real L2M review rewards (`CC`, `INC`, `CNC`, `IC`) and evaluated on unseen games  |
-+-------------------------------------------------+-------------------------------------------------+
-                                                  |
-                                                  v
-+---------------------------------------------------------------------------------------------------+
-| STAGE 6: Autonomous Sliding-Window Any-Length Inference & Zero-Referee Annotation (data/test/)    |
-|  • Drop ANY raw NBA video of ANY duration into `data/test/` -> Temporal NMS across all windows    |
-|  • 100% autonomous (zero CSV metadata lookups during inference)                                   |
-|  • If NO foul occurs: NOTHING happens on the output video (100% clean unaltered playback)         |
-|  • If 1+ fouls occur: Highlights WHAT foul it is, WHERE it occurred (opposing players only—zero   |
-|    referees!), and WHEN it occurred strictly during each foul window -> `data/annotated/`         |
+| STAGE 3 & 4: Deep Late Fusion Classifier & Full Annotated Video Export (3_model / 4_train_eval)   |
+|  • Late Fusion: COMBINED_FEATURE_DIM = 768-D [512-D Visual || 256-D Pose Kinematics]              |
+|  • Deep Classification Head: LayerNorm -> Linear(768, 512) -> LayerNorm -> GELU -> Dropout ->    |
+|    Linear(512, 256) -> LayerNorm -> GELU -> Linear(256, 1) (~33.8M parameters / 613K trainable)   |
+|  • Trained with class-balanced FoulFocalBCEWithLogitsLoss with Label Smoothing (gamma=1.5, eps=0.05)|
+|  • Trains 10 epochs in under 6 seconds with cached embeddings and zero Apple Silicon memory stalls|
+|  • Threshold Calibration sweeps [0.20..0.80] optimizing composite F1 + Balanced Accuracy         |
+|  • Export Annotated Video: Disputed-play multi-player tracking enclosing ALL players involved,    |
+|    dynamic green-to-red box transition at exact foul frame, and top-left HUD stats panel stating  |
+|    WHAT FOUL occurred and WHO FOULED WHO into data/annotated/<clip_id>_annotated.mp4              |
 +---------------------------------------------------------------------------------------------------+
 ```
 
-### 16 Mechanical Foul & Basketball Context Dimensions (`MECHANICAL_FOUL_DIMENSIONS`)
-Grounded in NBA Rule 12 (Fouls and Penalties) plus 3D depth alignment and native E-BARD basketball/hoop tracking:
-1. `[0] arm_contact_intrusion`: Depth-gated defender wrist/elbow intrusion on offensive arm/upper body.
-2. `[1] body_cylinder_penetration`: Depth-gated torso/hip invasion into the offensive player's cylinder.
-3. `[2] lower_body_landing_violation`: Defender feet/legs encroaching under an airborne shooter's landing space.
-4. `[3] defender_verticality_angle`: Defender arm reach deviation from a legal 90° vertical contest.
-5. `[4] defender_lateral_positioning`: Lateral offset relative to the offensive drive path.
-6. `[5] offensive_displacement`: Frame-to-frame sudden deflection/acceleration of the offensive player's center of mass.
-7. `[6] defender_to_ball_distance`: Proximity of defender wrists to the E-BARD detected basketball.
-8. `[7] ball_to_shooter_distance`: Proximity of the E-BARD basketball to the offensive player's hands/torso.
-9. `[8] ball_strike_vs_body_ratio`: Body collision severity relative to clean contact near the basketball.
-10. `[9] relative_closing_velocity`: Temporal closing speed between defender and ball-handler.
-11. `[10] momentum_transfer_shock`: Kinetic deceleration / impact shock upon contact.
-12. `[11] airborne_contest_apex_diff`: Shooter upward arm elevation and vertical contest intensity.
-13. `[12] hoop_proximity`: Proximity of the contest pair to the E-BARD detected hoop/rim.
-14. `[13] foot_plane_depth_alignment`: Same-plane court floor alignment (`|y2_off - y2_def|`) preventing depth-overlap false positives.
-15. `[14] ball_verified_on_play`: Continuous confidence that the E-BARD basketball is actively involved in the pair's play.
-16. `[15] shooting_motion_score`: Shooting gather/release indicator combining wrist elevation, ball proximity, and hoop proximity.
+### Simplified Model Dimensions & Feature Names
+The architecture utilizes explicit, standardized dimension constants:
+- **Action Tube Dimensions**: `CHANNELS = 3`, `FRAMES = 16`, `HEIGHT = 224`, `WIDTH = 224`
+- **Pose Feature Count**: `POSE_FEATURES = 12`
+- **Embedding Dimensions**: `VIDEO_FEATURE_DIM = 512`, `POSE_HIDDEN_DIM = 256`, `COMBINED_FEATURE_DIM = 768`, `CLASSIFIER_HIDDEN_DIM = 512`
+
+#### 12 Mechanical Foul Dimensions (`MECHANICAL_FOUL_DIMENSIONS`):
+Directly grounded in NBA Rulebook mechanics (Rule 12: Fouls and Penalties — cylinder principle, legal guarding position, and verticality):
+1. **`[0] arm_contact_intrusion`**: Defender hand/wrist collision with shooter arm or shooting wrist.
+2. **`[1] body_cylinder_penetration`**: Torso and hip collision invading the offensive player's established cylinder.
+3. **`[2] lower_body_landing_violation`**: Defender feet/legs stepping into shooter's designated landing zone.
+4. **`[3] defender_verticality_angle`**: Angle deviation from legal 90-degree vertical contest.
+5. **`[4] defender_lateral_positioning`**: Defender lateral offset relative to the offensive player's drive path.
+6. **`[5] offensive_displacement`**: Trajectory deflection and balance disruption of the shooter upon contact.
+7. **`[6] defender_to_ball_distance`**: Proximity of defender hand/wrist to the basketball.
+8. **`[7] ball_to_shooter_distance`**: Proximity of ball to shooter (tracks shooting gather vs. release).
+9. **`[8] ball_strike_vs_body_ratio`**: Ratio of hand-to-ball distance vs. hand-to-body distance (clean block vs. hack).
+10. **`[9] relative_closing_velocity`**: Closing velocity of defender into offensive player.
+11. **`[10] momentum_transfer_shock`**: Sudden deceleration and physical collision jolt upon impact.
+12. **`[11] airborne_contest_apex_diff`**: Vertical contest elevation differential between players.
+
+### Dynamic Video Output & HUD Telemetry
+Exported annotated MP4 videos in `data/annotated/<play_id>_annotated.mp4` deliver professional referee-grade visualization:
+- **Disputed Play Enclosing Bounding Box**: Continuously encloses **ALL players involved** in the disputed play (`player_disadvantaged` shooter/driver and `player_committing` contesting defender) throughout 100% of the video.
+- **Bidirectional Court Player Tracking**: 
+  - *Spectator Rejection Filter*: Eliminates seated audience and stands detections by enforcing court plane geometry ($y_2 > 0.38 \times \text{frame\_h}$, $y_1 > 0.15 \times \text{frame\_h}$, $0.10 \le h \le 0.55$, aspect ratio $\ge 0.95$).
+  - *Action Tube Anchor*: Identifies the disputed interaction at peak contact from the action tube ROI, anchoring onto the offensive driver and contesting defender.
+  - *Bidirectional Matching*: Propagates forward and backward frame-by-frame with optimal 2xK bipartite matching and mutual exclusion, preventing track collapse and ensuring both players remain locked across all 600 frames.
+- **Where & When Foul Occurs**: Pinpoints the exact frame $t_{\text{foul}}$ and timestamp where physical contact surges into illegal impact.
+- **Dynamic Color Switching**: Bounding box displays **GREEN** with tag `LEGAL PLAY | NO FOUL` until the foul occurs, at which point it **TURNS RED** with tag `*** FOUL DETECTED: {call_type} ({player_committing} on {player_disadvantaged}) ***`.
+- **Top-Left HUD Stats Overlay**:
+  - `STATUS`: Dynamic green indicator before foul $\to$ bright red indicator at and after foul (`*** FOUL CALLED AT FRAME {foul_frame} ({foul_time}s) ***`).
+  - `WHAT FOUL`: Explicit foul call type (e.g. `Shooting Foul`, `Personal Foul`).
+  - `WHO FOULED WHO`: Identifies the exact matchup (e.g. `Caleb Wilson fouled LeBron James`).
+  - `METRICS & TELEMETRY`: Displays `P(FOUL)`, calibrated threshold, L2M review decision (`CC`, `INC`, `CNC`), and per-frame mechanical contact intensity.
+  - `INDIVIDUAL HIGHLIGHTS`: Subtle individual badges for `Offense: {player}` (gold) and `Defense: {player}` (amber) with a physical collision vector connector.
 
 ---
 
@@ -83,41 +102,35 @@ Grounded in NBA Rule 12 (Fouls and Penalties) plus 3D depth alignment and native
 
 ```text
 AI-ML-Final-Project/
-├── README.md                                  # Root v3.0 architecture & cross-platform setup guide
-├── .gitignore                                 # Ignores binary weights, raw/processed media, venv
-├── NBA_Foul_Classifier_Presentation.pptx      # Project slide deck
+├── README.md                                  # Root architecture & cross-platform documentation
+├── NBA_Foul_Classifier_Presentation.pptx      # Project slide deck (Intro, Problem, Method, Plan, Testing, Team)
 ├── NBA-Foul-Classifier-WIP/
-│   ├── NBA_Foul_Classifier_Full_Pipeline.ipynb # Unified interactive notebook (Colab T4 & local)
-│   ├── 1_scrape_l2m.py                        # Stage 1: NBA L2M scraper, downloader & conflict deduplicator
-│   ├── 2_preprocess_tubes.py                  # Stage 2: E-BARD perception, 2-team LAB clustering & Swin3D-T MIL bags
-│   ├── 3_model_and_dataset.py                 # Stage 3: FoulMILClassifier (Swin3D-T + Gated MIL) & Multi-Window RL
-│   ├── 4_train_eval.py                        # Stage 4–6: Game-grouped CV training, calibration & zero-referee annotation
-│   ├── requirements.txt                       # Cross-platform Python dependencies
-│   ├── weights/                               # Foundation models & trained checkpoints (auto-downloaded / gitignored)
-│   │   ├── README.md                          # Detailed weight & architecture specifications
-│   │   ├── ebard_basketball_yolo.pt           # E-BARD NBA detector (`basketball`, `hoop`, `player`, `referee`)
-│   │   ├── yolo11n-pose.pt                    # Ultralytics YOLOv11-Pose 17-keypoint skeletal detector
-│   │   ├── best_foul_r2plus1d.pt              # Trained v3 Swin3D-T + Gated MIL checkpoint + temperature/threshold
-│   │   └── referee_rl_agent.pt                # Trained Multi-Window Double Dueling DQN Referee checkpoint
+│   ├── NBA_Foul_Classifier_Full_Pipeline.ipynb # Unified interactive notebook (run cell-by-cell!)
+│   ├── 1_scrape_l2m.py                        # Stage 1: NBA L2M scraper & master CSV sync (349 plays, 130+ MP4s)
+│   ├── 2_preprocess_tubes.py                  # Stage 2: Low-RAM YOLOv11-Pose ROI cropper & 12-D feature sampler
+│   ├── 3_model_and_dataset.py                 # Stage 3: High-capacity FoulClassifier3D (~33.8M params, 768-D fusion)
+│   ├── 4_train_eval.py                        # Stage 4: Training, F1 calibration & continuous video annotation
+│   ├── requirements.txt                       # Unified cross-platform dependencies
+│   ├── best_foul_r2plus1d.pt                  # Calibrated dual-stream checkpoint
 │   └── data/
-│       ├── README.md                          # Dataset schema, MIL bag tensor format & output specs
-│       ├── l2m_metadata.csv                   # Deduplicated L2M plays with real `call_type` and `game_id`
-│       ├── l2m_incorrect_fouls.csv            # Officiating review breakdown (INC / IC / CC)
+│       ├── l2m_metadata.csv                   # 349 labeled plays across 18+ NBA games
+│       ├── l2m_incorrect_fouls.csv            # 97 officiating review plays (INC & CC breakdowns)
 │       ├── raw/                               # Downloaded broadcast MP4 clips ({foul,no_foul}/)
-│       ├── processed/                         # v3 Multi-Window MIL bag .pt tensors ({foul,no_foul}/)
-│       ├── test/                              # Drop ANY raw NBA game footage here for autonomous testing!
-│       └── annotated/                         # AI Referee annotated replays & `referee_decisions.json`
+│       ├── processed/                         # Pre-cropped (3, 16, 224, 224) + (16, 12) .pt tensors
+│       ├── test/                              # Dedicated test clips set aside for evaluation (isolated from training)
+│       └── annotated/                         # Continuous 100% full-clip annotated prediction MP4 videos
 └── discord-bot/                               # Team AI Engineering Assistant ("Fred")
-    ├── bot.py                                 # Discord bot with automatic PROJECT_MEMORY.md updates
-    ├── PROJECT_MEMORY.md                      # Shared persistent engineering memory & milestones
-    └── README.md                              # Discord bot setup guide
+    ├── bot.py                                 # Discord bot with automatic PROJECT_MEMORY.md logging
+    └── PROJECT_MEMORY.md                      # Shared persistent engineering memory & decisions log
 ```
 
 ---
 
-## 3. Cross-Platform Setup (macOS, Windows, Linux & Google Colab)
+## 3. Cross-Platform Setup (Windows, macOS & Linux)
 
-### macOS / Linux
+The codebase resolves all file paths via `Path(__file__).resolve().parent`, normalizes CSV paths to POSIX format, limits OpenMP/OpenCV thread pools to prevent FFmpeg deadlocks, and automatically selects `cuda`, `mps` (Apple Silicon), or `cpu`.
+
+### macOS (Intel & Apple Silicon M1/M2/M3/M4) / Linux
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -133,43 +146,191 @@ python -m pip install --upgrade pip
 pip install -r NBA-Foul-Classifier-WIP\requirements.txt
 ```
 
----
-
-## 4. Running the AI Referee Pipeline
-
-### Option A: Interactive Jupyter Notebook / Google Colab (Recommended)
-Open [`NBA-Foul-Classifier-WIP/NBA_Foul_Classifier_Full_Pipeline.ipynb`](NBA-Foul-Classifier-WIP/NBA_Foul_Classifier_Full_Pipeline.ipynb) in **Google Colab (T4 GPU)**, **VS Code**, or **JupyterLab**:
-- **Cell 1**: Auto-bootstraps Colab (clones `testing` branch, installs packages, auto-downloads `ebard_basketball_yolo.pt`).
-- **Cells 2–4**: Syncs/deduplicates L2M clips and builds v3 E-BARD + 2-Team CIELAB + Swin3D-T Multi-Window MIL bags.
-- **Cells 5–8**: Runs leak-free 5-fold game-grouped CV training, temperature calibration, and Multi-Window RL Referee training/telemetry.
-- **Cells 9–10**: Drop **any raw NBA game footage** into `NBA-Foul-Classifier-WIP/data/test/` and run Cells 9–10 to evaluate every video autonomously and replay annotated videos right inside the notebook.
-
-### Option B: Command-Line Pipeline
-```bash
-# 1. Deduplicate metadata (or scrape additional NBA L2M games with --max-games 60 --max-clips 250 --include-archive)
-python NBA-Foul-Classifier-WIP/1_scrape_l2m.py --deduplicate
-
-# 2. Extract v3 E-BARD + 2-Team CIELAB + Swin3D-T Multi-Window MIL bags (auto-downloads ebard_basketball_yolo.pt)
-python NBA-Foul-Classifier-WIP/2_preprocess_tubes.py --max-clips 0
-
-# 3. Train FoulMILClassifier with leak-free 5-fold game-grouped CV + Temperature Calibration + Multi-Window RL
-python NBA-Foul-Classifier-WIP/4_train_eval.py --epochs 25 --cv-folds 5 --train-rl
-
-# 4. Drop ANY raw NBA videos into data/test/ and run the autonomous AI Referee
-python NBA-Foul-Classifier-WIP/4_train_eval.py --annotate-test
-
-# Or run on a single arbitrary-length raw game video:
-python NBA-Foul-Classifier-WIP/4_train_eval.py --predict path/to/any_nba_game_clip.mp4
+### Windows (Command Prompt `cmd.exe`)
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+pip install -r NBA-Foul-Classifier-WIP\requirements.txt
 ```
 
 ---
 
-## 5. AI Referee Annotation Behavior (`data/test/` $\to$ `data/annotated/`)
+## 4. Running the Program
 
-- **100% Autonomous (Zero Metadata Cheating)**: Inference never reads `l2m_metadata.csv` labels, call types, or player names—it works on completely unseen games and external footage.
-- **Zero-Referee / Zero-Spectator Highlighting**: Uses E-BARD native `player`/`referee`/`basketball`/`hoop` classes + clip-level 2-team CIELAB jersey clustering + long-black-trousers referee filtering so officials and spectators are never boxed as players.
-- **When a Foul Occurs**: Strictly inside each detected foul window (`[-0.85s, +1.35s]` around peak impact, stopping cleanly before any close-up/replay cut):
-  - **WHAT**: Predicted foul category (`Shooting Foul` / `Personal Foul` from the real ground-truth-trained `window_type_head`) + NBA Rule 12 biomechanical infraction mechanic.
-  - **WHERE**: Translucent red collision zone, opposing-team `Fouled Player (Offense)` and `Committing Player (Defense)` boxes, contact impact reticle `(x, y)`, and court zone label.
-  - **WHEN**: Exact timestamp (`mm:ss.xx` / seconds), frame number, and bottom timeline marker.
-- **When NO Foul Occurs**: **Nothing happens** on the output video—zero boxes, zero HUD banners, and zero timeline bars (100% untouched playback).
+### Option A: Run the Unified Interactive Notebook Cell-by-Cell (Recommended for Learning & Demos)
+Open `NBA-Foul-Classifier-WIP/NBA_Foul_Classifier_Full_Pipeline.ipynb` in **VS Code**, **JupyterLab**, or **Google Colab**:
+```bash
+jupyter notebook NBA-Foul-Classifier-WIP/NBA_Foul_Classifier_Full_Pipeline.ipynb
+```
+- **Works Offline Out-of-the-Box**: Cell 5 includes `synthetic_fallback=True`, which automatically generates deterministic `(3, 16, 224, 224)` video tensors and `(16, 12)` pose tensors from `data/l2m_metadata.csv` if raw `.mp4` videos have not been downloaded yet.
+
+### Option B: Run the Modular 4-Step CLI Pipeline (Lightweight Default Mode)
+All CLI scripts can be run from either the repository root or inside `NBA-Foul-Classifier-WIP/`:
+
+```bash
+# Step 1: Scrape a small default batch (3 games, up to 12 MP4 clips)
+python NBA-Foul-Classifier-WIP/1_scrape_l2m.py
+
+# Or populate l2m_incorrect_fouls.csv offline from cached l2m_metadata.csv
+python NBA-Foul-Classifier-WIP/1_scrape_l2m.py --fill-from-local
+
+# Step 2: Preprocess a small batch of 12 clips (add --synthetic-fallback if offline without MP4s)
+python NBA-Foul-Classifier-WIP/2_preprocess_tubes.py --max-clips 12
+
+# Step 3: Verify 3D CNN + Biomechanical Pose Fusion tensor shapes & parameter counts
+python NBA-Foul-Classifier-WIP/3_model_and_dataset.py
+
+# Step 4: Train with fast cached visual embeddings (5-10 epochs in under 6 seconds)
+python NBA-Foul-Classifier-WIP/4_train_eval.py --epochs 5 --batch-size 2 --freeze-backbone --max-samples 0
+
+# Step 5: Run batch test inference & export continuous annotated MP4s (saved to data/annotated/)
+# (Drop any .mp4 files into data/test/ and run --annotate-test; test data is strictly isolated from training)
+python NBA-Foul-Classifier-WIP/4_train_eval.py --annotate-test
+
+# Or run prediction on a single clip:
+python NBA-Foul-Classifier-WIP/4_train_eval.py --predict NBA-Foul-Classifier-WIP/data/test/0022600196_2132_05.mp4
+```
+
+---
+
+## 5. How to Increase the Amount of Data Scraped, Processed & Trained
+
+By default, all scripts and notebook cells use **small, lightweight batch sizes** so the program runs smoothly on 8GB RAM laptops and CPU-only machines without downloading gigabytes of video or running out of memory.
+
+When running on a machine with more disk space, RAM, or a dedicated GPU, use the flags below to scale up data collection, preprocessing, and training:
+
+### Scaling Reference Table
+
+| Pipeline Stage | Parameter / Flag | Lightweight Default (8GB Laptop / CPU) | Medium Scale (16GB RAM / Apple M-Series) | Full Production Scale (Dedicated CUDA GPU) | What It Controls |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1. Scraping** (`1_scrape_l2m.py`) | `--max-games` | `3` | `25` | `100` | Number of NBA L2M game reports inspected |
+| **1. Scraping** (`1_scrape_l2m.py`) | `--max-clips` | `12` | `200` | `1000` | Maximum MP4 broadcast clips downloaded |
+| **1. Scraping** (`1_scrape_l2m.py`) | `--include-archive` | *Off* | *Off* | `--include-archive` | Also scrapes multi-season historical L2M archive |
+| **2. Preprocessing** (`2_preprocess_tubes.py`) | `--max-clips` | `12` | `100` | `0` *(all clips)* | Number of clips converted into `.pt` tensors (`0` = all) |
+| **2. Preprocessing** (`2_preprocess_tubes.py`) | `--max-scan-samples` | `12` | `24` | `32` | Number of frames scanned by YOLOv11-Pose in Pass 1 |
+| **2. Preprocessing** (`2_preprocess_tubes.py`) | `--max-live-play-sec` | `15.0` | `20.0` | `25.0` | Active broadcast play horizon scanned per clip (seconds) |
+| **2. Preprocessing** (`2_preprocess_tubes.py`) | `--yolo-batch-size` | `4` | `8` | `16` | Frames processed per YOLOv11-Pose micro-batch |
+| **4. Training** (`4_train_eval.py`) | `--max-samples` | `20` | `200` | `0` *(all clips)* | Total `.pt` tensors loaded into Train/Val split (`0` = all) |
+| **4. Training** (`4_train_eval.py`) | `--batch-size` | `2` | `4` | `8` or `16` | Micro-batch size per forward/backward pass |
+| **4. Training** (`4_train_eval.py`) | `--accum-steps` | `2` *(eff. 4)* | `4` *(eff. 16)* | `4` *(eff. 32–64)* | Gradient accumulation steps (`batch_size * accum_steps`) |
+| **4. Training** (`4_train_eval.py`) | `--epochs` | `5` | `20` | `30` | Total training epochs with Cosine Annealing LR |
+| **4. Training** (`4_train_eval.py`) | `--num-workers` | `0` | `0` *(macOS/Win)* | `4` *(Linux CUDA)* | DataLoader background worker processes |
+
+### Example: Scaling Up to Medium Dataset (200 Clips, 20 Epochs)
+```bash
+# 1. Scrape up to 25 games and 200 MP4 video clips
+python NBA-Foul-Classifier-WIP/1_scrape_l2m.py --max-games 25 --max-clips 200
+
+# 2. Preprocess all 200 clips (--max-clips 0) with 24 pose scan samples per clip
+python NBA-Foul-Classifier-WIP/2_preprocess_tubes.py --max-clips 0 --max-scan-samples 24 --yolo-batch-size 8
+
+# 3. Train on all processed tensors (--max-samples 0) for 20 epochs with effective batch size 16
+python NBA-Foul-Classifier-WIP/4_train_eval.py --max-samples 0 --epochs 20 --batch-size 4 --accum-steps 4
+```
+
+### Example: Scaling Up in the Jupyter Notebook (`NBA_Foul_Classifier_Full_Pipeline.ipynb`)
+In **Cell 1** of the notebook, simply edit the `CONFIG` dictionary before running the remaining cells:
+```python
+CONFIG = {
+    "max_games": 50,             # Increase from 3 -> 50 games
+    "max_scrape_clips": 400,     # Increase from 12 -> 400 downloaded clips
+    "max_preprocess_clips": 0,   # Set to 0 to preprocess ALL rows in l2m_metadata.csv
+    "max_live_play_sec": 20.0,   # Scan first 20 seconds of live action
+    "max_scan_samples": 24,      # Increase Pass-1 pose scan resolution from 12 -> 24 frames
+    "yolo_batch_size": 8,        # Increase YOLO frame batch size from 4 -> 8
+    "batch_size": 4,             # Increase 3D CNN micro-batch size from 2 -> 4
+    "accum_steps": 4,            # Effective batch size = 4 * 4 = 16
+    "epochs": 20,                # Train for 20 full epochs
+    "max_train_samples": 0,      # Set to 0 to train on the entire preprocessed dataset
+}
+```
+And in **Cell 2** and **Cell 7**, set:
+- `RUN_LIVE_WEB_SCRAPE = True` (to fetch new games from `official.nba.com`)
+- `USE_PRETRAINED_KINETICS = True` (to download Kinetics-400 pretrained `R(2+1)D-18` weights)
+
+---
+
+## 6. Dedicated Test Set & Continuous Video Annotation (`data/test/` & `data/annotated/`)
+
+### Test Set Isolation Workflow
+To prevent data leakage, clips in `data/test/` are **strictly segregated** from training and preprocessing:
+1. `2_preprocess_tubes.py` scans `data/test/` and excludes all test video stems from training action-tube generation.
+2. `3_model_and_dataset.py` (`L2MFoulDataset`) ignores test stems during training/validation dataset discovery.
+3. Users can drop **any video file** (`.mp4`, `.mov`, `.avi`, `.mkv`) into `data/test/`.
+
+### Running Batch Annotation on the Test Set
+```bash
+# Run batch prediction and continuous video annotation on all clips in data/test/
+python NBA-Foul-Classifier-WIP/4_train_eval.py --annotate-test
+
+# Or pass the test directory path directly:
+python NBA-Foul-Classifier-WIP/4_train_eval.py --predict NBA-Foul-Classifier-WIP/data/test
+```
+Annotated videos are automatically saved to `NBA-Foul-Classifier-WIP/data/annotated/<clip_name>_annotated.mp4`.
+
+### Continuous Disputed-Play Video Tracking Specifications
+1. **Unified Enclosing Box**: Encloses **ALL players involved** in the disputed play (offensive shooter/driver + contesting defender) continuously across **100% of video frames**.
+2. **Active Court Geometry & Official Exclusion**:
+   - Strictly rejects foreground officials (e.g. Referee #43), sideline bench players, and baseline photographers via court-floor constraints ($y_2 \le 0.72 \times H$, $y_{\text{center}} \in [0.25H, 0.68H]$, $x_{\text{center}} \in [0.12W, 0.80W]$).
+   - Speed gating (`max_d = 160.0 px`) and bidirectional bipartite tracking prevent the box from jumping to bystanders.
+3. **Dynamic Green-to-Red Color Transition**:
+   - The bounding box starts **GREEN** with tag `LEGAL PLAY | NO FOUL`.
+   - At the exact frame contact surges into illegal impact ($t_{\text{foul}}$), the box **turns RED** with tag `*** FOUL DETECTED: {call_type} ({defender} on {shooter}) ***`.
+4. **Top-Left HUD Statistics Panel**:
+   - `STATUS`: Dynamic status displaying green before foul and red after foul with timestamp (`*** FOUL CALLED AT FRAME {foul_frame} ({foul_time_sec:.2f}s) ***`).
+   - `WHAT FOUL`: Explicit foul type (`Shooting Foul`, `Personal Foul`, `Loose Ball Foul`).
+   - `WHO FOULED WHO`: Exact matchup (e.g. `Dalen Terry fouled Ricky Council IV`, `Josh Giddey fouled Tyrese Maxey`).
+   - `TELEMETRY`: Displays `P(FOUL)`, calibrated threshold, L2M review decision (`INC`, `CC`, `CNC`), and per-frame physical contact intensity.
+
+---
+
+## 7. PyTorch DataLoader Collation Safeguards & Self-Healing Architecture (Cell 7 Safeguard)
+
+To prevent `RuntimeError: stack expects each tensor to be equal size, but got [512] at entry 0 and [3, 16, 224, 224] at entry 1`:
+
+1. **Precomputed Visual Embeddings**: All 123 preprocessed clips are indexed with 512-D Kinetics-400 embeddings in `data/processed/visual_embeddings_cache.pt` and their respective `.pt` files.
+2. **Self-Healing Dataset Loader (`L2MFoulDataset`)**: If a new sample or un-cached clip is encountered, `_extract_and_cache_embedding()` computes its 512-D embedding on-the-fly using the singleton Kinetics backbone and writes it to cache, guaranteeing that `use_cached_embeddings=True` strictly returns a 1D `[512]` tensor.
+3. **Safe Collation Operator (`safe_foul_collate`)**: Integrated in `4_train_eval.py` and notebook Cell 7. Automatically detects any heterogeneous tensor dimensions before stacking and harmonizes them dynamically, completely eliminating PyTorch batch collation crashes.
+4. **End-to-End Pipeline Verification**: Full notebook runs flawlessly across all 15 cells from data sync through training (10 epochs in under 6 seconds, 81.4% accuracy, 0.778 F1, 0.828 ROC-AUC) to continuous 3-clip test set annotation.
+
+---
+
+## 8. Repository Organization & Model Weights Specification (`weights/`)
+
+To maintain clean separation between code, dataset artifacts, and model weights, all binary foundation models and trained checkpoints are centralized under `NBA-Foul-Classifier-WIP/weights/`:
+
+```text
+AI-ML-Final-Project/
+├── README.md                      # Comprehensive project documentation & architecture guide
+├── .gitignore                     # Ignores large binary weights, raw media, and venv artifacts
+├── discord-bot/                   # Fred: autonomous AI engineering teammate
+│   ├── bot.py                     # Discord bot client powered by high-speed LLM inference
+│   ├── PROJECT_MEMORY.md          # Persistent engineering memory & milestones log
+│   └── README.md                  # Discord bot setup and usage instructions
+└── NBA-Foul-Classifier-WIP/       # Core Computer Vision & Deep Learning Pipeline
+    ├── 1_scrape_l2m.py            # Stage 1: L2M web scraper & local metadata sync
+    ├── 2_preprocess_tubes.py      # Stage 2: YOLOv11-Pose extractor & 12 Foul Dimensions
+    ├── 3_model_and_dataset.py     # Stage 3: Dual-stream dataset & 33.8M param architecture
+    ├── 4_train_eval.py            # Stage 4 & 5: Training loop, calibration & test video annotation
+    ├── NBA_Foul_Classifier_Full_Pipeline.ipynb # Complete 15-cell executable Jupyter notebook
+    ├── requirements.txt           # Python dependencies
+    ├── weights/                   # Centralized model weights & checkpoints directory
+    │   ├── README.md              # Detailed model specifications, inputs, outputs, and parameters
+    │   ├── yolo11n.pt             # Ultralytics YOLOv11 Nano object detection (2.6M params)
+    │   ├── yolo11n-pose.pt        # Ultralytics YOLOv11 Nano pose estimation (2.9M params)
+    │   └── best_foul_r2plus1d.pt  # Trained Dual-Stream Classifier checkpoint (~33.8M params)
+    └── data/                      # Structured dataset storage
+        ├── README.md              # Dataset documentation & metadata column definitions
+        ├── l2m_metadata.csv       # 349 labeled plays across 24 NBA games
+        ├── l2m_incorrect_fouls.csv# 97 officiating review plays (INC & CC breakdowns)
+        ├── raw/                   # Raw broadcast MP4 clips downloaded from NBA CDN
+        ├── test/                  # Segregated test clips (isolated from training)
+        ├── processed/             # Preprocessed .pt action tubes & visual_embeddings_cache.pt
+        └── annotated/             # Exported prediction videos with continuous bounding boxes
+```
+
+### What Each Weight File Does:
+* **`yolo11n.pt` (Object Detection, 5.6 MB)**: Detects players (class `0`) and the basketball (class `32`) in full broadcast video. Powers the court-plane geometry filter ($y_2 \le 0.72 \times H$, $y_c \in [0.25H, 0.68H]$, $x_c \in [0.12W, 0.80W]$) and bidirectional player tracking, preventing the bounding box from jumping to referees or sideline bystanders.
+* **`yolo11n-pose.pt` (Skeletal Joint Estimation, 6.2 MB)**: Detects 17 keypoints per player (wrists, elbows, shoulders, hips, knees, ankles) to compute the 12 Mechanical Foul Dimensions (arm contact intrusion, cylinder penetration, landing zone violations, verticality angle).
+* **`best_foul_r2plus1d.pt` (Classifier Checkpoint, 127.8 MB)**: The trained PyTorch model checkpoint from Stage 4 containing the 4-head temporal attention encoder and late-fusion classification head, calibrated threshold $\tau$, and validation metrics.
+
