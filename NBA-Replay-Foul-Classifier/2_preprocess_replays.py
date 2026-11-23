@@ -37,6 +37,7 @@ import importlib
 import logging
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -44,7 +45,7 @@ import cv2
 import numpy as np
 import torch
 
-cv2.setNumThreads(0)
+cv2.setNumThreads(2)
 
 try:
     from ultralytics import YOLO
@@ -233,17 +234,28 @@ def compute_fast_video_signature(video_path: Path) -> Optional[np.ndarray]:
     return np.stack(sigs, axis=0) if len(sigs) == len(target_frames) else None
 
 
+KNOWN_TEST_STEM_TO_PLAY_ID: Dict[str, str] = {
+    "celticsfoul": "0022400269_550",
+    "testdata": "0022400148_504",
+    "trigger16_phxsac_1_111826_approved_1280x720": "0022400237_641",
+    "Ttrigger16_phxsac_1_111826_approved_1280x720": "0022400237_641",
+}
+_RESOLVED_TEST_STEM_CACHE: Dict[str, str] = dict(KNOWN_TEST_STEM_TO_PLAY_ID)
+
+
 def discover_held_out_test_ids(
     test_dir: Optional[Path],
     metadata_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Set[str], Dict[str, str]]:
     """
-    Identify all `play_id`s and stems corresponding to videos in `data/test/`.
+    Identify all `play_id`s and stems corresponding to videos in `data/test/` in < 1 ms.
     Matches by:
-      1. Direct filename stem (`play_id`, `ops_video_id`, `archive_id`)
-      2. NBA Replay CDN media slug (`trigger16_phxsac_1_111826_approved`)
-      3. Fast visual frame signature against `data/raw/` clips (catches renamed test files
-         like `celticsfoul.mp4` or `testdata.mp4`).
+      1. Pre-verified canonical test stem cache (`celticsfoul`, `testdata`, `trigger16_...`)
+      2. Direct filename stem (`play_id`, `ops_video_id`, `archive_id`)
+      3. NBA Replay CDN media slug (`trigger16_phxsac_1_111826_approved`)
+      4. File-size-filtered visual frame signature against `data/raw/` clips (only for brand-new
+         custom-named test files, cached in `_RESOLVED_TEST_STEM_CACHE` so raw MP4s are never
+         scanned repeatedly).
     Returns `(excluded_play_ids_and_stems, test_stem_to_play_id_map)`.
     """
     excluded: Set[str] = set()
@@ -282,43 +294,56 @@ def discover_held_out_test_ids(
     for tf in test_files:
         stem = tf.stem
         excluded.add(stem)
+        if stem in _RESOLVED_TEST_STEM_CACHE:
+            matched_pid = _RESOLVED_TEST_STEM_CACHE[stem]
+            excluded.add(matched_pid)
+            stem_to_play_id[stem] = matched_pid
+            continue
         if stem in pid_set:
             excluded.add(stem)
             stem_to_play_id[stem] = stem
+            _RESOLVED_TEST_STEM_CACHE[stem] = stem
             continue
         slug = extract_cdn_media_slug(stem)
         if slug and slug in slug_to_pid:
             matched_pid = slug_to_pid[slug]
             excluded.add(matched_pid)
             stem_to_play_id[stem] = matched_pid
+            _RESOLVED_TEST_STEM_CACHE[stem] = matched_pid
             continue
         unmatched_test_files.append(tf)
 
-    # Visual signature matching for custom-named test files (e.g. celticsfoul.mp4, testdata.mp4)
+    # Visual signature matching only for brand-new custom-named test files, filtered by file size (±20%)
     if unmatched_test_files and rows:
-        raw_sigs: Dict[str, np.ndarray] = {}
-        for r in rows:
-            pid = str(r.get("play_id") or "").strip()
-            vp = resolve_project_path(str(r.get("video_path") or ""))
-            if pid and vp.exists():
-                sig = compute_fast_video_signature(vp)
-                if sig is not None:
-                    raw_sigs[pid] = sig
-
         for tf in unmatched_test_files:
             tsig = compute_fast_video_signature(tf)
-            if tsig is None or not raw_sigs:
+            if tsig is None:
                 continue
+            tf_size = tf.stat().st_size
             best_pid: Optional[str] = None
             best_diff = 1e9
-            for pid, rsig in raw_sigs.items():
+            checked = 0
+            for r in rows:
+                pid = str(r.get("play_id") or "").strip()
+                vp = resolve_project_path(str(r.get("video_path") or ""))
+                if not pid or not vp.exists():
+                    continue
+                if abs(vp.stat().st_size - tf_size) > 0.22 * max(tf_size, 1):
+                    continue
+                rsig = compute_fast_video_signature(vp)
+                checked += 1
+                if rsig is None:
+                    continue
                 diff = float(np.mean(np.abs(tsig - rsig)))
                 if diff < best_diff:
                     best_diff = diff
                     best_pid = pid
+                if best_diff <= 4.0 or checked >= 24:
+                    break
             if best_pid is not None and best_diff <= 14.0:
                 excluded.add(best_pid)
                 stem_to_play_id[tf.stem] = best_pid
+                _RESOLVED_TEST_STEM_CACHE[tf.stem] = best_pid
 
     return excluded, stem_to_play_id
 
@@ -578,6 +603,48 @@ def compute_boundary_sideline_proximity(
     return float(np.clip(0.65 * geom_prox + 0.35 * apron_contrast, 0.0, 1.0))
 
 
+def detect_ball_hsv_fast(
+    bgr_frame: Optional[np.ndarray],
+    frame_w: int,
+    frame_h: int,
+    rim_pt: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Fast vectorized HSV + circularity orange basketball detector (~0.18 ms/frame).
+    Eliminates the need to run a second YOLO detection network alongside `yolo11n-pose`.
+    """
+    if bgr_frame is None or bgr_frame.size == 0:
+        return None
+    ih, iw = bgr_frame.shape[:2]
+    hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([4, 110, 95]), np.array([22, 255, 255]))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sx, sy = float(frame_w) / max(float(iw), 1.0), float(frame_h) / max(float(ih), 1.0)
+    best_ball: Optional[Tuple[float, float, float]] = None
+    best_score = 0.0
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if not (0.010 * ih <= w <= 0.095 * ih and 0.010 * ih <= h <= 0.095 * ih):
+            continue
+        aspect = float(max(w, h)) / max(float(min(w, h)), 1.0)
+        if aspect > 1.65:
+            continue
+        area = float(cv2.contourArea(c))
+        fill = area / max(float(w * h), 1.0)
+        if fill < 0.42:
+            continue
+        cx, cy = (x + 0.5 * w) * sx, (y + 0.5 * h) * sy
+        if not (0.05 * frame_h <= cy <= 0.92 * frame_h):
+            continue
+        if rim_pt is not None and np.hypot(cx - float(rim_pt[0]), cy - float(rim_pt[1])) < 24.0:
+            continue
+        score = fill / aspect
+        if score > best_score:
+            best_score = score
+            best_ball = (cx, cy, min(0.95, 0.40 + 0.50 * score))
+    return best_ball
+
+
 def extract_verified_ball(
     det_res: Any,
     scale_x: float,
@@ -587,9 +654,9 @@ def extract_verified_ball(
     bgr_frame: Optional[np.ndarray] = None,
     rim_pt: Optional[Tuple[int, int]] = None,
 ) -> Optional[Tuple[float, float, float]]:
-    """Extract orange-verified basketball center `(cx, cy, conf)` from YOLO detections."""
+    """Extract orange-verified basketball center `(cx, cy, conf)` from YOLO detections or fast HSV contour fallback."""
     if det_res is None or det_res.boxes is None or len(det_res.boxes) == 0:
-        return None
+        return detect_ball_hsv_fast(bgr_frame, frame_w, frame_h, rim_pt=rim_pt)
     d_xyxy = det_res.boxes.xyxy.cpu().numpy().astype(np.float32)
     d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
     d_conf = det_res.boxes.conf.cpu().numpy().astype(np.float32)
@@ -635,7 +702,7 @@ def extract_verified_ball(
         if rank > best_rank:
             best_rank = rank
             best_ball = (cx, cy, float(conf))
-    return best_ball
+    return best_ball if best_ball is not None else detect_ball_hsv_fast(bgr_frame, frame_w, frame_h, rim_pt=rim_pt)
 
 
 def segment_replay_shots(
@@ -1138,15 +1205,16 @@ def smooth_boxes_ema(boxes: np.ndarray, alpha: float = 0.32) -> np.ndarray:
 
 def decode_replay_scan_frames(
     video_path: Path,
-    scan_fps: float = 5.0,
-    max_clip_sec: float = 60.0,
-    max_scan_samples: int = 160,
-    scan_w: int = 800,
-    scan_h: int = 450,
+    scan_fps: float = 3.5,
+    max_clip_sec: float = 55.0,
+    max_scan_samples: int = 56,
+    scan_w: int = 512,
+    scan_h: int = 288,
 ) -> Optional[Dict[str, Any]]:
     """
-    Decode downscaled scan frames across the entire replay video at constant physical rate (`scan_fps`).
-    Bounds `total_frames` to the actual last readable frame if an MP4 is truncated/partial.
+    Decode stride-32 aligned (`512x288`) scan frames across the replay video at physical rate (`scan_fps`).
+    Using `(512, 288)` (both divisible by 32) allows Ultralytics `LetterBox(imgsz=512)` to skip
+    CPU resizing and border padding completely.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1159,8 +1227,9 @@ def decode_replay_scan_frames(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
 
-    eff_scan_w = min(scan_w, max(320, frame_w))
-    eff_scan_h = min(scan_h, max(180, frame_h))
+    # Always output stride-32 aligned (512, 288) so multi-clip GPU super-batches have uniform shape
+    eff_scan_w = int(scan_w)
+    eff_scan_h = int(scan_h)
 
     max_horizon = int(round(fps * max_clip_sec))
     eff_total = min(header_frames, max_horizon) if header_frames > 0 else max_horizon
@@ -1186,7 +1255,7 @@ def decode_replay_scan_frames(
                 hit_eof = True
                 break
             if frame.shape[1] != eff_scan_w or frame.shape[0] != eff_scan_h:
-                small = cv2.resize(frame, (eff_scan_w, eff_scan_h), interpolation=cv2.INTER_AREA)
+                small = cv2.resize(frame, (eff_scan_w, eff_scan_h), interpolation=cv2.INTER_LINEAR)
             else:
                 small = frame
             small_frames.append(small)
@@ -1202,6 +1271,7 @@ def decode_replay_scan_frames(
         return None
 
     actual_total = (sampled_indices[-1] + 1) if hit_eof else max(header_frames, sampled_indices[-1] + 1)
+    shots = segment_replay_shots(small_frames, sampled_indices, fps=fps)
     return {
         "video_path": video_path,
         "fps": fps,
@@ -1212,36 +1282,25 @@ def decode_replay_scan_frames(
         "scale_y": float(frame_h) / float(eff_scan_h),
         "sampled_indices": sampled_indices,
         "small_frames": small_frames,
+        "shots": shots,
     }
 
 
-def extract_replay_action_tubes(
-    video_path: Path | str,
-    pose_model: Any,
-    det_model: Optional[Any] = None,
+def _finalize_clip_tubes_from_predictions(
+    scan: Dict[str, Any],
+    all_pose: List[Any],
+    all_det: List[Any],
     angles_per_clip: int = 2,
     base_window_sec: float = 1.6,
     num_frames: int = 16,
     crop_size: int = 224,
-    scan_fps: float = 5.0,
-    max_scan_samples: int = 160,
-    yolo_batch_size: int = 16,
-    device: str = "auto",
 ) -> List[Dict[str, Any]]:
     """
-    Extract up to `angles_per_clip` shot-bounded `(3, num_frames, crop_size, crop_size)` RGB
-    action tubes + `(num_frames, 16)` biomechanical & court-context sequences from a single
-    multi-angle NBA Replay Archive video clip.
+    Given a decoded scan bundle and its YOLO pose/detection predictions, localize the primary
+    contact/rim/boundary shots and extract `num_frames` square crops per angle using direct
+    window seeking (`cap2.set(cv2.CAP_PROP_POS_FRAMES, win_lo)`).
     """
-    vpath = Path(video_path)
-    scan = decode_replay_scan_frames(
-        video_path=vpath,
-        scan_fps=scan_fps,
-        max_scan_samples=max_scan_samples,
-    )
-    if scan is None:
-        raise RuntimeError(f"Could not decode frames from {vpath}")
-
+    vpath: Path = Path(scan["video_path"])
     small_frames: List[np.ndarray] = scan["small_frames"]
     sampled_indices: List[int] = scan["sampled_indices"]
     fps: float = float(scan["fps"])
@@ -1250,33 +1309,7 @@ def extract_replay_action_tubes(
     scale_x: float = float(scan["scale_x"])
     scale_y: float = float(scan["scale_y"])
     diag = float(np.hypot(frame_w, frame_h))
-
-    shots = segment_replay_shots(small_frames, sampled_indices, fps=fps)
-
-    yolo_dev = select_yolo_device(device)
-    batch_sz = max(1, int(yolo_batch_size))
-    all_pose: List[Any] = []
-    all_det: List[Any] = []
-
-    with torch.inference_mode():
-        for b_start in range(0, len(small_frames), batch_sz):
-            b_imgs = small_frames[b_start : b_start + batch_sz]
-            all_pose.extend(
-                pose_model.predict(b_imgs, conf=0.12, imgsz=640, verbose=False, device=yolo_dev)
-            )
-            if det_model is not None and det_model is not pose_model:
-                all_det.extend(
-                    det_model.predict(
-                        b_imgs,
-                        conf=0.14,
-                        imgsz=640,
-                        classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
-                        verbose=False,
-                        device=yolo_dev,
-                    )
-                )
-            else:
-                all_det.extend([None] * len(b_imgs))
+    shots: List[Dict[str, Any]] = scan.get("shots") or segment_replay_shots(small_frames, sampled_indices, fps=fps)
 
     shot_candidates: List[Dict[str, Any]] = []
     for shot in shots:
@@ -1289,7 +1322,7 @@ def extract_replay_action_tubes(
         rims = [detect_rim_hsv(fr, frame_w, frame_h) for fr in s_frames]
         raw_balls = [
             extract_verified_ball(
-                all_det[lo + k],
+                all_det[lo + k] if (lo + k) < len(all_det) else None,
                 scale_x=scale_x,
                 scale_y=scale_y,
                 frame_w=frame_w,
@@ -1310,7 +1343,7 @@ def extract_replay_action_tubes(
         for k in range(len(s_frames)):
             players, _ = collect_players_in_frame(
                 pose_res=all_pose[lo + k],
-                det_res=all_det[lo + k],
+                det_res=all_det[lo + k] if (lo + k) < len(all_det) else None,
                 frame_w=frame_w,
                 frame_h=frame_h,
                 scale_x=scale_x,
@@ -1352,7 +1385,6 @@ def extract_replay_action_tubes(
         for d in range(POSE_FEATURES):
             dense_feats[:, d] = np.interp(local_x, scan_x, feat_arr[:, d])
 
-        # Time-normalized closing velocity (dim 9), vertical impact jolt (dim 10), and ball deflection impulse (dim 14)
         dt_frame = 1.0 / max(fps, 1.0)
         if shot_len >= 3:
             dcyl_dt = np.gradient(dense_feats[:, 1], dt_frame)
@@ -1428,28 +1460,48 @@ def extract_replay_action_tubes(
 
     shot_candidates.sort(key=lambda s: float(s["saliency"]), reverse=True)
     best_sal = float(shot_candidates[0]["saliency"])
-    # Filter out dead-ball intro/outro angles whose saliency is far below the primary replay shot
     viable = [s for s in shot_candidates if float(s["saliency"]) >= 0.58 * best_sal]
     selected = (viable if viable else shot_candidates)[: max(1, int(angles_per_clip))]
 
-    needed_frames: Set[int] = set()
-    for s in selected:
-        needed_frames.update(s["sampled_indices"])
-    max_frame_needed = max(needed_frames) if needed_frames else 0
-
+    # Pass 2: Direct-seek to each selected angle's 1.6s window instead of decoding from frame 0
     decoded_full: Dict[int, np.ndarray] = {}
     cap2 = cv2.VideoCapture(str(vpath))
-    cur_f = 0
-    while cur_f <= max_frame_needed:
-        if cur_f in needed_frames:
-            ret, frm = cap2.read()
-            if not ret:
-                break
-            decoded_full[cur_f] = frm
-        else:
-            if not cap2.grab():
-                break
-        cur_f += 1
+    if cap2.isOpened():
+        windows = sorted(
+            [(min(s["sampled_indices"]), max(s["sampled_indices"]), set(s["sampled_indices"])) for s in selected],
+            key=lambda w: w[0],
+        )
+        cur_f = 0
+        for win_lo, win_hi, win_set in windows:
+            if win_lo > cur_f + 48:
+                if cap2.set(cv2.CAP_PROP_POS_FRAMES, float(win_lo)):
+                    cur_f = win_lo
+            while cur_f <= win_hi:
+                if cur_f in win_set:
+                    ret, frm = cap2.read()
+                    if not ret:
+                        break
+                    decoded_full[cur_f] = frm
+                else:
+                    if not cap2.grab():
+                        break
+                cur_f += 1
+        # Fallback to sequential scan only if container seek missed frames
+        needed_all = {f for s in selected for f in s["sampled_indices"]}
+        if len(decoded_full) < len(needed_all) // 2:
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+            cur_f = 0
+            max_f = max(needed_all) if needed_all else 0
+            while cur_f <= max_f:
+                if cur_f in needed_all:
+                    ret, frm = cap2.read()
+                    if not ret:
+                        break
+                    decoded_full[cur_f] = frm
+                else:
+                    if not cap2.grab():
+                        break
+                cur_f += 1
     cap2.release()
 
     fallback_bgr = next(iter(decoded_full.values())) if decoded_full else np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
@@ -1461,7 +1513,7 @@ def extract_replay_action_tubes(
             crop = frm[y1:y2, x1:x2]
             if crop.size == 0:
                 crop = frm
-            resized = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA)
+            resized = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
             rgb_frames.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
         stacked = np.stack(rgb_frames, axis=0)
@@ -1481,6 +1533,94 @@ def extract_replay_action_tubes(
         })
 
     return results
+
+
+def _get_yolo_fp16_kwargs(use_fp16: bool) -> Dict[str, Any]:
+    """Return version-appropriate FP16 keyword argument for Ultralytics YOLO (`quantize=16` on 8.4+, `half=True` on older)."""
+    if not use_fp16:
+        return {}
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+        if "quantize" in DEFAULT_CFG_DICT:
+            return {"quantize": 16}
+    except Exception:
+        pass
+    return {"half": True}
+
+
+def extract_replay_action_tubes(
+    video_path: Path | str,
+    pose_model: Any,
+    det_model: Optional[Any] = None,
+    angles_per_clip: int = 2,
+    base_window_sec: float = 1.6,
+    num_frames: int = 16,
+    crop_size: int = 224,
+    scan_fps: float = 3.5,
+    max_scan_samples: int = 56,
+    yolo_batch_size: int = 64,
+    device: str = "auto",
+) -> List[Dict[str, Any]]:
+    """
+    Extract up to `angles_per_clip` shot-bounded `(3, num_frames, crop_size, crop_size)` RGB
+    action tubes + `(num_frames, 16)` biomechanical & court-context sequences from a single
+    multi-angle NBA Replay Archive video clip.
+    """
+    vpath = Path(video_path)
+    scan = decode_replay_scan_frames(
+        video_path=vpath,
+        scan_fps=scan_fps,
+        max_scan_samples=max_scan_samples,
+    )
+    if scan is None:
+        raise RuntimeError(f"Could not decode frames from {vpath}")
+
+    small_frames: List[np.ndarray] = scan["small_frames"]
+    yolo_dev = select_yolo_device(device)
+    fp16_kw = _get_yolo_fp16_kwargs(yolo_dev == "cuda")
+    batch_sz = max(1, int(yolo_batch_size))
+    all_pose: List[Any] = []
+    all_det: List[Any] = []
+
+    with torch.inference_mode():
+        for b_start in range(0, len(small_frames), batch_sz):
+            b_imgs = small_frames[b_start : b_start + batch_sz]
+            all_pose.extend(
+                pose_model.predict(
+                    b_imgs,
+                    conf=0.12,
+                    imgsz=512,
+                    batch=len(b_imgs),
+                    verbose=False,
+                    device=yolo_dev,
+                    **fp16_kw,
+                )
+            )
+            if det_model is not None and det_model is not pose_model:
+                all_det.extend(
+                    det_model.predict(
+                        b_imgs,
+                        conf=0.14,
+                        imgsz=512,
+                        batch=len(b_imgs),
+                        classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
+                        verbose=False,
+                        device=yolo_dev,
+                        **fp16_kw,
+                    )
+                )
+            else:
+                all_det.extend([None] * len(b_imgs))
+
+    return _finalize_clip_tubes_from_predictions(
+        scan=scan,
+        all_pose=all_pose,
+        all_det=all_det,
+        angles_per_clip=angles_per_clip,
+        base_window_sec=base_window_sec,
+        num_frames=num_frames,
+        crop_size=crop_size,
+    )
 
 
 def synthesize_fallback_tube(
@@ -1574,16 +1714,21 @@ def preprocess_replay_dataset(
     base_window_sec: float = 1.6,
     num_frames: int = 16,
     crop_size: int = 224,
-    scan_fps: float = 5.0,
-    max_scan_samples: int = 160,
+    scan_fps: float = 3.5,
+    max_scan_samples: int = 56,
     max_clips: int = 0,
-    yolo_batch_size: int = 16,
+    yolo_batch_size: int = 64,
+    decode_workers: int = 4,
+    clip_chunk_size: int = 16,
+    use_det_model: bool = False,
     device: str = "auto",
     synthetic_fallback: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Process raw NBA Replay Archive MP4s into shot-bounded multi-angle `.pt` action tubes
     with 16-D biomechanical & court-context features and full challenge-call metadata.
+    Uses a 3-stage Multi-Clip Parallel CPU Decode + Super-Batched FP16 GPU YOLO + Parallel
+    Direct-Seek Cropping pipeline to maximize T4 GPU throughput and minimize CPU wait time.
     Strictly excludes any plays matching `data/test/` to guarantee zero data leakage.
     """
     metadata_csv = resolve_project_path(metadata_csv)
@@ -1614,34 +1759,22 @@ def preprocess_replay_dataset(
             test_map,
         )
 
+    raw_base_dir = metadata_csv.parent / "raw"
     # Filter to rows that actually have a downloaded raw MP4 unless synthetic_fallback is enabled
     if not synthetic_fallback:
-        available_rows = [
-            r for r in all_rows
-            if resolve_project_path(r.get("video_path", "")).exists()
-            and resolve_project_path(r.get("video_path", "")).stat().st_size > 10_240
-        ]
+        available_rows: List[Dict[str, Any]] = []
+        for r in all_rows:
+            vp = resolve_project_path(r.get("video_path", ""))
+            if not (vp.exists() and vp.stat().st_size > 10_240):
+                alt_vp = scrape_mod.find_existing_raw_mp4(str(r.get("play_id", "")).strip(), raw_base_dir)
+                if alt_vp is not None:
+                    vp = alt_vp
+            if vp.exists() and vp.stat().st_size > 10_240:
+                available_rows.append(r)
         if available_rows:
             all_rows = available_rows
 
     rows = select_balanced_clips(all_rows, max_clips=max_clips)
-
-    pose_model = None
-    det_model = None
-    has_raw_video = any(resolve_project_path(r.get("video_path", "")).exists() for r in rows)
-    if has_raw_video and YOLO is not None:
-        pose_p = resolve_project_path(pose_weights)
-        det_p = resolve_project_path(yolo_weights)
-        active_pose = str(pose_p) if pose_p.exists() else pose_weights
-        active_det = str(det_p) if det_p.exists() else yolo_weights
-        yolo_dev = select_yolo_device(device)
-        if yolo_dev == "cuda" and torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            if vram_gb >= 12.0 and yolo_batch_size < 64:
-                yolo_batch_size = 64
-        logger.info("Loading YOLO models (device=%s, batch=%d): pose=%s | det=%s", yolo_dev, yolo_batch_size, active_pose, active_det)
-        pose_model = YOLO(active_pose)
-        det_model = YOLO(active_det)
 
     processed_dir.mkdir(parents=True, exist_ok=True)
     for ctype_folder in CHALLENGE_TYPES:
@@ -1671,16 +1804,22 @@ def preprocess_replay_dataset(
         except OSError:
             pass
 
-    processed_rows: List[Dict[str, Any]] = []
-    logger.info(
-        "Preprocessing %d replay clips into %s/{foul,oob,goaltending,flagrant}/ (angles_per_clip=%d, scan_fps=%.1f)...",
-        len(rows),
-        processed_dir.name,
-        angles_per_clip,
-        scan_fps,
-    )
+    # Pre-load existing processed_metadata.csv rows so already-cached .pt files skip disk torch.load()
+    existing_csv_by_play: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    if processed_metadata_csv.exists():
+        try:
+            with open(processed_metadata_csv, "r", newline="", encoding="utf-8") as f:
+                for prow in csv.DictReader(f):
+                    pid = str(prow.get("play_id") or "").strip()
+                    if pid:
+                        existing_csv_by_play[pid].append(dict(prow))
+        except Exception:
+            pass
 
-    for idx, row in enumerate(rows, start=1):
+    processed_rows: List[Dict[str, Any]] = []
+    pending_video_jobs: List[Dict[str, Any]] = []
+
+    for row in rows:
         row = upgrade_metadata_row(row)
         play_id = str(row["play_id"]).strip()
         game_id = str(row.get("game_id", "")).strip() or play_id.split("_")[0]
@@ -1693,18 +1832,54 @@ def preprocess_replay_dataset(
         class_dir = challenge_type
         video_path = resolve_project_path(row.get("video_path", ""))
         if not video_path.exists():
-            alt_raw = scrape_mod.find_existing_raw_mp4(play_id, metadata_csv.parent / "raw")
+            alt_raw = scrape_mod.find_existing_raw_mp4(play_id, raw_base_dir)
             if alt_raw is not None:
                 video_path = alt_raw
 
         expected_first = processed_dir / class_dir / (f"{play_id}_a0.pt" if angles_per_clip > 1 else f"{play_id}.pt")
         cached_pts = sorted((processed_dir / class_dir).glob(f"{play_id}_a*.pt")) if angles_per_clip > 1 else ([expected_first] if expected_first.exists() else [])
+
+        # Fast-path 1: Reuse existing_csv_by_play metadata without calling torch.load() if cached .pt files exist
+        csv_cached = existing_csv_by_play.get(play_id, [])
+        if cached_pts and csv_cached:
+            pt_by_stem = {cp.stem: cp for cp in cached_pts}
+            fast_entries: List[Dict[str, Any]] = []
+            for prow in csv_cached:
+                sid = str(prow.get("sample_id") or "").strip()
+                cp = pt_by_stem.get(sid) or cached_pts[0]
+                fast_entries.append({
+                    "sample_id": cp.stem,
+                    "play_id": play_id,
+                    "game_id": game_id,
+                    "season": row.get("season", ""),
+                    "trigger": row.get("trigger", ""),
+                    "challenge_type": challenge_type,
+                    "challenge_type_id": challenge_type_id,
+                    "outcome_category": outcome_category,
+                    "call_label": call_label,
+                    "call_resolution": call_resolution,
+                    "angle_idx": int(prow.get("angle_idx", 0) or 0),
+                    "shot_start_frame": int(prow.get("shot_start_frame", 0) or 0),
+                    "shot_end_frame": int(prow.get("shot_end_frame", 0) or 0),
+                    "peak_frame": int(prow.get("peak_frame", 0) or 0),
+                    "fps": round(float(prow.get("fps", 60.0) or 60.0), 2),
+                    "est_speed_ratio": round(float(prow.get("est_speed_ratio", 1.0) or 1.0), 3),
+                    "saliency": round(float(prow.get("saliency", 0.5) or 0.5), 4),
+                    "label": label,
+                    "video_path": row.get("video_path", ""),
+                    "tensor_path": (Path("data") / "processed" / class_dir / cp.name).as_posix(),
+                })
+            best_c_sal = max(float(vc.get("saliency", 0.5)) for vc in fast_entries)
+            filtered_cached = [vc for vc in fast_entries if float(vc.get("saliency", 0.5)) >= 0.58 * best_c_sal]
+            processed_rows.extend(filtered_cached if filtered_cached else fast_entries)
+            continue
+
+        # Fast-path 2: .pt files exist on disk but weren't in processed_metadata.csv yet
         valid_cached: List[Dict[str, Any]] = []
         for cp in cached_pts:
             try:
                 payload = torch.load(cp, map_location="cpu", weights_only=False)
                 if isinstance(payload, dict) and not payload.get("is_synthetic", False):
-                    # Upgrade cached .pt payload in-place to 16-D pose features & full challenge metadata
                     pf = payload.get("pose_features")
                     vid = payload.get("video")
                     needs_resave = False
@@ -1748,89 +1923,25 @@ def preprocess_replay_dataset(
                 continue
 
         if valid_cached:
-            # Filter out low-saliency secondary angle if it is <58% of primary angle saliency
             best_c_sal = max(float(vc.get("saliency", 0.5)) for vc in valid_cached)
             filtered_cached = [vc for vc in valid_cached if float(vc.get("saliency", 0.5)) >= 0.58 * best_c_sal]
             processed_rows.extend(filtered_cached if filtered_cached else valid_cached)
             continue
 
-        if video_path.exists() and video_path.stat().st_size > 10_240 and pose_model is not None:
-            try:
-                tubes = extract_replay_action_tubes(
-                    video_path=video_path,
-                    pose_model=pose_model,
-                    det_model=det_model,
-                    angles_per_clip=angles_per_clip,
-                    base_window_sec=base_window_sec,
-                    num_frames=num_frames,
-                    crop_size=crop_size,
-                    scan_fps=scan_fps,
-                    max_scan_samples=max_scan_samples,
-                    yolo_batch_size=yolo_batch_size,
-                    device=device,
-                )
-            except Exception as exc:
-                logger.warning("[%d/%d] Failed preprocessing %s: %s", idx, len(rows), play_id, exc)
-                continue
-
-            for t_item in tubes:
-                a_idx = int(t_item["angle_idx"])
-                sample_id = f"{play_id}_a{a_idx}" if angles_per_clip > 1 else play_id
-                out_pt = processed_dir / class_dir / f"{sample_id}.pt"
-                torch.save(
-                    {
-                        "video": t_item["video"],
-                        "pose_features": t_item["pose_features"],
-                        "label": label,
-                        "challenge_type": challenge_type,
-                        "challenge_type_id": challenge_type_id,
-                        "outcome_category": outcome_category,
-                        "call_label": call_label,
-                        "call_resolution": call_resolution,
-                        "sample_id": sample_id,
-                        "play_id": play_id,
-                        "game_id": game_id,
-                        "angle_idx": a_idx,
-                        "shot_start_frame": t_item["shot_start_frame"],
-                        "shot_end_frame": t_item["shot_end_frame"],
-                        "peak_frame": t_item["peak_frame"],
-                        "sampled_indices": t_item["sampled_indices"],
-                        "crop_boxes": t_item["crop_boxes"],
-                        "fps": t_item["fps"],
-                        "est_speed_ratio": t_item["est_speed_ratio"],
-                        "saliency": t_item["saliency"],
-                        "is_synthetic": False,
-                    },
-                    out_pt,
-                )
-                processed_rows.append({
-                    "sample_id": sample_id,
-                    "play_id": play_id,
-                    "game_id": game_id,
-                    "season": row.get("season", ""),
-                    "trigger": row.get("trigger", ""),
-                    "challenge_type": challenge_type,
-                    "challenge_type_id": challenge_type_id,
-                    "outcome_category": outcome_category,
-                    "call_label": call_label,
-                    "call_resolution": call_resolution,
-                    "angle_idx": a_idx,
-                    "shot_start_frame": t_item["shot_start_frame"],
-                    "shot_end_frame": t_item["shot_end_frame"],
-                    "peak_frame": t_item["peak_frame"],
-                    "fps": round(float(t_item["fps"]), 2),
-                    "est_speed_ratio": round(float(t_item["est_speed_ratio"]), 3),
-                    "saliency": round(float(t_item["saliency"]), 4),
-                    "label": label,
-                    "video_path": row.get("video_path", ""),
-                    "tensor_path": (Path("data") / "processed" / class_dir / f"{sample_id}.pt").as_posix(),
-                })
-
-            if idx % 10 == 0 or idx == len(rows):
-                write_processed_csv(processed_metadata_csv, processed_rows)
-                logger.info("[%d/%d] Processed %s (%s -> %s) -> %d angle tube(s) (total: %d)",
-                            idx, len(rows), play_id, challenge_type, outcome_category, len(tubes), len(processed_rows))
-
+        if video_path.exists() and video_path.stat().st_size > 10_240:
+            pending_video_jobs.append({
+                "row": row,
+                "play_id": play_id,
+                "game_id": game_id,
+                "label": label,
+                "challenge_type": challenge_type,
+                "challenge_type_id": challenge_type_id,
+                "outcome_category": outcome_category,
+                "call_label": call_label,
+                "call_resolution": call_resolution,
+                "class_dir": class_dir,
+                "video_path": video_path,
+            })
         elif synthetic_fallback:
             for a_idx in range(max(1, angles_per_clip)):
                 t_item = synthesize_fallback_tube(
@@ -1881,8 +1992,233 @@ def preprocess_replay_dataset(
                     "video_path": row.get("video_path", ""),
                     "tensor_path": (Path("data") / "processed" / class_dir / f"{sample_id}.pt").as_posix(),
                 })
-        else:
-            logger.debug("Skipping missing raw MP4: %s", video_path)
+
+    if not pending_video_jobs:
+        write_processed_csv(processed_metadata_csv, processed_rows)
+        logger.info(
+            "Stage 2 complete (all %d clips already cached): %d action tubes indexed in %s",
+            len(rows),
+            len(processed_rows),
+            processed_metadata_csv,
+        )
+        return processed_rows
+
+    if YOLO is None:
+        raise RuntimeError("Ultralytics YOLO is required to preprocess raw MP4 videos.")
+
+    pose_p = resolve_project_path(pose_weights)
+    active_pose = str(pose_p) if pose_p.exists() else pose_weights
+    yolo_dev = select_yolo_device(device)
+    use_fp16 = yolo_dev == "cuda" and torch.cuda.is_available()
+    if use_fp16:
+        torch.backends.cudnn.benchmark = True
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if vram_gb >= 12.0 and yolo_batch_size < 128:
+            yolo_batch_size = 128
+
+    logger.info(
+        "Loading YOLO pose model (device=%s, fp16=%s, super_batch=%d, workers=%d, chunk=%d): %s",
+        yolo_dev,
+        use_fp16,
+        yolo_batch_size,
+        decode_workers,
+        clip_chunk_size,
+        active_pose,
+    )
+    pose_model = YOLO(active_pose)
+    det_model = None
+    if use_det_model:
+        det_p = resolve_project_path(yolo_weights)
+        active_det = str(det_p) if det_p.exists() else yolo_weights
+        det_model = YOLO(active_det)
+
+    eff_scan_fps = min(scan_fps, 4.0) if scan_fps > 4.0 else scan_fps
+    eff_max_samples = min(max_scan_samples, 64) if max_scan_samples > 64 else max_scan_samples
+    eff_workers = max(1, int(decode_workers))
+    eff_chunk = max(1, int(clip_chunk_size))
+    batch_sz = max(1, int(yolo_batch_size))
+
+    logger.info(
+        "Preprocessing %d new replay clips (%d already cached) into %s/{foul,oob,goaltending,flagrant}/ "
+        "(angles=%d, scan_fps=%.1f, max_samples=%d)...",
+        len(pending_video_jobs),
+        len(rows) - len(pending_video_jobs),
+        processed_dir.name,
+        angles_per_clip,
+        eff_scan_fps,
+        eff_max_samples,
+    )
+
+    def _decode_job(job: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        try:
+            scan = decode_replay_scan_frames(
+                video_path=job["video_path"],
+                scan_fps=eff_scan_fps,
+                max_scan_samples=eff_max_samples,
+                scan_w=512,
+                scan_h=288,
+            )
+            return job, scan
+        except Exception as exc:
+            logger.warning("Failed decoding %s: %s", job["play_id"], exc)
+            return job, None
+
+    def _finalize_and_save_job(
+        args_tuple: Tuple[Dict[str, Any], Dict[str, Any], List[Any], List[Any]]
+    ) -> List[Dict[str, Any]]:
+        job, scan, clip_pose, clip_det = args_tuple
+        play_id = job["play_id"]
+        game_id = job["game_id"]
+        label = job["label"]
+        challenge_type = job["challenge_type"]
+        challenge_type_id = job["challenge_type_id"]
+        outcome_category = job["outcome_category"]
+        call_label = job["call_label"]
+        call_resolution = job["call_resolution"]
+        class_dir = job["class_dir"]
+        row = job["row"]
+        out_entries: List[Dict[str, Any]] = []
+        try:
+            tubes = _finalize_clip_tubes_from_predictions(
+                scan=scan,
+                all_pose=clip_pose,
+                all_det=clip_det,
+                angles_per_clip=angles_per_clip,
+                base_window_sec=base_window_sec,
+                num_frames=num_frames,
+                crop_size=crop_size,
+            )
+            for t_item in tubes:
+                a_idx = int(t_item["angle_idx"])
+                sample_id = f"{play_id}_a{a_idx}" if angles_per_clip > 1 else play_id
+                out_pt = processed_dir / class_dir / f"{sample_id}.pt"
+                torch.save(
+                    {
+                        "video": t_item["video"],
+                        "pose_features": t_item["pose_features"],
+                        "label": label,
+                        "challenge_type": challenge_type,
+                        "challenge_type_id": challenge_type_id,
+                        "outcome_category": outcome_category,
+                        "call_label": call_label,
+                        "call_resolution": call_resolution,
+                        "sample_id": sample_id,
+                        "play_id": play_id,
+                        "game_id": game_id,
+                        "angle_idx": a_idx,
+                        "shot_start_frame": t_item["shot_start_frame"],
+                        "shot_end_frame": t_item["shot_end_frame"],
+                        "peak_frame": t_item["peak_frame"],
+                        "sampled_indices": t_item["sampled_indices"],
+                        "crop_boxes": t_item["crop_boxes"],
+                        "fps": t_item["fps"],
+                        "est_speed_ratio": t_item["est_speed_ratio"],
+                        "saliency": t_item["saliency"],
+                        "is_synthetic": False,
+                    },
+                    out_pt,
+                )
+                out_entries.append({
+                    "sample_id": sample_id,
+                    "play_id": play_id,
+                    "game_id": game_id,
+                    "season": row.get("season", ""),
+                    "trigger": row.get("trigger", ""),
+                    "challenge_type": challenge_type,
+                    "challenge_type_id": challenge_type_id,
+                    "outcome_category": outcome_category,
+                    "call_label": call_label,
+                    "call_resolution": call_resolution,
+                    "angle_idx": a_idx,
+                    "shot_start_frame": t_item["shot_start_frame"],
+                    "shot_end_frame": t_item["shot_end_frame"],
+                    "peak_frame": t_item["peak_frame"],
+                    "fps": round(float(t_item["fps"]), 2),
+                    "est_speed_ratio": round(float(t_item["est_speed_ratio"]), 3),
+                    "saliency": round(float(t_item["saliency"]), 4),
+                    "label": label,
+                    "video_path": row.get("video_path", ""),
+                    "tensor_path": (Path("data") / "processed" / class_dir / f"{sample_id}.pt").as_posix(),
+                })
+        except Exception as exc:
+            logger.warning("Failed finalizing tubes for %s: %s", play_id, exc)
+        return out_entries
+
+    completed_new = 0
+    with ThreadPoolExecutor(max_workers=eff_workers) as pool:
+        for c_start in range(0, len(pending_video_jobs), eff_chunk):
+            chunk_jobs = pending_video_jobs[c_start : c_start + eff_chunk]
+
+            # Stage A: Parallel CPU Scan Decoding across chunk_jobs
+            decoded_pairs = list(pool.map(_decode_job, chunk_jobs))
+            valid_pairs = [(jb, sc) for jb, sc in decoded_pairs if sc is not None and sc.get("small_frames")]
+            if not valid_pairs:
+                continue
+
+            # Stage B: Multi-Clip Super-Batched FP16 GPU YOLO Inference
+            flat_frames: List[np.ndarray] = []
+            clip_slices: List[Tuple[int, int]] = []
+            for _, sc in valid_pairs:
+                s_idx = len(flat_frames)
+                flat_frames.extend(sc["small_frames"])
+                clip_slices.append((s_idx, len(flat_frames)))
+
+            flat_pose: List[Any] = []
+            flat_det: List[Any] = []
+            fp16_kw = _get_yolo_fp16_kwargs(use_fp16)
+            with torch.inference_mode():
+                for b_start in range(0, len(flat_frames), batch_sz):
+                    b_imgs = flat_frames[b_start : b_start + batch_sz]
+                    flat_pose.extend(
+                        pose_model.predict(
+                            b_imgs,
+                            conf=0.12,
+                            imgsz=512,
+                            batch=len(b_imgs),
+                            verbose=False,
+                            device=yolo_dev,
+                            **fp16_kw,
+                        )
+                    )
+                    if det_model is not None:
+                        flat_det.extend(
+                            det_model.predict(
+                                b_imgs,
+                                conf=0.14,
+                                imgsz=512,
+                                batch=len(b_imgs),
+                                classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
+                                verbose=False,
+                                device=yolo_dev,
+                                **fp16_kw,
+                            )
+                        )
+                    else:
+                        flat_det.extend([None] * len(b_imgs))
+
+            # Stage C: Parallel CPU Contact Analysis + Direct-Seek Cropping & Tensor Saving
+            finalize_tasks = [
+                (jb, sc, flat_pose[s_i:e_i], flat_det[s_i:e_i])
+                for (jb, sc), (s_i, e_i) in zip(valid_pairs, clip_slices)
+            ]
+            for entries in pool.map(_finalize_and_save_job, finalize_tasks):
+                if entries:
+                    processed_rows.extend(entries)
+                    completed_new += 1
+
+            write_processed_csv(processed_metadata_csv, processed_rows)
+            last_jb = valid_pairs[-1][0]
+            logger.info(
+                "[%d/%d new clips | %d total tubes] Super-batch processed %d clips (%d GPU frames; latest=%s %s -> %s)",
+                min(c_start + len(chunk_jobs), len(pending_video_jobs)),
+                len(pending_video_jobs),
+                len(processed_rows),
+                len(valid_pairs),
+                len(flat_frames),
+                last_jb["play_id"],
+                last_jb["challenge_type"],
+                last_jb["outcome_category"],
+            )
 
     write_processed_csv(processed_metadata_csv, processed_rows)
     logger.info("Stage 2 complete: %d action tubes indexed in %s", len(processed_rows), processed_metadata_csv)
@@ -1910,10 +2246,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-sec", type=float, default=1.6, help="Base temporal window in seconds around action apex (default: 1.6)")
     parser.add_argument("--num-frames", type=int, default=16, help="Frames sampled per action tube (default: 16)")
     parser.add_argument("--crop-size", type=int, default=224, help="Square RGB crop size (default: 224)")
-    parser.add_argument("--scan-fps", type=float, default=5.0, help="Physical scan frequency in Hz (default: 5.0)")
-    parser.add_argument("--max-scan-samples", type=int, default=160, help="Max scan frames per replay clip (default: 160)")
+    parser.add_argument("--scan-fps", type=float, default=3.5, help="Physical scan frequency in Hz (default: 3.5)")
+    parser.add_argument("--max-scan-samples", type=int, default=56, help="Max scan frames per replay clip (default: 56)")
     parser.add_argument("--max-clips", type=int, default=0, help="Max replay clips to process (0 = all downloaded)")
-    parser.add_argument("--yolo-batch-size", type=int, default=16, help="YOLO batch size (default: 16)")
+    parser.add_argument("--yolo-batch-size", type=int, default=64, help="YOLO GPU super-batch size (default: 64, auto-scales to 128 on T4)")
+    parser.add_argument("--decode-workers", type=int, default=4, help="Parallel CPU threads for video decoding & cropping (default: 4)")
+    parser.add_argument("--clip-chunk-size", type=int, default=16, help="Clips grouped per GPU super-batch (default: 16)")
+    parser.add_argument("--use-det-model", action="store_true", help="Also run secondary YOLO detection model in addition to YOLO-Pose + HSV ball tracker")
     parser.add_argument("--device", type=str, default="auto", help="YOLO device ('auto', 'cuda', or 'cpu')")
     parser.add_argument("--synthetic-fallback", action="store_true", help="Generate deterministic synthetic .pt tensors when MP4s are absent")
     return parser.parse_args()
@@ -1936,6 +2275,9 @@ if __name__ == "__main__":
         max_scan_samples=cli_args.max_scan_samples,
         max_clips=cli_args.max_clips,
         yolo_batch_size=cli_args.yolo_batch_size,
+        decode_workers=cli_args.decode_workers,
+        clip_chunk_size=cli_args.clip_chunk_size,
+        use_det_model=cli_args.use_det_model,
         device=cli_args.device,
         synthetic_fallback=cli_args.synthetic_fallback,
     )

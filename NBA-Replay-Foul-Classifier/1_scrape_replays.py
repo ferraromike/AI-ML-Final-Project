@@ -1221,10 +1221,12 @@ def bulk_download_clips(
     max_clips: int = 0,
     max_workers: int = 8,
     balanced: bool = True,
+    quality: Optional[str] = None,
 ) -> int:
     """
     Concurrently download missing MP4 clips from metadata rows into challenge-type folders:
     `output_dir/{foul,oob,goaltending,flagrant}/{play_id}.mp4`.
+    If `quality='sd'`, prefers `_320x180.mp4` (~4x faster download & CPU decode on Colab).
     """
     output_dir = resolve_project_path(output_dir)
     for ctype in CHALLENGE_TYPES:
@@ -1235,12 +1237,17 @@ def bulk_download_clips(
     ordered = interleave_balanced_rows(rows) if balanced else [upgrade_metadata_row(r) for r in rows]
     pending: List[Tuple[str, str, Path]] = []
     already_cached = 0
+    q_low = (quality or "").strip().lower()
     for row in ordered:
         play_id = str(row.get("play_id") or "").strip()
         mp4_url = str(row.get("mp4_url") or "").strip()
         ctype = normalize_challenge_type(row.get("challenge_type"))
         if not play_id or not mp4_url:
             continue
+        if q_low == "sd" and "_1280x720.mp4" in mp4_url:
+            mp4_url = mp4_url.replace("_1280x720.mp4", "_320x180.mp4")
+        elif q_low == "hd" and "_320x180.mp4" in mp4_url:
+            mp4_url = mp4_url.replace("_320x180.mp4", "_1280x720.mp4")
         dest = output_dir / ctype / f"{play_id}.mp4"
         if dest.exists() and dest.stat().st_size > 10_240:
             already_cached += 1
