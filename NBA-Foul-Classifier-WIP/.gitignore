@@ -37,11 +37,18 @@ wheels/
 *.pth
 *.onnx
 
-# Raw & Processed Video Data (keep CSV metadata tracked or local as needed)
+# Raw, Processed & Test Video Data
+*.mp4
+*.mov
+*.avi
+*.mkv
 data/raw/
 data/processed/
 outputs/
 *_annotated.mp4
+data/test/*
+!data/test/README.md
+!data/test/.gitkeep
 
 # macOS & IDE
 .DS_Store
