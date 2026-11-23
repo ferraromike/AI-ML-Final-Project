@@ -45,7 +45,7 @@ import cv2
 import numpy as np
 import torch
 
-cv2.setNumThreads(2)
+cv2.setNumThreads(0)
 
 try:
     from ultralytics import YOLO
@@ -2032,21 +2032,21 @@ def preprocess_replay_dataset(
         active_det = str(det_p) if det_p.exists() else yolo_weights
         det_model = YOLO(active_det)
 
-    eff_scan_fps = min(scan_fps, 4.0) if scan_fps > 4.0 else scan_fps
-    eff_max_samples = min(max_scan_samples, 64) if max_scan_samples > 64 else max_scan_samples
-    eff_workers = max(1, int(decode_workers))
-    eff_chunk = max(1, int(clip_chunk_size))
+    eff_scan_fps = min(scan_fps, 2.5) if scan_fps > 2.5 else scan_fps
+    eff_max_samples = min(max_scan_samples, 36) if max_scan_samples > 36 else max_scan_samples
+    eff_chunk = max(1, min(int(clip_chunk_size), 8))
     batch_sz = max(1, int(yolo_batch_size))
 
     logger.info(
         "Preprocessing %d new replay clips (%d already cached) into %s/{foul,oob,goaltending,flagrant}/ "
-        "(angles=%d, scan_fps=%.1f, max_samples=%d)...",
+        "(angles=%d, scan_fps=%.1f, max_samples=%d, chunk=%d)...",
         len(pending_video_jobs),
         len(rows) - len(pending_video_jobs),
         processed_dir.name,
         angles_per_clip,
         eff_scan_fps,
         eff_max_samples,
+        eff_chunk,
     )
 
     def _decode_job(job: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
@@ -2054,6 +2054,7 @@ def preprocess_replay_dataset(
             scan = decode_replay_scan_frames(
                 video_path=job["video_path"],
                 scan_fps=eff_scan_fps,
+                max_clip_sec=36.0,
                 max_scan_samples=eff_max_samples,
                 scan_w=512,
                 scan_h=288,
@@ -2145,80 +2146,80 @@ def preprocess_replay_dataset(
         return out_entries
 
     completed_new = 0
-    with ThreadPoolExecutor(max_workers=eff_workers) as pool:
-        for c_start in range(0, len(pending_video_jobs), eff_chunk):
-            chunk_jobs = pending_video_jobs[c_start : c_start + eff_chunk]
+    fp16_kw = _get_yolo_fp16_kwargs(use_fp16)
+    for c_start in range(0, len(pending_video_jobs), eff_chunk):
+        chunk_jobs = pending_video_jobs[c_start : c_start + eff_chunk]
 
-            # Stage A: Parallel CPU Scan Decoding across chunk_jobs
-            decoded_pairs = list(pool.map(_decode_job, chunk_jobs))
-            valid_pairs = [(jb, sc) for jb, sc in decoded_pairs if sc is not None and sc.get("small_frames")]
-            if not valid_pairs:
-                continue
+        # Stage A: Main-thread scan decoding across chunk_jobs (avoids OpenCV/FFmpeg pthread deadlocks on Linux)
+        decoded_pairs = [_decode_job(jb) for jb in chunk_jobs]
+        valid_pairs = [(jb, sc) for jb, sc in decoded_pairs if sc is not None and sc.get("small_frames")]
+        if not valid_pairs:
+            continue
 
-            # Stage B: Multi-Clip Super-Batched FP16 GPU YOLO Inference
-            flat_frames: List[np.ndarray] = []
-            clip_slices: List[Tuple[int, int]] = []
-            for _, sc in valid_pairs:
-                s_idx = len(flat_frames)
-                flat_frames.extend(sc["small_frames"])
-                clip_slices.append((s_idx, len(flat_frames)))
+        # Stage B: Multi-Clip Super-Batched FP16 GPU YOLO Inference
+        flat_frames: List[np.ndarray] = []
+        clip_slices: List[Tuple[int, int]] = []
+        for _, sc in valid_pairs:
+            s_idx = len(flat_frames)
+            flat_frames.extend(sc["small_frames"])
+            clip_slices.append((s_idx, len(flat_frames)))
 
-            flat_pose: List[Any] = []
-            flat_det: List[Any] = []
-            fp16_kw = _get_yolo_fp16_kwargs(use_fp16)
-            with torch.inference_mode():
-                for b_start in range(0, len(flat_frames), batch_sz):
-                    b_imgs = flat_frames[b_start : b_start + batch_sz]
-                    flat_pose.extend(
-                        pose_model.predict(
+        flat_pose: List[Any] = []
+        flat_det: List[Any] = []
+        with torch.inference_mode():
+            for b_start in range(0, len(flat_frames), batch_sz):
+                b_imgs = flat_frames[b_start : b_start + batch_sz]
+                flat_pose.extend(
+                    pose_model.predict(
+                        b_imgs,
+                        conf=0.12,
+                        imgsz=512,
+                        batch=len(b_imgs),
+                        verbose=False,
+                        device=yolo_dev,
+                        **fp16_kw,
+                    )
+                )
+                if det_model is not None:
+                    flat_det.extend(
+                        det_model.predict(
                             b_imgs,
-                            conf=0.12,
+                            conf=0.14,
                             imgsz=512,
                             batch=len(b_imgs),
+                            classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
                             verbose=False,
                             device=yolo_dev,
                             **fp16_kw,
                         )
                     )
-                    if det_model is not None:
-                        flat_det.extend(
-                            det_model.predict(
-                                b_imgs,
-                                conf=0.14,
-                                imgsz=512,
-                                batch=len(b_imgs),
-                                classes=[COCO_PERSON_CLS, COCO_SPORTS_BALL_CLS],
-                                verbose=False,
-                                device=yolo_dev,
-                                **fp16_kw,
-                            )
-                        )
-                    else:
-                        flat_det.extend([None] * len(b_imgs))
+                else:
+                    flat_det.extend([None] * len(b_imgs))
 
-            # Stage C: Parallel CPU Contact Analysis + Direct-Seek Cropping & Tensor Saving
-            finalize_tasks = [
-                (jb, sc, flat_pose[s_i:e_i], flat_det[s_i:e_i])
-                for (jb, sc), (s_i, e_i) in zip(valid_pairs, clip_slices)
-            ]
-            for entries in pool.map(_finalize_and_save_job, finalize_tasks):
-                if entries:
-                    processed_rows.extend(entries)
-                    completed_new += 1
+        # Stage C: Contact Analysis + Direct-Seek Cropping & Tensor Saving
+        finalize_tasks = [
+            (jb, sc, flat_pose[s_i:e_i], flat_det[s_i:e_i])
+            for (jb, sc), (s_i, e_i) in zip(valid_pairs, clip_slices)
+        ]
+        for task_item in finalize_tasks:
+            entries = _finalize_and_save_job(task_item)
+            if entries:
+                processed_rows.extend(entries)
+                completed_new += 1
 
-            write_processed_csv(processed_metadata_csv, processed_rows)
-            last_jb = valid_pairs[-1][0]
-            logger.info(
-                "[%d/%d new clips | %d total tubes] Super-batch processed %d clips (%d GPU frames; latest=%s %s -> %s)",
-                min(c_start + len(chunk_jobs), len(pending_video_jobs)),
-                len(pending_video_jobs),
-                len(processed_rows),
-                len(valid_pairs),
-                len(flat_frames),
-                last_jb["play_id"],
-                last_jb["challenge_type"],
-                last_jb["outcome_category"],
-            )
+        write_processed_csv(processed_metadata_csv, processed_rows)
+        last_jb = valid_pairs[-1][0]
+        logger.info(
+            "[%d/%d new clips | %d total tubes] Super-batch processed %d clips (%d GPU frames; latest=%s %s -> %s)",
+            min(c_start + len(chunk_jobs), len(pending_video_jobs)),
+            len(pending_video_jobs),
+            len(processed_rows),
+            len(valid_pairs),
+            len(flat_frames),
+            last_jb["play_id"],
+            last_jb["challenge_type"],
+            last_jb["outcome_category"],
+        )
 
     write_processed_csv(processed_metadata_csv, processed_rows)
     logger.info("Stage 2 complete: %d action tubes indexed in %s", len(processed_rows), processed_metadata_csv)
