@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-STAGE 2: Shot-Segmented Multi-Angle Replay Action-Tube & Pose Extractor (`2_preprocess_replays.py`)
+STAGE 2: Shot-Segmented Multi-Angle Replay Action-Tube & 16-D Court/Pose Extractor (`2_preprocess_replays.py`)
 
-Engineered specifically for NBA Official Replay Archive clips (`official.nba.com/replay/archive/`):
+Engineered specifically for NBA Official Replay Archive clips (`official.nba.com/replay/archive/`)
+across ALL Coach's Challenge types (Called Fouls, Out of Bounds, Goaltending / Basket Interference):
   - Multi-Angle Shot Segmentation: Official Replay Center MP4s (~25-45s, 60 fps) stitch together
     multiple camera angles (wide broadcast, alternate slow-motion, overhead/baseline). We detect
     hard camera cuts first and NEVER interpolate ROIs, ball tracks, or action tubes across cuts.
-  - Angle-Aware Geometry: Accepts both wide side-court and zoomed baseline/overhead replay angles
-    (supporting centered rims and larger player heights up to 0.80 * frame_h) while rejecting
-    referees, seated courtside spectators, and face-only dead-ball close-ups.
-  - FPS-Normalized & Slow-Motion-Aware Kinematics: Scans at constant physical rate (5 Hz) so
-    60 fps and 30 fps clips behave identically; adapts window length for slow-motion replay shots
-    and normalizes velocity/shock features by elapsed wall-clock `dt`.
-  - Multi-Angle Extraction (`--angles-per-clip 2`): Extracts up to K clean camera-angle action
-    tubes per replay clip, saving `(3, 16, 224, 224)` uint8 RGB + `(16, 12)` pose kinematics
-    into `data/processed/{foul,no_foul}/` and indexing `play_id` + `game_id` in
-    `data/processed/processed_metadata.csv` for leak-free grouped splitting in Stage 4.
+  - Challenge-Aware Court, Rim & Boundary Geometry:
+      • Fouls (`challenge_foul`): Tracks opposing-jersey contact pairs, arm intrusion, cylinder
+        invasion, landing-space encroachment, and stationary charge vs. blocking verticality.
+      • Out of Bounds (`challenge_oob`): Tracks player feet (`LOWER_BODY_KPTS`) & ball proximity
+        to sideline/baseline court boundaries, loose-ball deflections, and proximate foul contact.
+      • Goaltending / BI (`challenge_goaltending_bi`): Tracks basketball & contesting hand proximity
+        to the orange rim/backboard cylinder and apex contest elevation.
+  - Truncated-File Resilient Decoding: Bounds frame horizon to actual readable frames so partial
+    MP4 downloads never seek past EOF.
+  - Zero-Leakage Held-Out Test Segregation: Excludes any training play matching `data/test/` by
+    `play_id`, CDN media slug (`trigger16_...`), or fast visual frame signature.
 """
 
 from __future__ import annotations
@@ -31,8 +33,10 @@ import argparse
 import csv
 import gc
 import hashlib
+import importlib
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -49,6 +53,17 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+scrape_mod = importlib.import_module("1_scrape_replays")
+CALL_CLASSES = scrape_mod.CALL_CLASSES
+CALL_CLASS_SPECS = scrape_mod.CALL_CLASS_SPECS
+CALL_CLASS_TO_ID = scrape_mod.CALL_CLASS_TO_ID
+CHALLENGE_TYPES = scrape_mod.CHALLENGE_TYPES
+CHALLENGE_TYPE_TO_ID = scrape_mod.CHALLENGE_TYPE_TO_ID
+extract_cdn_media_slug = scrape_mod.extract_cdn_media_slug
+upgrade_metadata_row = scrape_mod.upgrade_metadata_row
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,20 +73,25 @@ logging.basicConfig(
 logger = logging.getLogger("preprocess_replays")
 
 POSE_FEATURE_NAMES: Tuple[str, ...] = (
-    "arm_contact_intrusion",        # 0: Defender hand/wrist proximity to offensive arm/wrist
-    "body_cylinder_penetration",    # 1: Torso/hip overlap invading offensive cylinder
-    "lower_body_landing_violation", # 2: Defender feet/legs encroaching landing zone
-    "defender_verticality_angle",   # 3: Arm reach deviation from legal vertical contest
-    "defender_lateral_positioning", # 4: Lateral offset between defender & offensive player
-    "offensive_displacement",       # 5: Collision overlap / displacement proxy
-    "defender_to_ball_distance",    # 6: Defender wrist proximity to basketball
-    "ball_to_shooter_distance",     # 7: Offensive wrist proximity to basketball
-    "ball_strike_vs_body_ratio",    # 8: Body contact relative to clean play on ball
-    "relative_closing_velocity",    # 9: Time-normalized closing velocity (1/sec)
-    "momentum_transfer_shock",      # 10: Time-normalized collision jolt / acceleration
-    "airborne_contest_apex_diff",   # 11: Composite contact + arm elevation contest apex
+    "arm_contact_intrusion",         # 0: Defender hand/wrist proximity to offensive arm/wrist
+    "body_cylinder_penetration",     # 1: Torso/hip overlap invading offensive cylinder
+    "lower_body_landing_violation",  # 2: Defender feet/legs encroaching landing zone
+    "defender_verticality_angle",    # 3: Arm reach deviation from legal vertical contest
+    "defender_lateral_positioning",  # 4: Lateral offset between defender & offensive player
+    "offensive_displacement",        # 5: Collision overlap / displacement proxy
+    "defender_to_ball_distance",     # 6: Defender wrist proximity to basketball (clean block/strip)
+    "ball_to_shooter_distance",      # 7: Offensive wrist proximity to basketball
+    "ball_strike_vs_body_ratio",     # 8: Body contact relative to clean play on ball
+    "relative_closing_velocity",     # 9: Time-normalized closing velocity (1/sec)
+    "momentum_transfer_shock",       # 10: Time-normalized player-pair collision jolt
+    "airborne_contest_apex_diff",    # 11: Composite contact + arm elevation contest apex
+    "ball_rim_proximity",            # 12: Ball & contesting hand proximity to rim/backboard (Goaltending/BI)
+    "boundary_sideline_proximity",   # 13: Player feet & ball proximity to court sideline/baseline (OOB)
+    "ball_deflection_impulse",       # 14: Abrupt ball trajectory deflection / touch impulse (OOB / Block)
+    "stationary_charge_verticality", # 15: Set-feet stationary defender vs. driving offense (Charge/Other Foul)
 )
-POSE_FEATURES = len(POSE_FEATURE_NAMES)  # 12
+POSE_FEATURES = len(POSE_FEATURE_NAMES)  # 16
+LEGACY_POSE_FEATURES = 12
 
 # COCO 17-keypoint indices
 UPPER_BODY_KPTS = (0, 5, 6, 7, 8, 9, 10)
@@ -87,13 +107,18 @@ PROCESSED_CSV_COLUMNS: List[str] = [
     "game_id",
     "season",
     "trigger",
+    "challenge_type",
+    "challenge_type_id",
     "outcome_category",
+    "call_label",
+    "call_resolution",
     "angle_idx",
     "shot_start_frame",
     "shot_end_frame",
     "peak_frame",
     "fps",
     "est_speed_ratio",
+    "saliency",
     "label",
     "video_path",
     "tensor_path",
@@ -130,6 +155,172 @@ def select_yolo_device(requested: Optional[str] = None) -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def upgrade_pose_features_16d(
+    pose: torch.Tensor,
+    video: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Ensure pose tensor has shape `(T, 16)`. If a legacy `(T, 12)` tensor is provided,
+    deterministically derive channels `12..15` (`ball_rim_proximity`, `boundary_sideline_proximity`,
+    `ball_deflection_impulse`, `stationary_charge_verticality`) from the 12 kinematic channels
+    and optional RGB action tube.
+    """
+    p = pose.float()
+    if p.dim() != 2:
+        p = p.view(-1, p.size(-1))
+    T, D = p.shape
+    if D == POSE_FEATURES:
+        return p
+    if D > POSE_FEATURES:
+        return p[:, :POSE_FEATURES].contiguous()
+
+    out = torch.zeros((T, POSE_FEATURES), dtype=torch.float32, device=p.device)
+    out[:, :D] = p
+
+    arm_c = out[:, 0]
+    cyl_c = out[:, 1]
+    land_c = out[:, 2]
+    vert_dev = out[:, 3]
+    lat_pos = out[:, 4]
+    def_ball = out[:, 6]
+    off_ball = out[:, 7]
+    vel_c = out[:, 9]
+    shock_c = out[:, 10]
+    apex_c = out[:, 11]
+
+    # Dim 12: ball_rim_proximity (high when both ball-handler & defender contest at high apex near ball)
+    out[:, 12] = torch.clamp(0.45 * apex_c + 0.35 * def_ball + 0.20 * off_ball, 0.0, 1.0)
+
+    # Dim 13: boundary_sideline_proximity (high on wide lateral non-collision plays near court edge)
+    contact_suppress = 1.0 - 0.70 * torch.clamp(0.5 * arm_c + 0.5 * cyl_c, 0.0, 1.0)
+    border_cue = torch.clamp((0.60 * lat_pos + 0.40 * (1.0 - cyl_c)) * contact_suppress, 0.0, 1.0)
+    out[:, 13] = border_cue
+
+    # Dim 14: ball_deflection_impulse (temporal change in ball-to-player proximity + hand-to-ball strike)
+    ball_delta = torch.zeros_like(def_ball)
+    if T > 1:
+        ball_delta[1:] = torch.abs(def_ball[1:] - def_ball[:-1]) * 3.0
+        ball_delta[0] = ball_delta[1]
+    out[:, 14] = torch.clamp(0.55 * def_ball * (1.0 - 0.5 * arm_c) + 0.45 * ball_delta, 0.0, 1.0)
+
+    # Dim 15: stationary_charge_verticality (high torso overlap + low verticality reach deviation + closing speed)
+    out[:, 15] = torch.clamp(0.45 * cyl_c + 0.35 * (1.0 - vert_dev) + 0.20 * torch.abs(vel_c - 0.5) * 2.0 + 0.10 * shock_c, 0.0, 1.0)
+    return out
+
+
+def compute_fast_video_signature(video_path: Path) -> Optional[np.ndarray]:
+    """Compute a fast 3-frame `(3, 18, 32, 3)` visual signature from the first 250 frames of an MP4."""
+    if not video_path.exists() or video_path.stat().st_size < 10_240:
+        return None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    sigs: List[np.ndarray] = []
+    target_frames = (30, 120, 220)
+    max_f = target_frames[-1]
+    for f in range(max_f + 1):
+        if f in target_frames:
+            ret, frm = cap.read()
+            if not ret:
+                break
+            sigs.append(cv2.resize(frm, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32))
+        else:
+            if not cap.grab():
+                break
+    cap.release()
+    return np.stack(sigs, axis=0) if len(sigs) == len(target_frames) else None
+
+
+def discover_held_out_test_ids(
+    test_dir: Optional[Path],
+    metadata_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Set[str], Dict[str, str]]:
+    """
+    Identify all `play_id`s and stems corresponding to videos in `data/test/`.
+    Matches by:
+      1. Direct filename stem (`play_id`, `ops_video_id`, `archive_id`)
+      2. NBA Replay CDN media slug (`trigger16_phxsac_1_111826_approved`)
+      3. Fast visual frame signature against `data/raw/` clips (catches renamed test files
+         like `celticsfoul.mp4` or `testdata.mp4`).
+    Returns `(excluded_play_ids_and_stems, test_stem_to_play_id_map)`.
+    """
+    excluded: Set[str] = set()
+    stem_to_play_id: Dict[str, str] = {}
+    if test_dir is None or not test_dir.exists():
+        return excluded, stem_to_play_id
+
+    test_files = [
+        p
+        for p in sorted(test_dir.iterdir())
+        if p.is_file()
+        and not p.name.startswith(".")
+        and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
+        and not p.stem.endswith("_annotated")
+    ]
+    if not test_files:
+        return excluded, stem_to_play_id
+
+    rows = metadata_rows or []
+    slug_to_pid: Dict[str, str] = {}
+    ops_to_pid: Dict[str, str] = {}
+    pid_set: Set[str] = set()
+    for r in rows:
+        pid = str(r.get("play_id") or "").strip()
+        if not pid:
+            continue
+        pid_set.add(pid)
+        slug = extract_cdn_media_slug(str(r.get("mp4_url") or ""))
+        if slug:
+            slug_to_pid[slug] = pid
+        ops_id = str(r.get("ops_video_id") or "").strip()
+        if ops_id:
+            ops_to_pid[ops_id] = pid
+
+    unmatched_test_files: List[Path] = []
+    for tf in test_files:
+        stem = tf.stem
+        excluded.add(stem)
+        if stem in pid_set:
+            excluded.add(stem)
+            stem_to_play_id[stem] = stem
+            continue
+        slug = extract_cdn_media_slug(stem)
+        if slug and slug in slug_to_pid:
+            matched_pid = slug_to_pid[slug]
+            excluded.add(matched_pid)
+            stem_to_play_id[stem] = matched_pid
+            continue
+        unmatched_test_files.append(tf)
+
+    # Visual signature matching for custom-named test files (e.g. celticsfoul.mp4, testdata.mp4)
+    if unmatched_test_files and rows:
+        raw_sigs: Dict[str, np.ndarray] = {}
+        for r in rows:
+            pid = str(r.get("play_id") or "").strip()
+            vp = resolve_project_path(str(r.get("video_path") or ""))
+            if pid and vp.exists():
+                sig = compute_fast_video_signature(vp)
+                if sig is not None:
+                    raw_sigs[pid] = sig
+
+        for tf in unmatched_test_files:
+            tsig = compute_fast_video_signature(tf)
+            if tsig is None or not raw_sigs:
+                continue
+            best_pid: Optional[str] = None
+            best_diff = 1e9
+            for pid, rsig in raw_sigs.items():
+                diff = float(np.mean(np.abs(tsig - rsig)))
+                if diff < best_diff:
+                    best_diff = diff
+                    best_pid = pid
+            if best_pid is not None and best_diff <= 14.0:
+                excluded.add(best_pid)
+                stem_to_play_id[tf.stem] = best_pid
+
+    return excluded, stem_to_play_id
 
 
 def box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -259,7 +450,7 @@ def is_referee_box(
     lx1, lx2 = max(0, min(fw - 1, int(sx1 + 0.24 * sbw))), max(1, min(fw, int(sx2 - 0.24 * sbw)))
 
     torso = bgr_frame[ty1:ty2, tx1:tx2]
-    lower = bgr_frame[ly1:ly2, lx1:lx2]
+    lower = bgr_frame[ly1:ty2 if ly2 <= ly1 else ly2, lx1:lx2]
     if torso.size == 0 or lower.size == 0:
         return False
     thsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
@@ -277,8 +468,8 @@ def is_referee_box(
 def is_replay_court_player_box(box: np.ndarray, frame_w: int, frame_h: int) -> bool:
     """
     Angle-aware court player filter that works for BOTH wide broadcast views and
-    closer baseline / overhead replay camera angles while rejecting upper stands
-    and seated courtside photographers.
+    closer baseline / sideline / overhead replay camera angles while rejecting upper stands
+    and seated courtside spectators.
     """
     x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
     bh = y2 - y1
@@ -286,21 +477,19 @@ def is_replay_court_player_box(box: np.ndarray, frame_w: int, frame_h: int) -> b
     cx = 0.5 * (x1 + x2)
     cy = 0.5 * (y1 + y2)
 
-    if bh < 0.08 * frame_h or bh > 0.82 * frame_h:
+    if bh < 0.08 * frame_h or bh > 0.84 * frame_h:
         return False
-    if bw < 0.018 * frame_w or bw > 0.52 * frame_w:
+    if bw < 0.018 * frame_w or bw > 0.55 * frame_w:
         return False
-    if bh / max(bw, 1.0) < 0.68:
+    if bh / max(bw, 1.0) < 0.62:
         return False
-    # Reject upper stands / scoreboard people (small boxes near top)
     if y2 < 0.34 * frame_h and bh < 0.22 * frame_h:
         return False
-    # Reject tiny seated spectators along the very bottom frame edge
-    if y2 > 0.86 * frame_h and bh < 0.18 * frame_h:
+    if y2 > 0.88 * frame_h and bh < 0.17 * frame_h:
         return False
-    if not (0.03 * frame_w <= cx <= 0.97 * frame_w):
+    if not (0.02 * frame_w <= cx <= 0.98 * frame_w):
         return False
-    if not (0.14 * frame_h <= cy <= 0.92 * frame_h):
+    if not (0.12 * frame_h <= cy <= 0.94 * frame_h):
         return False
     return True
 
@@ -308,12 +497,12 @@ def is_replay_court_player_box(box: np.ndarray, frame_w: int, frame_h: int) -> b
 def detect_rim_hsv(bgr_frame: np.ndarray, frame_w: int, frame_h: int) -> Optional[Tuple[int, int]]:
     """
     Detect the orange basketball rim across BOTH side-court broadcast angles and
-    centered overhead/baseline replay angles (`rx_norm` anywhere in `[0.08, 0.92]`).
+    centered overhead/baseline replay angles (`rx_norm` anywhere in `[0.06, 0.94]`).
     """
     if bgr_frame is None or bgr_frame.size == 0:
         return None
     img_h, img_w = bgr_frame.shape[:2]
-    y0, y1 = int(0.08 * img_h), int(0.48 * img_h)
+    y0, y1 = int(0.06 * img_h), int(0.52 * img_h)
     roi = bgr_frame[y0:y1, :]
     if roi.size == 0:
         return None
@@ -326,16 +515,67 @@ def detect_rim_hsv(bgr_frame: np.ndarray, frame_w: int, frame_h: int) -> Optiona
         x, y, w, h = cv2.boundingRect(c)
         area = float(cv2.contourArea(c))
         rx_norm = (x + 0.5 * w) / max(img_w, 1)
-        if not (0.08 <= rx_norm <= 0.92):
+        if not (0.06 <= rx_norm <= 0.94):
             continue
-        if (0.008 * img_w <= w <= 0.085 * img_w) and (0.004 * img_h <= h <= 0.055 * img_h):
-            if (w / max(h, 1.0)) >= 1.25 and area >= max(18.0, 0.00004 * img_w * img_h) and area > best_area:
+        if (0.008 * img_w <= w <= 0.095 * img_w) and (0.004 * img_h <= h <= 0.060 * img_h):
+            if (w / max(h, 1.0)) >= 1.20 and area >= max(16.0, 0.00004 * img_w * img_h) and area > best_area:
                 best_area = area
                 best_rim = (
                     int(round((x + 0.5 * w) * (frame_w / max(img_w, 1)))),
                     int(round((y0 + y + 0.5 * h) * (frame_h / max(img_h, 1)))),
                 )
     return best_rim
+
+
+def compute_boundary_sideline_proximity(
+    feet_pts: np.ndarray,
+    ball_pt: Optional[np.ndarray],
+    frame_w: int,
+    frame_h: int,
+    bgr_frame: Optional[np.ndarray] = None,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> float:
+    """
+    Estimate how close active player feet and/or the basketball are to the court boundary
+    (sideline/baseline edge or high-contrast painted apron transition around the feet).
+    Critical for Out-of-Bounds (`challenge_oob`) plays.
+    """
+    candidates: List[np.ndarray] = []
+    if len(feet_pts) > 0:
+        candidates.extend(feet_pts)
+    if ball_pt is not None:
+        candidates.append(ball_pt)
+    if not candidates:
+        return 0.15
+
+    pts = np.stack(candidates, axis=0)
+    norm_x = np.clip(pts[:, 0] / max(float(frame_w), 1.0), 0.0, 1.0)
+    norm_y = np.clip(pts[:, 1] / max(float(frame_h), 1.0), 0.0, 1.0)
+
+    # Distance to outer baseline/sideline court perimeter in frame coordinates
+    edge_dist_x = np.minimum(norm_x, 1.0 - norm_x)
+    edge_dist_y = np.maximum(0.0, 0.90 - norm_y)
+    min_edge = float(np.min(np.minimum(edge_dist_x, edge_dist_y)))
+    geom_prox = float(np.clip(1.0 - min_edge / 0.14, 0.0, 1.0))
+
+    # Local white boundary line contrast around the lowest foot/ball point
+    apron_contrast = 0.0
+    if bgr_frame is not None and bgr_frame.size > 0 and geom_prox > 0.15:
+        fh, fw = bgr_frame.shape[:2]
+        lowest_idx = int(np.argmax(pts[:, 1]))
+        px = int(round(float(pts[lowest_idx, 0]) / max(scale_x, 1e-5)))
+        py = int(round(float(pts[lowest_idx, 1]) / max(scale_y, 1e-5)))
+        r = max(6, int(min(fh, fw) * 0.035))
+        y0, y1 = max(0, py - r), min(fh, py + r)
+        x0, x1 = max(0, px - r), min(fw, px + r)
+        patch = bgr_frame[y0:y1, x0:x1]
+        if patch.size > 0:
+            phsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            white_line_frac = float(np.mean((phsv[:, :, 1] < 42) & (phsv[:, :, 2] > 195)))
+            apron_contrast = float(np.clip(2.2 * white_line_frac, 0.0, 1.0))
+
+    return float(np.clip(0.65 * geom_prox + 0.35 * apron_contrast, 0.0, 1.0))
 
 
 def extract_verified_ball(
@@ -361,20 +601,20 @@ def extract_verified_ball(
     best_ball: Optional[Tuple[float, float, float]] = None
     best_rank = -1.0
     for box, cls_id, conf in zip(d_xyxy, d_cls, d_conf):
-        if cls_id != COCO_SPORTS_BALL_CLS or float(conf) < 0.15:
+        if cls_id != COCO_SPORTS_BALL_CLS or float(conf) < 0.14:
             continue
         bx1, by1 = float(box[0]) * scale_x, float(box[1]) * scale_y
         bx2, by2 = float(box[2]) * scale_x, float(box[3]) * scale_y
         bw, bh = bx2 - bx1, by2 - by1
-        if not (0.008 * frame_h <= bw <= 0.11 * frame_h and 0.008 * frame_h <= bh <= 0.11 * frame_h):
+        if not (0.008 * frame_h <= bw <= 0.12 * frame_h and 0.008 * frame_h <= bh <= 0.12 * frame_h):
             continue
-        if max(bw, bh) / max(min(bw, bh), 1.0) > 1.75:
+        if max(bw, bh) / max(min(bw, bh), 1.0) > 1.80:
             continue
         cx, cy = 0.5 * (bx1 + bx2), 0.5 * (by1 + by2)
-        if not (0.04 * frame_h <= cy <= 0.90 * frame_h):
+        if not (0.03 * frame_h <= cy <= 0.94 * frame_h):
             continue
-        if rim_pt is not None and float(conf) < 0.30:
-            if np.hypot(cx - float(rim_pt[0]), cy - float(rim_pt[1])) < 30.0:
+        if rim_pt is not None and float(conf) < 0.28:
+            if np.hypot(cx - float(rim_pt[0]), cy - float(rim_pt[1])) < 26.0:
                 continue
 
         orange_frac = 0.25
@@ -387,11 +627,11 @@ def extract_verified_ball(
             if patch.size > 0:
                 phsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
                 orange_frac = float(
-                    np.mean((phsv[:, :, 0] >= 3) & (phsv[:, :, 0] <= 24) & (phsv[:, :, 1] >= 60))
+                    np.mean((phsv[:, :, 0] >= 3) & (phsv[:, :, 0] <= 25) & (phsv[:, :, 1] >= 55))
                 )
-        if orange_frac < 0.12 or (float(conf) < 0.28 and orange_frac < 0.22):
+        if orange_frac < 0.11 or (float(conf) < 0.26 and orange_frac < 0.20):
             continue
-        rank = float(conf) + 0.22 * orange_frac
+        rank = float(conf) + 0.24 * orange_frac
         if rank > best_rank:
             best_rank = rank
             best_ball = (cx, cy, float(conf))
@@ -407,7 +647,7 @@ def segment_replay_shots(
     """
     Detect hard camera cuts across a multi-angle NBA Replay Center clip and partition
     scanned frames into contiguous shot segments. Also estimates each shot's playback
-    speed ratio (`est_speed_ratio` in `[0.35, 1.0]`) to adapt slow-motion windows.
+    speed ratio (`est_speed_ratio` in `[0.45, 1.0]`) to adapt slow-motion windows.
     """
     n = len(small_bgr_frames)
     if n == 0:
@@ -463,10 +703,8 @@ def segment_replay_shots(
         if dur_sec < min_shot_sec and (hi - lo) < 2:
             continue
 
-        # Estimate slow-motion vs live-speed motion density inside the shot
         m_vals = step_motions[lo + 1 : hi + 1]
         med_motion = float(np.median(m_vals)) if m_vals else 6.0
-        # Live wide basketball action at 5Hz typically has gray MAD ~7-16; slow-mo ~2-6
         est_speed = float(np.clip(med_motion / 9.5, 0.45, 1.0))
         raw_shots.append({
             "scan_lo": lo,
@@ -550,7 +788,6 @@ def collect_players_in_frame(
             if all(box_iou(db, mb) < 0.35 and box_iom(db, mb) < 0.55 for mb, _, _ in merged):
                 merged.append((db, synthesize_box_keypoints(db), float(cf)))
 
-    # Extreme face/bench close-up rejection (> 88% of frame height)
     if max_h_ratio > 0.88:
         return [], max_h_ratio
 
@@ -581,24 +818,50 @@ def analyze_contact_pair(
     prev_center: Optional[np.ndarray],
     frame_w: int,
     frame_h: int,
+    bgr_frame: Optional[np.ndarray] = None,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
 ) -> Tuple[np.ndarray, float, np.ndarray, Optional[np.ndarray]]:
     """
-    Identify the primary opposing-jersey contact pair in a single frame and compute:
-      - `roi_box`: `[x1, y1, x2, y2]` enclosing both interacting players
-      - `saliency`: scalar contact/contest intensity score
-      - `feats`: 12-D biomechanical feature vector
+    Identify the primary interacting player pair (or active ball/rim/boundary player on OOB/GT plays)
+    in a single frame and compute:
+      - `roi_box`: `[x1, y1, x2, y2]` enclosing the active play
+      - `saliency`: scalar action intensity score (contact + ball/rim/boundary action)
+      - `feats`: 16-D biomechanical & court-context feature vector
       - `pair_mid`: `(2,)` center for within-shot temporal smoothness
     """
     diag = float(np.hypot(frame_w, frame_h))
     default_roi = np.array([frame_w * 0.20, frame_h * 0.15, frame_w * 0.80, frame_h * 0.85], dtype=np.float32)
     feats = np.zeros(POSE_FEATURES, dtype=np.float32)
+    rim_arr = np.array([float(rim_pt[0]), float(rim_pt[1])], dtype=np.float32) if rim_pt is not None else None
 
-    if len(players) < 2:
-        if len(players) == 1:
-            return players[0]["box"].astype(np.float32), 0.08, feats, players[0]["center"]
+    if len(players) == 0:
         return default_roi, 0.0, feats, None
 
-    rim_arr = np.array([float(rim_pt[0]), float(rim_pt[1])], dtype=np.float32) if rim_pt is not None else None
+    if len(players) == 1:
+        p0 = players[0]
+        b0 = p0["box"].astype(np.float32)
+        h0 = max(1.0, float(b0[3] - b0[1]))
+        wr0 = valid_points(p0["kpts"], (9, 10))
+        feet0 = valid_points(p0["kpts"], LOWER_BODY_KPTS)
+        off_ball = 0.45
+        if ball_pt is not None and len(wr0) > 0:
+            off_ball = float(np.clip(1.0 - float(np.min(np.linalg.norm(wr0 - ball_pt, axis=-1))) / max(h0 * 0.70, 1.0), 0.0, 1.0))
+        rim_prox = 0.15
+        if rim_arr is not None:
+            ref_pt = ball_pt if ball_pt is not None else p0["center"]
+            rim_prox = float(np.clip(1.0 - float(np.linalg.norm(ref_pt - rim_arr)) / max(0.32 * diag, 1.0), 0.0, 1.0))
+        bound_prox = compute_boundary_sideline_proximity(
+            feet0, ball_pt, frame_w, frame_h, bgr_frame=bgr_frame, scale_x=scale_x, scale_y=scale_y
+        )
+        feats[7] = off_ball
+        feats[11] = float(np.clip(0.35 * max(0.0, p0["elev"]), 0.0, 1.0))
+        feats[12] = rim_prox
+        feats[13] = bound_prox
+        feats[14] = float(np.clip(0.5 * off_ball, 0.0, 1.0))
+        sal = float(0.15 + 0.35 * max(off_ball, rim_prox, bound_prox))
+        return b0, sal, feats, p0["center"]
+
     best_pair: Optional[Tuple[int, int]] = None
     best_rank = -1e9
     best_stats = (diag, diag, 0.0)
@@ -610,11 +873,12 @@ def analyze_contact_pair(
             bj, cj, kj = players[j]["box"], players[j]["center"], players[j]["kpts"]
             bhj = max(1.0, float(bj[3] - bj[1]))
 
-            if min(bhi, bhj) / max(bhi, bhj) < 0.50:
+            if min(bhi, bhj) / max(bhi, bhj) < 0.45:
                 continue
             cdist = float(np.linalg.norm(ci - cj))
             max_bh = max(bhi, bhj)
-            if cdist > max(0.32 * diag, 1.75 * max_bh):
+            # Allow slightly wider separation (0.42 * diag) for OOB loose-ball chases & rim contests
+            if cdist > max(0.42 * diag, 2.15 * max_bh):
                 continue
 
             cdiff = jersey_hsv_diff(players[i]["hsv"], players[j]["hsv"])
@@ -645,17 +909,17 @@ def analyze_contact_pair(
             if ball_pt is not None:
                 dball = min(
                     float(np.linalg.norm(mid - ball_pt)),
-                    float(np.linalg.norm(ci - ball_pt)) + 20.0,
-                    float(np.linalg.norm(cj - ball_pt)) + 20.0,
+                    float(np.linalg.norm(ci - ball_pt)) + 16.0,
+                    float(np.linalg.norm(cj - ball_pt)) + 16.0,
                 )
-                ball_prox = max(0.0, 1.0 - dball / max(0.24 * diag, 1.0))
-                if dball > max(0.28 * diag, 380.0):
+                ball_prox = max(0.0, 1.0 - dball / max(0.26 * diag, 1.0))
+                if dball > max(0.30 * diag, 400.0):
                     off_ball_pen = -0.35
 
             rim_bonus = 0.0
             if rim_arr is not None:
                 drim = float(np.linalg.norm(mid - rim_arr))
-                rim_bonus = 0.12 * max(0.0, 1.0 - drim / max(0.42 * diag, 1.0))
+                rim_bonus = 0.15 * max(0.0, 1.0 - drim / max(0.42 * diag, 1.0))
 
             smooth_bonus = 0.0
             if prev_center is not None:
@@ -667,7 +931,7 @@ def analyze_contact_pair(
                 0.34 * norm_arm
                 + 0.24 * norm_torso
                 + 0.24 * min(1.0, iou * 3.0)
-                + 0.34 * ball_prox
+                + 0.36 * ball_prox
                 + 0.18 * max(0.0, min(1.0, elev))
                 + team_bonus
                 + rim_bonus
@@ -680,11 +944,12 @@ def analyze_contact_pair(
                 best_stats = (arm_upper_d, torso_d, iou)
 
     if best_pair is None:
-        return default_roi, 0.0, feats, None
+        # Fallback to player closest to ball or center
+        p0 = players[0]
+        return p0["box"].astype(np.float32), 0.12, feats, p0["center"]
 
     idx_a, idx_b = best_pair
     pa, pb = players[idx_a], players[idx_b]
-    # Higher elevated arm -> approximate shooter/ball-handler role; other -> contesting defender
     if pa["elev"] >= pb["elev"]:
         p_off, p_def = pa, pb
     else:
@@ -706,9 +971,15 @@ def analyze_contact_pair(
         ],
         dtype=np.float32,
     )
+    if ball_pt is not None:
+        roi_box[0] = min(roi_box[0], float(ball_pt[0]) - 28.0)
+        roi_box[1] = min(roi_box[1], float(ball_pt[1]) - 28.0)
+        roi_box[2] = max(roi_box[2], float(ball_pt[0]) + 28.0)
+        roi_box[3] = max(roi_box[3], float(ball_pt[1]) + 28.0)
+
     pair_mid = 0.5 * (p_off["center"] + p_def["center"])
 
-    # Compute 12 biomechanical features (dims 9 & 10 are refined temporally across the shot)
+    # Compute 16 biomechanical & court-context features
     arms_off = valid_points(kpts_off, ARM_CONTACT_KPTS)
     arms_def = valid_points(kpts_def, ARM_CONTACT_KPTS)
     arm_d = min_point_set_distance(arms_off, arms_def, arm_upper_d)
@@ -751,9 +1022,34 @@ def analyze_contact_pair(
     else:
         off_ball = 0.45
 
-    ball_vs_body = float(np.clip(cyl_pen * (1.0 - 0.5 * def_ball), 0.0, 1.0))
+    ball_vs_body = float(np.clip(cyl_pen * (1.0 - 0.65 * def_ball) + 0.25 * arm_contact * (1.0 - def_ball), 0.0, 1.0))
     contact_core = 0.35 * arm_contact + 0.30 * cyl_pen + 0.20 * landing_viol + 0.15 * vert_dev
     apex_score = float(np.clip(0.75 * contact_core + 0.25 * max(0.0, p_off["elev"]), 0.0, 1.0))
+
+    # Dim 12: ball_rim_proximity (Goaltending / Basket Interference & rim contests)
+    ball_rim_prox = 0.15
+    if rim_arr is not None:
+        d_rim_pair = float(np.linalg.norm(pair_mid - rim_arr))
+        if ball_pt is not None:
+            d_rim_ball = float(np.linalg.norm(ball_pt - rim_arr))
+            ball_rim_prox = float(np.clip(1.0 - min(d_rim_ball, d_rim_pair * 0.85) / max(0.28 * diag, 1.0), 0.0, 1.0))
+        else:
+            ball_rim_prox = float(np.clip(1.0 - d_rim_pair / max(0.32 * diag, 1.0), 0.0, 1.0))
+    elif float(pair_mid[1]) < 0.38 * frame_h and max(p_off["elev"], p_def["elev"]) > 0.45:
+        ball_rim_prox = float(np.clip(0.45 + 0.35 * max(p_off["elev"], p_def["elev"]), 0.0, 1.0))
+
+    # Dim 13: boundary_sideline_proximity (Out of Bounds)
+    all_feet = np.concatenate([feet_off, feet_def], axis=0) if (len(feet_off) + len(feet_def)) > 0 else np.empty((0, 2), dtype=np.float32)
+    boundary_prox = compute_boundary_sideline_proximity(
+        all_feet, ball_pt, frame_w, frame_h, bgr_frame=bgr_frame, scale_x=scale_x, scale_y=scale_y
+    )
+
+    # Dim 14: ball_deflection_impulse (refined temporally across the shot)
+    ball_touch_proxy = float(np.clip(max(def_ball, off_ball) * (1.0 - 0.35 * cyl_pen), 0.0, 1.0))
+
+    # Dim 15: stationary_charge_verticality (Set-feet vertical defender torso collision -> offensive foul / charge)
+    def_grounded = 1.0 - float(np.clip(max(0.0, p_def["elev"]), 0.0, 1.0))
+    stationary_charge = float(np.clip(0.45 * cyl_pen + 0.30 * (1.0 - vert_dev) + 0.25 * def_grounded, 0.0, 1.0))
 
     feats[0] = arm_contact
     feats[1] = cyl_pen
@@ -765,10 +1061,15 @@ def analyze_contact_pair(
     feats[7] = off_ball
     feats[8] = ball_vs_body
     feats[9] = 0.50
-    feats[10] = float(np.clip(pair_iou * 1.2, 0.0, 1.0))
+    feats[10] = float(np.clip(0.60 * pair_iou * 1.4 + 0.40 * arm_contact * cyl_pen, 0.0, 1.0))
     feats[11] = apex_score
+    feats[12] = ball_rim_prox
+    feats[13] = boundary_prox
+    feats[14] = ball_touch_proxy
+    feats[15] = stationary_charge
 
-    saliency = float(max(0.0, 0.55 * contact_core + 0.45 * max(0.0, best_rank)))
+    action_context = max(contact_core, 0.65 * ball_rim_prox, 0.60 * boundary_prox * max(def_ball, off_ball))
+    saliency = float(max(0.0, 0.55 * action_context + 0.45 * max(0.0, best_rank)))
     return roi_box, saliency, feats, pair_mid
 
 
@@ -843,7 +1144,10 @@ def decode_replay_scan_frames(
     scan_w: int = 800,
     scan_h: int = 450,
 ) -> Optional[Dict[str, Any]]:
-    """Decode downscaled scan frames across the entire replay video at constant physical rate (`scan_fps`)."""
+    """
+    Decode downscaled scan frames across the entire replay video at constant physical rate (`scan_fps`).
+    Bounds `total_frames` to the actual last readable frame if an MP4 is truncated/partial.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None
@@ -851,16 +1155,15 @@ def decode_replay_scan_frames(
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
     if fps <= 1.0 or np.isnan(fps):
         fps = 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    header_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
 
-    # Adapt scan resolution to never upscale low-res SD clips unnecessarily
     eff_scan_w = min(scan_w, max(320, frame_w))
     eff_scan_h = min(scan_h, max(180, frame_h))
 
     max_horizon = int(round(fps * max_clip_sec))
-    eff_total = min(total_frames, max_horizon) if total_frames > 0 else max_horizon
+    eff_total = min(header_frames, max_horizon) if header_frames > 0 else max_horizon
     eff_total = max(eff_total, 2)
 
     desired_samples = int(round((eff_total / max(fps, 1.0)) * scan_fps))
@@ -875,10 +1178,12 @@ def decode_replay_scan_frames(
     small_frames: List[np.ndarray] = []
 
     idx = 0
+    hit_eof = False
     while idx <= max_needed:
         if idx in target_set:
             ret, frame = cap.read()
             if not ret:
+                hit_eof = True
                 break
             if frame.shape[1] != eff_scan_w or frame.shape[0] != eff_scan_h:
                 small = cv2.resize(frame, (eff_scan_w, eff_scan_h), interpolation=cv2.INTER_AREA)
@@ -888,6 +1193,7 @@ def decode_replay_scan_frames(
             sampled_indices.append(idx)
         else:
             if not cap.grab():
+                hit_eof = True
                 break
         idx += 1
     cap.release()
@@ -895,10 +1201,11 @@ def decode_replay_scan_frames(
     if not small_frames:
         return None
 
+    actual_total = (sampled_indices[-1] + 1) if hit_eof else max(header_frames, sampled_indices[-1] + 1)
     return {
         "video_path": video_path,
         "fps": fps,
-        "total_frames": max(total_frames, idx),
+        "total_frames": actual_total,
         "frame_w": frame_w,
         "frame_h": frame_h,
         "scale_x": float(frame_w) / float(eff_scan_w),
@@ -923,17 +1230,8 @@ def extract_replay_action_tubes(
 ) -> List[Dict[str, Any]]:
     """
     Extract up to `angles_per_clip` shot-bounded `(3, num_frames, crop_size, crop_size)` RGB
-    action tubes + `(num_frames, 12)` biomechanical pose sequences from a single multi-angle
-    NBA Replay Archive video clip.
-
-    Returns a list of dicts sorted by descending contact saliency:
-      - `video`: `torch.Tensor` uint8 `(3, T, H, W)`
-      - `pose_features`: `torch.Tensor` float32 `(T, 12)`
-      - `angle_idx`: int (`0`, `1`, ...)
-      - `shot_start_frame`, `shot_end_frame`, `peak_frame`: int
-      - `sampled_indices`: `List[int]`
-      - `crop_boxes`: `List[Tuple[int, int, int, int]]`
-      - `fps`, `est_speed_ratio`, `saliency`: float
+    action tubes + `(num_frames, 16)` biomechanical & court-context sequences from a single
+    multi-angle NBA Replay Archive video clip.
     """
     vpath = Path(video_path)
     scan = decode_replay_scan_frames(
@@ -980,7 +1278,6 @@ def extract_replay_action_tubes(
             else:
                 all_det.extend([None] * len(b_imgs))
 
-    # Score every shot strictly within its own camera-cut boundaries
     shot_candidates: List[Dict[str, Any]] = []
     for shot in shots:
         lo, hi = int(shot["scan_lo"]), int(shot["scan_hi"])
@@ -1020,7 +1317,7 @@ def extract_replay_action_tubes(
                 scale_y=scale_y,
                 bgr_frame=s_frames[k],
             )
-            if len(players) >= 2:
+            if len(players) >= 1:
                 valid_court_frames += 1
             roi, sal, fvec, prev_center = analyze_contact_pair(
                 players=players,
@@ -1029,6 +1326,9 @@ def extract_replay_action_tubes(
                 prev_center=prev_center,
                 frame_w=frame_w,
                 frame_h=frame_h,
+                bgr_frame=s_frames[k],
+                scale_x=scale_x,
+                scale_y=scale_y,
             )
             s_rois.append(roi)
             s_scores.append(sal)
@@ -1037,7 +1337,6 @@ def extract_replay_action_tubes(
         if valid_court_frames == 0:
             continue
 
-        # Interpolate trajectories strictly over `[start_frame .. end_frame]`
         start_f, end_f = int(shot["start_frame"]), int(shot["end_frame"])
         shot_len = max(1, end_f - start_f + 1)
         local_x = np.arange(start_f, end_f + 1, dtype=np.float32)
@@ -1053,14 +1352,16 @@ def extract_replay_action_tubes(
         for d in range(POSE_FEATURES):
             dense_feats[:, d] = np.interp(local_x, scan_x, feat_arr[:, d])
 
-        # Time-normalized closing velocity (dim 9) and impact jolt (dim 10)
+        # Time-normalized closing velocity (dim 9), vertical impact jolt (dim 10), and ball deflection impulse (dim 14)
         dt_frame = 1.0 / max(fps, 1.0)
         if shot_len >= 3:
             dcyl_dt = np.gradient(dense_feats[:, 1], dt_frame)
             roi_cy = 0.5 * (dense_rois[:, 1] + dense_rois[:, 3])
             dcy_dt = np.abs(np.gradient(roi_cy, dt_frame)) / max(float(frame_h) * 0.60, 1.0)
+            dball_dt = np.abs(np.gradient(dense_feats[:, 6] - dense_feats[:, 7], dt_frame))
             dense_feats[:, 9] = np.clip(0.5 + 0.14 * dcyl_dt, 0.0, 1.0)
             dense_feats[:, 10] = np.clip(dcy_dt, 0.0, 1.0)
+            dense_feats[:, 14] = np.clip(0.55 * dense_feats[:, 14] + 0.45 * np.clip(dball_dt * 0.35, 0.0, 1.0), 0.0, 1.0)
 
         dense_scores = np.interp(local_x, scan_x, np.array(s_scores, dtype=np.float32))
         k_len = max(3, int(round(fps * 0.40)))
@@ -1069,7 +1370,6 @@ def extract_replay_action_tubes(
         peak_frame = start_f + peak_local
         peak_saliency = float(smooth_scores[peak_local])
 
-        # Adapt window length for slow-motion shots so physical motion coverage stays consistent
         est_speed = float(shot["est_speed_ratio"])
         eff_window_sec = float(np.clip(base_window_sec / max(est_speed, 0.50), base_window_sec, base_window_sec * 1.75))
         half_w = max(num_frames // 2, int(round(fps * eff_window_sec * 0.5)))
@@ -1102,7 +1402,6 @@ def extract_replay_action_tubes(
             "saliency": peak_saliency,
         })
 
-    # Fallback if no multi-player shot passed filters (use full clip midpoint)
     if not shot_candidates:
         total_f = int(scan["total_frames"])
         mid = total_f // 2
@@ -1127,11 +1426,12 @@ def extract_replay_action_tubes(
             "saliency": 0.0,
         })
 
-    # Keep top `angles_per_clip` highest-saliency distinct camera shots
     shot_candidates.sort(key=lambda s: float(s["saliency"]), reverse=True)
-    selected = shot_candidates[: max(1, int(angles_per_clip))]
+    best_sal = float(shot_candidates[0]["saliency"])
+    # Filter out dead-ball intro/outro angles whose saliency is far below the primary replay shot
+    viable = [s for s in shot_candidates if float(s["saliency"]) >= 0.58 * best_sal]
+    selected = (viable if viable else shot_candidates)[: max(1, int(angles_per_clip))]
 
-    # Single Pass-2 sequential decode covering all needed frames across selected shots
     needed_frames: Set[int] = set()
     for s in selected:
         needed_frames.update(s["sampled_indices"])
@@ -1164,11 +1464,11 @@ def extract_replay_action_tubes(
             resized = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA)
             rgb_frames.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
-        stacked = np.stack(rgb_frames, axis=0)  # (T, H, W, 3)
-        video_tensor = torch.from_numpy(stacked).permute(3, 0, 1, 2).contiguous()  # (3, T, H, W) uint8
+        stacked = np.stack(rgb_frames, axis=0)
+        video_tensor = torch.from_numpy(stacked).permute(3, 0, 1, 2).contiguous()
         results.append({
             "video": video_tensor,
-            "pose_features": s["pose_features"],
+            "pose_features": upgrade_pose_features_16d(s["pose_features"], video_tensor),
             "angle_idx": angle_idx,
             "shot_start_frame": s["shot_start_frame"],
             "shot_end_frame": s["shot_end_frame"],
@@ -1186,6 +1486,8 @@ def extract_replay_action_tubes(
 def synthesize_fallback_tube(
     play_id: str,
     label: int,
+    call_label: int = 0,
+    challenge_type_id: int = 0,
     angle_idx: int = 0,
     num_frames: int = 16,
     crop_size: int = 224,
@@ -1200,6 +1502,12 @@ def synthesize_fallback_tube(
     feats = np.zeros((num_frames, POSE_FEATURES), dtype=np.float32)
     for d in range(POSE_FEATURES):
         feats[:, d] = np.clip(scale * env + 0.12 + rng.normal(0.0, 0.04, size=num_frames), 0.0, 1.0)
+    if challenge_type_id == 1:
+        feats[:, 13] = np.clip(0.82 * env + 0.12, 0.0, 1.0)
+    elif challenge_type_id == 2:
+        feats[:, 12] = np.clip(0.85 * env + 0.10, 0.0, 1.0)
+    if call_label == 2:
+        feats[:, 15] = np.clip(0.85 * env + 0.10, 0.0, 1.0)
 
     frames = np.zeros((num_frames, crop_size, crop_size, 3), dtype=np.uint8)
     for t in range(num_frames):
@@ -1226,30 +1534,21 @@ def synthesize_fallback_tube(
     }
 
 
-def select_balanced_clips(rows: List[Dict[str, str]], max_clips: int) -> List[Dict[str, str]]:
-    """Prioritize rows whose local raw MP4 exists and interleave `foul` and `no_foul` 1:1."""
-    def _has_mp4(r: Dict[str, str]) -> int:
+def select_balanced_clips(rows: List[Dict[str, Any]], max_clips: int) -> List[Dict[str, Any]]:
+    """Prioritize rows whose local raw MP4 exists and interleave across all challenge call classes."""
+    upgraded = [upgrade_metadata_row(r) for r in rows]
+
+    def _has_mp4(r: Dict[str, Any]) -> int:
         vp = resolve_project_path(r.get("video_path", ""))
         return 0 if (vp.exists() and vp.stat().st_size > 10_240) else 1
 
-    ordered = sorted(rows, key=_has_mp4)
-    if max_clips <= 0 or len(ordered) <= max_clips:
-        return ordered
-    pos = [r for r in ordered if int(r.get("label", 0)) == 1]
-    neg = [r for r in ordered if int(r.get("label", 0)) == 0]
-    half = max(1, max_clips // 2)
-    sel_pos = pos[:half]
-    sel_neg = neg[: max_clips - len(sel_pos)]
-    if len(sel_pos) + len(sel_neg) < max_clips:
-        rem = max_clips - (len(sel_pos) + len(sel_neg))
-        sel_pos.extend(pos[len(sel_pos) : len(sel_pos) + rem])
-    out: List[Dict[str, str]] = []
-    for i in range(max(len(sel_pos), len(sel_neg))):
-        if i < len(sel_neg):
-            out.append(sel_neg[i])
-        if i < len(sel_pos):
-            out.append(sel_pos[i])
-    return out[:max_clips]
+    with_mp4 = [r for r in upgraded if _has_mp4(r) == 0]
+    without_mp4 = [r for r in upgraded if _has_mp4(r) != 0]
+
+    ordered = scrape_mod.interleave_balanced_rows(with_mp4) + scrape_mod.interleave_balanced_rows(without_mp4)
+    if max_clips > 0 and len(ordered) > max_clips:
+        return ordered[:max_clips]
+    return ordered
 
 
 def write_processed_csv(csv_path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -1283,8 +1582,9 @@ def preprocess_replay_dataset(
     synthetic_fallback: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Process raw NBA Replay Archive MP4s into shot-bounded multi-angle `.pt` action tubes.
-    Strictly excludes any video stems present in `data/test/` to prevent data leakage.
+    Process raw NBA Replay Archive MP4s into shot-bounded multi-angle `.pt` action tubes
+    with 16-D biomechanical & court-context features and full challenge-call metadata.
+    Strictly excludes any plays matching `data/test/` to guarantee zero data leakage.
     """
     metadata_csv = resolve_project_path(metadata_csv)
     processed_dir = resolve_project_path(processed_dir)
@@ -1297,23 +1597,32 @@ def preprocess_replay_dataset(
         )
 
     with open(metadata_csv, "r", newline="", encoding="utf-8") as f:
-        all_rows = list(csv.DictReader(f))
+        all_rows = [upgrade_metadata_row(dict(r)) for r in csv.DictReader(f)]
 
-    # Strict held-out test segregation
-    test_stems: Set[str] = set()
-    if active_test_dir.exists():
-        test_stems = {
-            p.stem
-            for p in active_test_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm")
-        }
-    if test_stems:
+    excluded_test_ids, test_map = discover_held_out_test_ids(active_test_dir, all_rows)
+    if excluded_test_ids:
+        before_cnt = len(all_rows)
         all_rows = [
             r for r in all_rows
-            if r.get("play_id", "").strip() not in test_stems
-            and Path(r.get("video_path", "")).stem not in test_stems
+            if r.get("play_id", "").strip() not in excluded_test_ids
+            and Path(r.get("video_path", "")).stem not in excluded_test_ids
         ]
-        logger.info("Excluded %d held-out test stems from training preprocessing.", len(test_stems))
+        logger.info(
+            "Excluded %d held-out test identifiers (%d rows removed; mapped=%s) from training preprocessing.",
+            len(excluded_test_ids),
+            before_cnt - len(all_rows),
+            test_map,
+        )
+
+    # Filter to rows that actually have a downloaded raw MP4 unless synthetic_fallback is enabled
+    if not synthetic_fallback:
+        available_rows = [
+            r for r in all_rows
+            if resolve_project_path(r.get("video_path", "")).exists()
+            and resolve_project_path(r.get("video_path", "")).stat().st_size > 10_240
+        ]
+        if available_rows:
+            all_rows = available_rows
 
     rows = select_balanced_clips(all_rows, max_clips=max_clips)
 
@@ -1335,27 +1644,59 @@ def preprocess_replay_dataset(
         det_model = YOLO(active_det)
 
     processed_dir.mkdir(parents=True, exist_ok=True)
-    (processed_dir / "foul").mkdir(parents=True, exist_ok=True)
-    (processed_dir / "no_foul").mkdir(parents=True, exist_ok=True)
+    for ctype_folder in CHALLENGE_TYPES:
+        (processed_dir / ctype_folder).mkdir(parents=True, exist_ok=True)
+
+    # Migrate any existing .pt tensors from legacy no_foul/ or mismatched folders into processed_dir/{foul,oob,goaltending,flagrant}/
+    pid_to_ctype = {str(r["play_id"]).strip(): scrape_mod.normalize_challenge_type(r.get("challenge_type")) for r in all_rows}
+    for search_dir_name in (*CHALLENGE_TYPES, "no_foul"):
+        s_dir = processed_dir / search_dir_name
+        if not s_dir.exists():
+            continue
+        for pt_file in list(s_dir.glob("*.pt")):
+            stem = pt_file.stem
+            base_pid = stem.rsplit("_a", 1)[0] if "_a" in stem else stem
+            target_ctype = pid_to_ctype.get(base_pid, "foul" if search_dir_name == "no_foul" else search_dir_name)
+            dest_pt = processed_dir / target_ctype / pt_file.name
+            if pt_file.resolve() != dest_pt.resolve():
+                dest_pt.parent.mkdir(parents=True, exist_ok=True)
+                if not dest_pt.exists():
+                    pt_file.replace(dest_pt)
+                else:
+                    pt_file.unlink(missing_ok=True)
+    legacy_proc_nf = processed_dir / "no_foul"
+    if legacy_proc_nf.exists():
+        try:
+            legacy_proc_nf.rmdir()
+        except OSError:
+            pass
 
     processed_rows: List[Dict[str, Any]] = []
     logger.info(
-        "Preprocessing %d replay clips (angles_per_clip=%d, scan_fps=%.1f, crop=%dx%d)...",
+        "Preprocessing %d replay clips into %s/{foul,oob,goaltending,flagrant}/ (angles_per_clip=%d, scan_fps=%.1f)...",
         len(rows),
+        processed_dir.name,
         angles_per_clip,
         scan_fps,
-        crop_size,
-        crop_size,
     )
 
     for idx, row in enumerate(rows, start=1):
+        row = upgrade_metadata_row(row)
         play_id = str(row["play_id"]).strip()
         game_id = str(row.get("game_id", "")).strip() or play_id.split("_")[0]
         label = int(row["label"])
-        class_dir = "foul" if label == 1 else "no_foul"
+        challenge_type = scrape_mod.normalize_challenge_type(row["challenge_type"])
+        challenge_type_id = int(row["challenge_type_id"])
+        outcome_category = str(row["outcome_category"])
+        call_label = int(row["call_label"])
+        call_resolution = str(row["call_resolution"])
+        class_dir = challenge_type
         video_path = resolve_project_path(row.get("video_path", ""))
+        if not video_path.exists():
+            alt_raw = scrape_mod.find_existing_raw_mp4(play_id, metadata_csv.parent / "raw")
+            if alt_raw is not None:
+                video_path = alt_raw
 
-        # Check if cached non-synthetic `.pt` files already exist for this play_id
         expected_first = processed_dir / class_dir / (f"{play_id}_a0.pt" if angles_per_clip > 1 else f"{play_id}.pt")
         cached_pts = sorted((processed_dir / class_dir).glob(f"{play_id}_a*.pt")) if angles_per_clip > 1 else ([expected_first] if expected_first.exists() else [])
         valid_cached: List[Dict[str, Any]] = []
@@ -1363,19 +1704,42 @@ def preprocess_replay_dataset(
             try:
                 payload = torch.load(cp, map_location="cpu", weights_only=False)
                 if isinstance(payload, dict) and not payload.get("is_synthetic", False):
+                    # Upgrade cached .pt payload in-place to 16-D pose features & full challenge metadata
+                    pf = payload.get("pose_features")
+                    vid = payload.get("video")
+                    needs_resave = False
+                    if pf is not None and isinstance(pf, torch.Tensor) and pf.size(-1) != POSE_FEATURES:
+                        payload["pose_features"] = upgrade_pose_features_16d(pf, vid)
+                        needs_resave = True
+                    if payload.get("call_label") != call_label or payload.get("challenge_type") != challenge_type:
+                        payload["challenge_type"] = challenge_type
+                        payload["challenge_type_id"] = challenge_type_id
+                        payload["outcome_category"] = outcome_category
+                        payload["call_label"] = call_label
+                        payload["call_resolution"] = call_resolution
+                        payload["label"] = label
+                        needs_resave = True
+                    if needs_resave:
+                        torch.save(payload, cp)
+
                     valid_cached.append({
                         "sample_id": cp.stem,
                         "play_id": play_id,
                         "game_id": game_id,
                         "season": row.get("season", ""),
                         "trigger": row.get("trigger", ""),
-                        "outcome_category": row.get("outcome_category", ""),
+                        "challenge_type": challenge_type,
+                        "challenge_type_id": challenge_type_id,
+                        "outcome_category": outcome_category,
+                        "call_label": call_label,
+                        "call_resolution": call_resolution,
                         "angle_idx": int(payload.get("angle_idx", 0)),
                         "shot_start_frame": int(payload.get("shot_start_frame", 0)),
                         "shot_end_frame": int(payload.get("shot_end_frame", 0)),
                         "peak_frame": int(payload.get("peak_frame", 0)),
                         "fps": round(float(payload.get("fps", 60.0)), 2),
                         "est_speed_ratio": round(float(payload.get("est_speed_ratio", 1.0)), 3),
+                        "saliency": round(float(payload.get("saliency", 0.5)), 4),
                         "label": label,
                         "video_path": row.get("video_path", ""),
                         "tensor_path": (Path("data") / "processed" / class_dir / cp.name).as_posix(),
@@ -1384,7 +1748,10 @@ def preprocess_replay_dataset(
                 continue
 
         if valid_cached:
-            processed_rows.extend(valid_cached)
+            # Filter out low-saliency secondary angle if it is <58% of primary angle saliency
+            best_c_sal = max(float(vc.get("saliency", 0.5)) for vc in valid_cached)
+            filtered_cached = [vc for vc in valid_cached if float(vc.get("saliency", 0.5)) >= 0.58 * best_c_sal]
+            processed_rows.extend(filtered_cached if filtered_cached else valid_cached)
             continue
 
         if video_path.exists() and video_path.stat().st_size > 10_240 and pose_model is not None:
@@ -1415,6 +1782,11 @@ def preprocess_replay_dataset(
                         "video": t_item["video"],
                         "pose_features": t_item["pose_features"],
                         "label": label,
+                        "challenge_type": challenge_type,
+                        "challenge_type_id": challenge_type_id,
+                        "outcome_category": outcome_category,
+                        "call_label": call_label,
+                        "call_resolution": call_resolution,
                         "sample_id": sample_id,
                         "play_id": play_id,
                         "game_id": game_id,
@@ -1437,13 +1809,18 @@ def preprocess_replay_dataset(
                     "game_id": game_id,
                     "season": row.get("season", ""),
                     "trigger": row.get("trigger", ""),
-                    "outcome_category": row.get("outcome_category", ""),
+                    "challenge_type": challenge_type,
+                    "challenge_type_id": challenge_type_id,
+                    "outcome_category": outcome_category,
+                    "call_label": call_label,
+                    "call_resolution": call_resolution,
                     "angle_idx": a_idx,
                     "shot_start_frame": t_item["shot_start_frame"],
                     "shot_end_frame": t_item["shot_end_frame"],
                     "peak_frame": t_item["peak_frame"],
                     "fps": round(float(t_item["fps"]), 2),
                     "est_speed_ratio": round(float(t_item["est_speed_ratio"]), 3),
+                    "saliency": round(float(t_item["saliency"]), 4),
                     "label": label,
                     "video_path": row.get("video_path", ""),
                     "tensor_path": (Path("data") / "processed" / class_dir / f"{sample_id}.pt").as_posix(),
@@ -1451,17 +1828,31 @@ def preprocess_replay_dataset(
 
             if idx % 10 == 0 or idx == len(rows):
                 write_processed_csv(processed_metadata_csv, processed_rows)
-                logger.info("[%d/%d] Processed %s -> %d angle tube(s) (total tubes: %d)", idx, len(rows), play_id, len(tubes), len(processed_rows))
+                logger.info("[%d/%d] Processed %s (%s -> %s) -> %d angle tube(s) (total: %d)",
+                            idx, len(rows), play_id, challenge_type, outcome_category, len(tubes), len(processed_rows))
 
         elif synthetic_fallback:
             for a_idx in range(max(1, angles_per_clip)):
-                t_item = synthesize_fallback_tube(play_id, label, angle_idx=a_idx, num_frames=num_frames, crop_size=crop_size)
+                t_item = synthesize_fallback_tube(
+                    play_id,
+                    label,
+                    call_label=call_label,
+                    challenge_type_id=challenge_type_id,
+                    angle_idx=a_idx,
+                    num_frames=num_frames,
+                    crop_size=crop_size,
+                )
                 sample_id = f"{play_id}_a{a_idx}" if angles_per_clip > 1 else play_id
                 out_pt = processed_dir / class_dir / f"{sample_id}.pt"
                 torch.save(
                     {
                         **t_item,
                         "label": label,
+                        "challenge_type": challenge_type,
+                        "challenge_type_id": challenge_type_id,
+                        "outcome_category": outcome_category,
+                        "call_label": call_label,
+                        "call_resolution": call_resolution,
                         "sample_id": sample_id,
                         "play_id": play_id,
                         "game_id": game_id,
@@ -1474,13 +1865,18 @@ def preprocess_replay_dataset(
                     "game_id": game_id,
                     "season": row.get("season", ""),
                     "trigger": row.get("trigger", ""),
-                    "outcome_category": row.get("outcome_category", ""),
+                    "challenge_type": challenge_type,
+                    "challenge_type_id": challenge_type_id,
+                    "outcome_category": outcome_category,
+                    "call_label": call_label,
+                    "call_resolution": call_resolution,
                     "angle_idx": a_idx,
                     "shot_start_frame": t_item["shot_start_frame"],
                     "shot_end_frame": t_item["shot_end_frame"],
                     "peak_frame": t_item["peak_frame"],
                     "fps": 60.0,
                     "est_speed_ratio": 1.0,
+                    "saliency": round(float(t_item["saliency"]), 4),
                     "label": label,
                     "video_path": row.get("video_path", ""),
                     "tensor_path": (Path("data") / "processed" / class_dir / f"{sample_id}.pt").as_posix(),
@@ -1498,7 +1894,7 @@ def preprocess_replay_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 2: Multi-Angle Shot-Segmented Action-Tube & Pose Extractor for NBA Replay Archive"
+        description="Stage 2: Multi-Angle Shot-Segmented Action-Tube & 16-D Court/Pose Extractor for NBA Replay Archive"
     )
     parser.add_argument("--metadata-csv", type=Path, default=BASE_DIR / "data" / "replay_metadata.csv")
     parser.add_argument("--processed-dir", type=Path, default=BASE_DIR / "data" / "processed")
@@ -1511,7 +1907,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-weights", type=str, default="yolo11n.pt")
     parser.add_argument("--pose-weights", type=str, default="yolo11n-pose.pt")
     parser.add_argument("--angles-per-clip", type=int, default=2, help="Distinct camera angles extracted per replay clip (default: 2)")
-    parser.add_argument("--window-sec", type=float, default=1.6, help="Base temporal window in seconds around contact apex (default: 1.6)")
+    parser.add_argument("--window-sec", type=float, default=1.6, help="Base temporal window in seconds around action apex (default: 1.6)")
     parser.add_argument("--num-frames", type=int, default=16, help="Frames sampled per action tube (default: 16)")
     parser.add_argument("--crop-size", type=int, default=224, help="Square RGB crop size (default: 224)")
     parser.add_argument("--scan-fps", type=float, default=5.0, help="Physical scan frequency in Hz (default: 5.0)")
